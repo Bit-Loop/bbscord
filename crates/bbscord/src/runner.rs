@@ -569,6 +569,20 @@ fn current_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Clear a fullscreen Ratatui terminal and reset its diff back-buffer without issuing a blocking
+/// `CSI 6n` DSR cursor-position query on stdin.
+///
+/// In `ratatui 0.30`, [`Terminal::clear`] queries `backend.get_cursor_position()`, which crashes
+/// on TTYs that do not answer DSR (serial/LCD/dumb/slow SSH/real PTYs) and races with
+/// `crossterm::event::EventStream`. Calling [`Terminal::resize`] on a fullscreen viewport runs
+/// `clear_region(ClearType::All)` and resets the previous buffer directly with zero stdin I/O.
+fn clear_fullscreen_without_dsr<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
+) -> std::result::Result<(), B::Error> {
+    let size = terminal.size()?;
+    terminal.resize(Rect::from((ratatui::layout::Position::ORIGIN, size)))
+}
+
 /// Run the full integrated interactive TUI runtime (`--mock-demo` or live Discord mode).
 pub async fn run_interactive(
     cli: &Cli,
@@ -604,7 +618,7 @@ pub async fn run_interactive(
 
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend).context("failed to construct Ratatui terminal")?;
-    terminal.clear()?;
+    clear_fullscreen_without_dsr(&mut terminal)?;
 
     // 4. Construct either mock or live services (running interactive QR/Token login if needed).
     let (mut services, mut backend_rx) = if cli.mock_demo {
@@ -631,7 +645,7 @@ pub async fn run_interactive(
             }
         };
         tracing::info!(origin = ?auth.origin, "starting live Discord session");
-        terminal.clear()?;
+        clear_fullscreen_without_dsr(&mut terminal)?;
         RuntimeServices::build_live(auth.token, &app_cfg, &api_secrets, fingerprint).await?
     };
 
@@ -732,11 +746,11 @@ pub async fn run_interactive(
                         if let Ok(resume) = tty_guard.resume_after_sigcont() {
                             debouncer.commit_immediate(resume.geometry);
                             media.clear_encoded();
-                            let _ = terminal.clear();
+                            let _ = clear_fullscreen_without_dsr(&mut terminal);
                             effects.extend(app.handle_resize(resume.geometry.cols, resume.geometry.rows));
                         } else {
                             debouncer.commit_immediate(geom);
-                            let _ = terminal.clear();
+                            let _ = clear_fullscreen_without_dsr(&mut terminal);
                         }
                     }
                     Some(TerminalSignal::Terminate) => {
@@ -951,13 +965,13 @@ pub async fn run_interactive(
                 Effect::Redraw => {
                     let _ = tty_guard.refresh_modes();
                     media.clear_encoded();
-                    let _ = terminal.clear();
+                    let _ = clear_fullscreen_without_dsr(&mut terminal);
                 }
                 Effect::Suspend => {
                     if let Ok(resume) = tty_guard.suspend() {
                         debouncer.commit_immediate(resume.geometry);
                         media.clear_encoded();
-                        let _ = terminal.clear();
+                        let _ = clear_fullscreen_without_dsr(&mut terminal);
                         let _ = app.handle_resize(resume.geometry.cols, resume.geometry.rows);
                     }
                 }
@@ -969,7 +983,7 @@ pub async fn run_interactive(
                         }
                         debouncer.commit_immediate(resume.geometry);
                         media.clear_encoded();
-                        let _ = terminal.clear();
+                        let _ = clear_fullscreen_without_dsr(&mut terminal);
                     }
                 }
                 Effect::SendAsFile {
@@ -1441,6 +1455,108 @@ mod tests {
         assert!(matches_ptt_key(KeyCode::F(4), "F4"));
         assert!(!matches_ptt_key(KeyCode::Char('x'), "v"));
         assert!(!matches_ptt_key(KeyCode::F(4), ""));
+    }
+
+    #[test]
+    fn clear_fullscreen_without_dsr_never_queries_cursor_position() {
+        use ratatui::backend::{Backend, ClearType, WindowSize};
+        use ratatui::buffer::Cell;
+        use ratatui::layout::{Position, Size};
+
+        struct NoDsrBackend {
+            inner: TestBackend,
+            clear_calls: usize,
+        }
+
+        impl Backend for NoDsrBackend {
+            type Error = io::Error;
+
+            fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
+            where
+                I: Iterator<Item = (u16, u16, &'a Cell)>,
+            {
+                let _ = self.inner.draw(content);
+                Ok(())
+            }
+
+            fn hide_cursor(&mut self) -> io::Result<()> {
+                let _ = self.inner.hide_cursor();
+                Ok(())
+            }
+
+            fn show_cursor(&mut self) -> io::Result<()> {
+                let _ = self.inner.show_cursor();
+                Ok(())
+            }
+
+            fn get_cursor_position(&mut self) -> io::Result<Position> {
+                Err(io::Error::other(
+                    "DSR cursor query must not be invoked on clear",
+                ))
+            }
+
+            fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
+                let _ = self.inner.set_cursor_position(position);
+                Ok(())
+            }
+
+            fn clear(&mut self) -> io::Result<()> {
+                self.clear_calls += 1;
+                let _ = self.inner.clear();
+                Ok(())
+            }
+
+            fn clear_region(&mut self, clear_type: ClearType) -> io::Result<()> {
+                self.clear_calls += 1;
+                let _ = self.inner.clear_region(clear_type);
+                Ok(())
+            }
+
+            fn size(&self) -> io::Result<Size> {
+                Ok(Size::new(16, 2))
+            }
+
+            fn window_size(&mut self) -> io::Result<WindowSize> {
+                Ok(WindowSize {
+                    columns_rows: Size::new(16, 2),
+                    pixels: Size::new(128, 32),
+                })
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                let _ = self.inner.flush();
+                Ok(())
+            }
+        }
+
+        let backend = NoDsrBackend {
+            inner: TestBackend::new(16, 2),
+            clear_calls: 0,
+        };
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        // Standard `Terminal::clear()` fails without DSR support, while our helper succeeds cleanly.
+        assert!(terminal.clear().is_err());
+        clear_fullscreen_without_dsr(&mut terminal).unwrap();
+        assert_eq!(terminal.backend().clear_calls, 1);
+
+        // Draw a symbol, clear without DSR, and verify the next draw repaints cleanly.
+        terminal
+            .draw(|f| {
+                f.buffer_mut()[(0, 0)].set_symbol("X");
+            })
+            .unwrap();
+        assert_eq!(terminal.backend().inner.buffer()[(0, 0)].symbol(), "X");
+
+        clear_fullscreen_without_dsr(&mut terminal).unwrap();
+        assert_eq!(terminal.backend().inner.buffer()[(0, 0)].symbol(), " ");
+
+        terminal
+            .draw(|f| {
+                f.buffer_mut()[(0, 0)].set_symbol("X");
+            })
+            .unwrap();
+        assert_eq!(terminal.backend().inner.buffer()[(0, 0)].symbol(), "X");
     }
 
     #[test]
