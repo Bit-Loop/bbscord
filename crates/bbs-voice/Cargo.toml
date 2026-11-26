@@ -5,11 +5,28 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Discord Voice Gateway, UDP/Opus audio, DAVE E2EE, and voice-message playback for bbscord"
+description = "Discord Voice Gateway v8, UDP/Opus audio pipeline, mandatory DAVE MLS E2EE, and voice-message playback for bbscord"
 
 [dependencies]
 bbs-core.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+zeroize.workspace = true
+tokio-tungstenite.workspace = true
+wreq.workspace = true
+davey.workspace = true
+audiopus.workspace = true
+cpal.workspace = true
+chacha20poly1305 = "0.10"
+aes-gcm = "0.10"
+rand = "0.8"
+
+[dev-dependencies]
+openmls = { version = "0.8.1", features = ["js"] }
+openmls_basic_credential = "0.5.0"
+openmls_rust_crypto = "0.5.1"
