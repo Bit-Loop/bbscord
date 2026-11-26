@@ -841,6 +841,7 @@ fn reply_current(app: &mut App) {
             message_id: m.id,
             author: m.author.display_name().to_string(),
             snippet: text::truncate(&sanitize_single_line(&m.content), 40, "."),
+            mention: true,
         };
     }
 }

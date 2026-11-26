@@ -18,8 +18,8 @@ pub enum Sem {
     Text(MdStyle),
     /// Timestamp.
     Time,
-    /// Author nick (user id for colour hashing).
-    Nick(u64),
+    /// Author nick `(user_id, optional 24-bit RGB highest guild role color)`.
+    Nick(u64, Option<u32>),
     /// Gutter separator / blank gutter.
     Gutter,
     /// Dim informational text.
@@ -132,12 +132,24 @@ pub struct LayoutParams {
     pub utc_offset_min: i32,
     /// Text-tag-only graphics (1-row tags instead of boxes).
     pub text_tags: bool,
+    /// Half-block graphics tier (target pixel density is `cols × 2*rows` instead of `cell_px`).
+    pub halfblock: bool,
 }
 
-/// Name resolution for mentions.
+/// Name and style resolution for mentions and message authors.
 pub trait Resolve {
     /// Resolve a mention.
     fn resolve(&self, kind: MentionKind, id: u64) -> Option<String>;
+
+    /// Resolve a guild-specific author display name (`None` falls back to message author).
+    fn author_nick(&self, _m: &Message) -> Option<String> {
+        None
+    }
+
+    /// Resolve a guild-specific 24-bit RGB role color for the message author.
+    fn author_color(&self, _m: &Message) -> Option<u32> {
+        None
+    }
 }
 
 impl<F: Fn(MentionKind, u64) -> Option<String>> Resolve for F {
@@ -153,6 +165,91 @@ pub fn fmt_time(id: Snowflake, utc_offset_min: i32) -> String {
     let mins = ms / 60_000 + i64::from(utc_offset_min);
     let day_min = mins.rem_euclid(1440);
     format!("{:02}:{:02}", day_min / 60, day_min % 60)
+}
+
+/// Civil `(year, month 1..=12, day 1..=31)` for a snowflake timestamp with `utc_offset_min`.
+#[must_use]
+pub fn local_date_ymd(id: Snowflake, utc_offset_min: i32) -> (i32, u8, u8) {
+    let ms = i64::try_from(id.timestamp_ms()).unwrap_or(0);
+    let secs = ms.div_euclid(1_000) + i64::from(utc_offset_min) * 60;
+    let z = secs.div_euclid(86_400) + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = y + i64::from(m <= 2);
+    (year as i32, m as u8, d as u8)
+}
+
+/// Whether two snowflakes fall on the same local calendar day.
+#[must_use]
+pub fn same_local_date(a: Snowflake, b: Snowflake, utc_offset_min: i32) -> bool {
+    local_date_ymd(a, utc_offset_min) == local_date_ymd(b, utc_offset_min)
+}
+
+/// Format a human-readable date separator label (e.g. `"November 26, 2026"`).
+#[must_use]
+pub fn fmt_date_separator(id: Snowflake, utc_offset_min: i32) -> String {
+    const MONTHS: [&str; 12] = [
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December",
+    ];
+    let (year, month, day) = local_date_ymd(id, utc_offset_min);
+    let mname = MONTHS
+        .get(usize::from(month.saturating_sub(1)))
+        .copied()
+        .unwrap_or("Unknown");
+    format!("{mname} {day}, {year}")
+}
+
+/// Whether a media URL looks like an animated GIF or WebP asset.
+#[must_use]
+pub fn url_looks_animated(url: &str) -> bool {
+    let base = url.split(['?', '#']).next().unwrap_or(url);
+    let lower = base.to_ascii_lowercase();
+    lower.ends_with(".gif") || lower.ends_with(".webp") || url.contains("animated=true")
+}
+
+/// Resize a Discord media proxy URL to the target box's pixel dimensions while preserving
+/// attachment signatures (`ex`/`is`/`hm`) and leaving non-proxy URLs untouched.
+#[must_use]
+pub fn resize_proxy_for_box(
+    url: &str,
+    cols: u16,
+    rows: u16,
+    cell_px: (u16, u16),
+    halfblock: bool,
+) -> String {
+    let (px_w, px_h) = if halfblock {
+        (
+            u32::from(cols.max(1)).max(16),
+            u32::from(rows.max(1)).saturating_mul(2).max(16),
+        )
+    } else {
+        (
+            u32::from(cols.max(1))
+                .saturating_mul(u32::from(cell_px.0.max(1)))
+                .clamp(16, 1024),
+            u32::from(rows.max(1))
+                .saturating_mul(u32::from(cell_px.1.max(1)))
+                .clamp(16, 1024),
+        )
+    };
+    bbs_core::resize_discord_media_proxy_url(url, px_w, px_h, true)
 }
 
 /// Human file size.
@@ -184,6 +281,7 @@ pub fn fmt_dur(secs: f32) -> String {
 pub fn is_grouped(prev: Option<&Message>, cur: &Message) -> bool {
     prev.is_some_and(|p| {
         p.author.id == cur.author.id
+            && p.author.username == cur.author.username
             && cur.reply_to.is_none()
             && cur.id.timestamp_ms().saturating_sub(p.id.timestamp_ms()) <= 7 * 60_000
     })
@@ -263,6 +361,21 @@ pub fn layout_message(
     res: &dyn Resolve,
     playback: Option<&bbs_core::VoicePlaybackState>,
 ) -> Vec<VLine> {
+    layout_message_with_date(m, grouped, false, mentions_me, p, res, playback)
+}
+
+/// Lay out one message, optionally prepending a local-date separator line.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn layout_message_with_date(
+    m: &Message,
+    grouped: bool,
+    show_date_sep: bool,
+    mentions_me: bool,
+    p: &LayoutParams,
+    res: &dyn Resolve,
+    playback: Option<&bbs_core::VoicePlaybackState>,
+) -> Vec<VLine> {
     let g = p.glyphs;
     let usable = p.width.saturating_sub(1).max(1); // scrollbar column
     let gutter_mode = p.measure.gutter > 0;
@@ -281,7 +394,38 @@ pub fn layout_message(
         res,
     };
 
-    let nick_raw = b.norm1(m.author.display_name());
+    if show_date_sep {
+        let label = format!(" {} ", fmt_date_separator(m.id, p.utc_offset_min));
+        let label_w = str_width(&label);
+        let avail = usize::from(usable);
+        let sep_text = if avail <= label_w {
+            text::truncate(label.trim(), avail, g.ellipsis)
+        } else {
+            let rem = avail - label_w;
+            let left = rem / 2;
+            let right = rem - left;
+            format!(
+                "{}{label}{}",
+                g.h.to_string().repeat(left),
+                g.h.to_string().repeat(right)
+            )
+        };
+        b.lines
+            .push(VLine::new(AnchorPart::Header, vec![Seg::new(sep_text, Sem::Dim)]));
+    }
+
+    let resolved_nick = res.author_nick(m).or_else(|| {
+        m.author_nick
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    });
+    let nick_raw = b.norm1(
+        resolved_nick
+            .as_deref()
+            .unwrap_or_else(|| m.author.display_name()),
+    );
+    let nick_color = res.author_color(m);
     let time = fmt_time(m.id, p.utc_offset_min);
 
     // Reply context line.
@@ -301,7 +445,7 @@ pub fn layout_message(
     if !gutter_mode && !grouped {
         let nick = text::truncate(&nick_raw, usize::from(usable.saturating_sub(9)), g.ellipsis);
         let segs = vec![
-            Seg::new(nick, Sem::Nick(m.author.id.as_u64())),
+            Seg::new(nick, Sem::Nick(m.author.id.as_u64(), nick_color)),
             Seg::new(format!(" {} {time}", g.dot), Sem::Time),
         ];
         b.lines.push(VLine::new(AnchorPart::Header, segs));
@@ -402,22 +546,11 @@ pub fn layout_message(
                 (Some(w), Some(h)) => format!(" {w}x{h}"),
                 _ => String::new(),
             };
-            let label = format!(
-                "[{}{} {name}{dims}]",
-                if a.is_gif() { "GIF" } else { "IMG" },
-                ""
-            );
-            push_image(
-                &mut b,
-                idx,
-                a.proxy_url.clone().unwrap_or_else(|| a.url.clone()),
-                bw,
-                bh,
-                label,
-                a.is_gif(),
-                on_side,
-                body_start,
-            );
+            let raw_url = a.proxy_url.clone().unwrap_or_else(|| a.url.clone());
+            let is_anim = a.is_gif() || url_looks_animated(&raw_url);
+            let url = resize_proxy_for_box(&raw_url, bw, bh, p.cell_px, p.halfblock);
+            let label = format!("[{} {name}{dims}]", if is_anim { "GIF" } else { "IMG" });
+            push_image(&mut b, idx, url, bw, bh, label, is_anim, on_side, body_start);
         } else {
             let tag = if a.is_image() {
                 let dims = match (a.width, a.height) {
@@ -554,7 +687,7 @@ pub fn layout_message(
                     let n = text::truncate(&nick_raw, nick_w, g.ellipsis);
                     format!("{}{n}", " ".repeat(nick_w.saturating_sub(str_width(&n))))
                 };
-                pre.push(Seg::new(nick, Sem::Nick(m.author.id.as_u64())));
+                pre.push(Seg::new(nick, Sem::Nick(m.author.id.as_u64(), nick_color)));
             } else {
                 pre.push(Seg::new(" ".repeat(6 + nick_w), Sem::Gutter));
             }
@@ -661,12 +794,13 @@ fn layout_embed(b: &mut Builder<'_>, e: &Embed, idx: u16, body_start: usize) {
             + 1
     };
 
+    let is_gifv = e.kind == EmbedKind::Gifv;
     let media_only = matches!(
         e.kind,
         EmbedKind::Image | EmbedKind::Gifv | EmbedKind::Video
     ) && e.title.is_none()
         && e.description.is_none();
-    let thumb = if !media_only && w >= 48 && !p.text_tags {
+    let thumb = if !media_only && !is_gifv && w >= 48 && !p.text_tags {
         e.thumbnail.as_ref()
     } else {
         None
@@ -810,10 +944,11 @@ fn layout_embed(b: &mut Builder<'_>, e: &Embed, idx: u16, body_start: usize) {
 
     // Thumbnail image rows (top-right of the embed).
     if let Some(th_media) = thumb {
-        let url = th_media
+        let raw_url = th_media
             .proxy_url
             .clone()
             .unwrap_or_else(|| th_media.url.clone());
+        let url = resize_proxy_for_box(&raw_url, tw, th, p.cell_px, p.halfblock);
         for r in 0..th {
             let li = first_line + usize::from(r);
             if let Some(line) = b.lines.get_mut(li) {
@@ -832,12 +967,13 @@ fn layout_embed(b: &mut Builder<'_>, e: &Embed, idx: u16, body_start: usize) {
     }
 
     // Hero image / video.
-    let hero = e.image.as_ref().or(if media_only {
+    let hero = e.image.as_ref().or(if media_only || is_gifv {
         e.thumbnail.as_ref()
     } else {
         None
     });
-    let animated = e.kind == EmbedKind::Gifv;
+    let animated = is_gifv
+        || hero.is_some_and(|img| url_looks_animated(img.proxy_url.as_deref().unwrap_or(&img.url)));
     if e.kind == EmbedKind::Video && e.video.is_some() && hero.is_none() {
         let s = format!(
             "[{} video {}]",
@@ -879,7 +1015,8 @@ fn layout_embed(b: &mut Builder<'_>, e: &Embed, idx: u16, body_start: usize) {
                 p.max_img_rows.max(1),
                 p.cell_px,
             );
-            let url = img.proxy_url.clone().unwrap_or_else(|| img.url.clone());
+            let raw_url = img.proxy_url.clone().unwrap_or_else(|| img.url.clone());
+            let url = resize_proxy_for_box(&raw_url, bw, bh, p.cell_px, p.halfblock);
             if on_side {
                 push_image(b, 0, url, bw, bh, label, animated, true, body_start);
             } else {

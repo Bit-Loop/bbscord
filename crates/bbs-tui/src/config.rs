@@ -65,6 +65,8 @@ pub struct TuiConfig {
     pub inline_video_low_tier: bool,
     /// Allow inline video over SSH.
     pub inline_video_ssh: bool,
+    /// Auto-focus the composer (`Mode::Insert`) when selecting a text/DM channel (default `true`).
+    pub auto_focus: bool,
 }
 
 impl Default for TuiConfig {
@@ -90,6 +92,7 @@ impl Default for TuiConfig {
             prefer_inline_video: false,
             inline_video_low_tier: false,
             inline_video_ssh: false,
+            auto_focus: true,
         }
     }
 }

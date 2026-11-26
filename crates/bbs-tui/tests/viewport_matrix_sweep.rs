@@ -184,13 +184,14 @@ fn micro_six_keys_reach_compose_voice_gif_quit() {
             .any(|a| matches!(a, UiAction::SendGif { .. })),
         "{fx:?}"
     );
-    // Quit is reachable: Esc → NAV → MAIN, Up to top then Down×7 → Quit → Enter → y via Enter.
+    // Quit is reachable: Esc → NAV → MAIN, Down×8 → Quit → Enter → Right (Yes) → Enter (6-key safe).
     let _ = app.handle_key(key(KeyCode::Esc));
     let _ = app.handle_key(key(KeyCode::Esc));
     for _ in 0..8 {
         let _ = app.handle_key(key(KeyCode::Down));
     }
     let _ = app.handle_key(key(KeyCode::Enter));
+    let _ = app.handle_key(key(KeyCode::Right));
     let fx = app.handle_key(key(KeyCode::Enter));
     assert!(fx.iter().any(|e| matches!(e, Effect::Quit)), "{fx:?}");
 }
@@ -561,8 +562,8 @@ fn dave_verification_truthfulness_epoch_reset_and_degraded_banner() {
         "unverified session must not show DAVE✓"
     );
 
-    // Verify locally via DAVE modal -> DAVE✓ returns.
-    let _ = app.handle_key(ch('D'));
+    // Verify locally via DAVE modal (Ctrl+D) -> DAVE✓ returns.
+    let _ = app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
     let _ = app.handle_key(key(KeyCode::Down));
     let _ = app.handle_key(ch('v'));
     let _ = app.handle_key(key(KeyCode::Esc));
@@ -687,5 +688,559 @@ fn title_closing_bracket_short_ring_dedupe_oversized_paste_and_cache_refresh() {
     assert!(
         d.contains("⏸") && d.contains("0:03/0:06"),
         "voice playback progress must render pause glyph and position: {d}"
+    );
+}
+
+fn mouse_click(x: u16, y: u16) -> crossterm::event::MouseEvent {
+    crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        column: x,
+        row: y,
+        modifiers: KeyModifiers::NONE,
+    }
+}
+
+fn mouse_wheel(x: u16, y: u16, down: bool) -> crossterm::event::MouseEvent {
+    crossterm::event::MouseEvent {
+        kind: if down {
+            crossterm::event::MouseEventKind::ScrollDown
+        } else {
+            crossterm::event::MouseEventKind::ScrollUp
+        },
+        column: x,
+        row: y,
+        modifiers: KeyModifiers::NONE,
+    }
+}
+
+#[test]
+fn mouse_click_focus_tree_messages_modals_and_wheel_scroll() {
+    let mut app = demo_app(ResolvedCharset::Utf8, false);
+    let _ = app.tick(10_000);
+    let _ = render(&mut app, 120, 36);
+    let layout = app.layout().expect("layout").clone();
+    let sidebar = layout
+        .panes
+        .iter()
+        .find(|p| p.kind == geometry::PaneKind::Sidebar)
+        .expect("sidebar")
+        .rect;
+
+    // Click composer -> enters Insert mode.
+    let _ = app.handle_mouse(mouse_click(layout.composer.x + 1, layout.composer.y));
+    assert_eq!(app.mode, bbs_tui::Mode::Insert);
+
+    // Click messages pane -> exits Insert, focuses Messages, selects clicked row.
+    let msg_y = layout.messages.bottom().saturating_sub(1);
+    let _ = app.handle_mouse(mouse_click(layout.messages.x + 2, msg_y));
+    assert_eq!(app.mode, bbs_tui::Mode::Normal);
+    assert_eq!(app.focus, bbs_tui::Focus::Messages);
+    assert!(app.selected.is_some());
+
+    // Wheel up over messages scrolls off tail.
+    let _ = app.handle_mouse(mouse_wheel(layout.messages.x + 2, msg_y, false));
+    assert!(matches!(app.scroll_state(), ScrollState::Anchored(_)));
+
+    // Click on a DM row in the sidebar -> opens channel & auto-focuses composer.
+    let dm_row_y = sidebar.y + 1; // row 0 is Home ("DMs"), row 1 is first DM
+    let fx = app.handle_mouse(mouse_click(sidebar.x + 1, dm_row_y));
+    assert!(
+        actions(&fx)
+            .iter()
+            .any(|a| matches!(a, UiAction::SelectChannel(_))),
+        "clicking DM row must select channel: {fx:?}"
+    );
+    assert_eq!(
+        app.mode,
+        bbs_tui::Mode::Insert,
+        "auto_focus should focus composer on channel click"
+    );
+
+    // Open Quit confirm modal -> click outside modal dismisses it.
+    let _ = app.handle_key(key(KeyCode::Esc));
+    let _ = app.handle_key(ch('q'));
+    let _ = render(&mut app, 120, 36);
+    let fx = app.handle_mouse(mouse_click(0, 0));
+    assert!(!fx.iter().any(|e| matches!(e, Effect::Quit)));
+    let buf = render(&mut app, 120, 36);
+    assert!(!common::dump(&buf).contains("Quit bbscord?"));
+}
+
+#[test]
+fn composer_autofocus_esc_reply_toggle_autocomplete_and_safe_confirm() {
+    let mut app = demo_app(ResolvedCharset::Utf8, false);
+    let _ = app.tick(20_000);
+    let _ = render(&mut app, 120, 36);
+
+    // Focus messages and select the last own message (or send one via event).
+    let me = app.store.me.clone().expect("me");
+    let ch_id = app.active_channel.expect("ch");
+    let own_id = bbs_core::Snowflake::new(99_000_001);
+    let own_msg = bbs_core::Message {
+        id: own_id,
+        channel_id: ch_id,
+        guild_id: app.active_guild,
+        author: me,
+        content: "check https://example.invalid/a and https://example.invalid/b".to_string(),
+        timestamp: "2026-11-26T12:00:00Z".to_string(),
+        edited_timestamp: None,
+        pinned: false,
+        reply_to: None,
+        mentions: Vec::new(),
+        mention_everyone: false,
+        attachments: Vec::new(),
+        embeds: Vec::new(),
+        reactions: Vec::new(),
+        poll: None,
+        flags: 0,
+        nonce: None,
+        author_nick: None,
+        author_role_ids: Vec::new(),
+        mention_roles: Vec::new(),
+    };
+    let _ = app.handle_event(bbs_core::BackendEvent::MessageCreated(own_msg));
+    app.focus = bbs_tui::Focus::Messages;
+    app.selected = Some(own_id);
+
+    // Safe delete confirmation: `d` opens confirm with [ No ] focused -> Enter does NOT delete!
+    let _ = app.handle_key(ch('d'));
+    let buf = render(&mut app, 120, 36);
+    let dump = common::dump(&buf);
+    assert!(dump.contains("Delete this message?"), "{dump}");
+    assert!(dump.contains("[ No ]") && dump.contains("[ Yes ]"), "{dump}");
+    let fx = app.handle_key(key(KeyCode::Enter));
+    assert!(
+        !actions(&fx)
+            .iter()
+            .any(|a| matches!(a, UiAction::DeleteMessage { .. })),
+        "Enter on default-No confirm must NOT delete: {fx:?}"
+    );
+    // Re-open, move Right to [ Yes ], press Enter -> deletes!
+    let _ = app.handle_key(ch('d'));
+    let _ = app.handle_key(key(KeyCode::Right));
+    let fx = app.handle_key(key(KeyCode::Enter));
+    assert!(
+        actions(&fx)
+            .iter()
+            .any(|a| matches!(a, UiAction::DeleteMessage { message_id, .. } if *message_id == own_id)),
+        "Right+Enter must delete: {fx:?}"
+    );
+
+    // Copy message (`y`) and URL (`u`), and multi-URL opener (`o`) -> picker -> Enter -> take_open_url().
+    let _ = app.handle_key(ch('y'));
+    assert!(app.take_copy_text().is_some_and(|t| t.contains("example.invalid/a")));
+    let _ = app.handle_key(ch('u'));
+    assert_eq!(app.take_copy_text().as_deref(), Some("https://example.invalid/a"));
+    let _ = app.handle_key(ch('o'));
+    let buf = render(&mut app, 120, 36);
+    assert!(common::dump(&buf).contains("Open>"));
+    let _ = app.handle_key(key(KeyCode::Enter));
+    assert_eq!(app.take_open_url().as_deref(), Some("https://example.invalid/a"));
+
+    // Reply (`r`) defaults to mention: true; Tab toggles mention OFF; Esc cancels target without wiping draft!
+    let _ = app.handle_key(ch('r'));
+    assert_eq!(app.mode, bbs_tui::Mode::Insert);
+    assert!(matches!(
+        app.composer.target,
+        bbs_tui::composer::ComposeTarget::Reply { mention: true, .. }
+    ));
+    let _ = app.handle_key(key(KeyCode::Tab));
+    assert!(matches!(
+        app.composer.target,
+        bbs_tui::composer::ComposeTarget::Reply { mention: false, .. }
+    ));
+    let mut saw_typing = false;
+    for c in "draft :fi".chars() {
+        let fx = app.handle_key(ch(c));
+        if actions(&fx).iter().any(|a| matches!(a, UiAction::SendTyping { .. })) {
+            saw_typing = true;
+        }
+    }
+    assert!(saw_typing, "typing in Insert mode should emit throttled SendTyping");
+    assert!(app.autocomplete.is_open(), ":fi should open emoji autocomplete");
+    // Accept `:fire:` via Tab -> inserts 🔥.
+    let _ = app.handle_key(key(KeyCode::Tab));
+    assert!(app.composer.text().contains('🔥'), "{}", app.composer.text());
+    assert!(!app.autocomplete.is_open());
+
+    // First Esc cancels Reply target while preserving draft text; second Esc exits to Normal preserving draft!
+    let _ = app.handle_key(key(KeyCode::Esc));
+    assert_eq!(app.composer.target, bbs_tui::composer::ComposeTarget::New);
+    assert_eq!(app.mode, bbs_tui::Mode::Insert);
+    assert!(app.composer.text().starts_with("draft "));
+    let _ = app.handle_key(key(KeyCode::Esc));
+    assert_eq!(app.mode, bbs_tui::Mode::Normal);
+    assert!(app.composer.text().starts_with("draft "));
+
+    // Typing `@mod` opens Mention autocomplete; Tab accepts `@modem_wizard `.
+    app.composer.clear();
+    let _ = app.handle_key(ch('i'));
+    for c in "@mod".chars() {
+        let _ = app.handle_key(ch(c));
+    }
+    assert!(app.autocomplete.is_open(), "@mod should open mention autocomplete");
+    let _ = app.handle_key(key(KeyCode::Tab));
+    assert_eq!(app.composer.text(), "@modem_wizard ");
+    // Typing `#gen` opens Channel autocomplete; Tab accepts `#general-bbs `.
+    for c in "#gen".chars() {
+        let _ = app.handle_key(ch(c));
+    }
+    assert!(app.autocomplete.is_open(), "#gen should open channel autocomplete");
+    let _ = app.handle_key(key(KeyCode::Tab));
+    assert_eq!(app.composer.text(), "@modem_wizard #general-bbs ");
+    let _ = app.handle_key(key(KeyCode::Esc));
+
+    // Sending `@modem_wizard` outside backticks expands to `<@USER_ALICE>`, while `` `@modem_wizard` `` stays literal!
+    app.composer.clear();
+    let _ = app.handle_key(ch('r'));
+    let _ = app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT));
+    let _ = app.handle_paste("hi @modem_wizard and `@modem_wizard` in #general-bbs");
+    let fx = app.handle_key(key(KeyCode::Enter));
+    let sent = actions(&fx).into_iter().find_map(|a| {
+        if let UiAction::SendMessage {
+            content,
+            mention_replied_user,
+            ..
+        } = a
+        {
+            Some((content.clone(), *mention_replied_user))
+        } else {
+            None
+        }
+    });
+    let (content, mention_replied) = sent.expect("send message");
+    assert!(!mention_replied, "Alt+M should toggle reply ping off");
+    assert!(
+        content.contains(&format!("<@{}>", mock_ids::USER_ALICE)),
+        "outgoing @modem_wizard must expand to <@id>: {content}"
+    );
+    assert!(
+        content.contains("`@modem_wizard`"),
+        "inline code `@modem_wizard` must NOT expand: {content}"
+    );
+    assert!(
+        content.contains(&format!("<#{}>", mock_ids::CH_RETRONET_GENERAL)),
+        "outgoing #general-bbs must expand to <#id>: {content}"
+    );
+}
+
+#[test]
+fn at_a_glance_coloring_roles_presence_folders_mutes_and_ack() {
+    let mut app = demo_app(ResolvedCharset::Utf8, false);
+    // Add guild roles + guild member with role color & guild nick.
+    let role_id = bbs_core::Snowflake::new(777_001);
+    let _ = app.handle_event(bbs_core::BackendEvent::GuildRolesUpdated {
+        guild_id: mock_ids::GUILD_RETRONET,
+        roles: vec![bbs_core::Role {
+            id: role_id,
+            name: "SysOps".to_string(),
+            color: 0x00FF_55AA,
+            position: 10,
+            hoist: true,
+        }],
+    });
+    let _ = app.handle_event(bbs_core::BackendEvent::GuildMembersUpdated {
+        guild_id: mock_ids::GUILD_RETRONET,
+        members: vec![bbs_core::GuildMemberSummary {
+            user_id: mock_ids::USER_ALICE,
+            nick: Some("ModemQueen".to_string()),
+            role_ids: vec![role_id],
+        }],
+    });
+
+    // Add a colored GuildFolder and mute a channel while keeping another unread and mentioned.
+    app.store.folders = vec![bbs_core::GuildFolder {
+        id: Some(1),
+        name: Some("RetroNetOps".to_string()),
+        color: Some(0x0033_CCFF),
+        guild_ids: vec![mock_ids::GUILD_RETRONET],
+        collapsed: false,
+    }];
+    let _ = app.handle_event(bbs_core::BackendEvent::GuildSettingsUpdated {
+        guild_id: Some(mock_ids::GUILD_RETRONET),
+        muted: false,
+        suppress_everyone: true,
+        suppress_roles: false,
+        muted_channels: vec![(mock_ids::CH_RETRONET_MUTED_LOGS, true)],
+    });
+    assert!(app.store.is_channel_muted(mock_ids::CH_RETRONET_MUTED_LOGS));
+
+    // Verify ChannelsLoaded preserves unread/mention/muted state when REST returns zeroes!
+    let mut fresh_chs = app
+        .store
+        .channels
+        .get(&mock_ids::GUILD_RETRONET)
+        .cloned()
+        .unwrap_or_default();
+    for c in &mut fresh_chs {
+        c.unread_count = 0;
+        c.mention_count = 0;
+        c.muted = false;
+        c.last_ack_message_id = None;
+    }
+    if let Some(chs) = app.store.channels.get_mut(&mock_ids::GUILD_RETRONET)
+        && let Some(thr) = chs.iter_mut().find(|c| c.id == mock_ids::CH_RETRONET_THREAD)
+    {
+        thr.unread_count = 3;
+        thr.mention_count = 1;
+    }
+    let _ = app.handle_event(bbs_core::BackendEvent::ChannelsLoaded {
+        guild_id: Some(mock_ids::GUILD_RETRONET),
+        channels: fresh_chs,
+    });
+    assert!(app.store.is_channel_muted(mock_ids::CH_RETRONET_MUTED_LOGS));
+    let thr = app
+        .store
+        .channel(mock_ids::CH_RETRONET_THREAD)
+        .expect("thread");
+    assert_eq!(thr.unread_count, 3);
+    assert_eq!(thr.mention_count, 1);
+
+    // Render and verify folder + guild nick render cleanly.
+    let buf = render(&mut app, 160, 40);
+    let dump = common::dump(&buf);
+    assert!(dump.contains("RetroNetOps"), "folder name must render: {dump}");
+    assert!(
+        dump.contains("ModemQueen"),
+        "guild nick must render in timeline/members: {dump}"
+    );
+
+    // Selecting an unread channel emits deduplicated AckMessage and clears unread.
+    app.select_channel(mock_ids::CH_RETRONET_THREAD);
+    let fx = app.tick(30_000);
+    let _ = fx;
+    let _ = app.handle_event(bbs_core::BackendEvent::MessageAcked {
+        channel_id: mock_ids::CH_RETRONET_THREAD,
+        last_message_id: bbs_core::Snowflake::new(9_999_999),
+        mention_count: 0,
+    });
+    let thr = app
+        .store
+        .channel(mock_ids::CH_RETRONET_THREAD)
+        .expect("thread");
+    assert_eq!(thr.unread_count, 0);
+    assert_eq!(thr.mention_count, 0);
+}
+
+#[test]
+fn voice_sidebar_occupants_toggle_leave_and_guards() {
+    let mut app = demo_app(ResolvedCharset::Utf8, false);
+    // Not in voice: m and D must NOT emit SetSelfMute/SetSelfDeaf!
+    let fx_m = app.handle_key(ch('m'));
+    let fx_d = app.handle_key(ch('D'));
+    assert!(actions(&fx_m).is_empty(), "mute outside voice must no-op: {fx_m:?}");
+    assert!(actions(&fx_d).is_empty(), "deaf outside voice must no-op: {fx_d:?}");
+
+    // OutgoingRinging + h must emit StopCallRing AND LeaveVoice.
+    let _ = app.handle_event(bbs_core::BackendEvent::CallRingUpdated(
+        bbs_core::CallRingState::OutgoingRinging {
+            channel_id: mock_ids::CH_DM_ALICE,
+            target_user_ids: vec![mock_ids::USER_ALICE],
+        },
+    ));
+    app.focus = bbs_tui::Focus::Messages;
+    let fx_h = app.handle_key(ch('h'));
+    assert!(
+        actions(&fx_h)
+            .iter()
+            .any(|a| matches!(a, UiAction::StopCallRing { .. })),
+        "decline during OutgoingRinging must StopCallRing: {fx_h:?}"
+    );
+    assert!(
+        actions(&fx_h)
+            .iter()
+            .any(|a| matches!(a, UiAction::LeaveVoice)),
+        "decline during OutgoingRinging must LeaveVoice: {fx_h:?}"
+    );
+
+    // VoiceRosterUpdated populates nested VoiceMember rows under the voice channel.
+    let _ = app.handle_event(bbs_core::BackendEvent::VoiceRosterUpdated {
+        guild_id: Some(mock_ids::GUILD_RETRONET),
+        channel_id: mock_ids::CH_RETRONET_VOICE,
+        participants: vec![bbs_core::VoiceParticipant {
+            user_id: mock_ids::USER_ALICE,
+            display_name: "Alice".to_string(),
+            speaking: true,
+            self_mute: false,
+            self_deaf: false,
+            server_mute: false,
+            server_deaf: false,
+            volume: 120,
+            rms_db: -12.0,
+            dave_verified: true,
+            streaming: false,
+        }],
+    });
+    app.select_guild(Some(mock_ids::GUILD_RETRONET));
+    let items = app.sidebar_items();
+    assert!(
+        items.iter().any(|it| matches!(
+            it,
+            bbs_tui::app::SideItem::VoiceMember(ch, uid, _)
+                if *ch == mock_ids::CH_RETRONET_VOICE && *uid == mock_ids::USER_ALICE
+        )),
+        "voice occupants must appear nested under voice channel: {items:?}"
+    );
+
+    // Re-selecting an already-joined voice channel emits LeaveVoice instead of duplicate JoinVoice!
+    let mut app_vc = demo_app(ResolvedCharset::Utf8, true);
+    let vc_id = app_vc.store.voice.as_ref().expect("voice").channel_id;
+    app_vc.select_channel(vc_id);
+    let fx = app_vc.tick(1000);
+    assert!(
+        actions(&fx).iter().any(|a| matches!(a, UiAction::LeaveVoice)),
+        "re-selecting joined voice channel must emit LeaveVoice: {fx:?}"
+    );
+    assert!(
+        !actions(&fx)
+            .iter()
+            .any(|a| matches!(a, UiAction::JoinVoice { .. })),
+        "re-selecting joined voice channel must NOT re-send JoinVoice: {fx:?}"
+    );
+}
+
+#[test]
+fn gif_debounce_error_grid_nav_and_media_polish() {
+    let mut app = demo_app(ResolvedCharset::Utf8, false);
+    app.cfg.graphics = bbs_core::GraphicsTier::KittyPlaceholder;
+    let _ = app.tick(5_000);
+    let _ = render(&mut app, 120, 40);
+
+    // Open GIF picker -> initial trending SearchGifs emitted.
+    let fx_open = app.handle_key(ch('G'));
+    let req0 = actions(&fx_open)
+        .iter()
+        .find_map(|a| {
+            if let UiAction::SearchGifs { request_id, .. } = a {
+                Some(*request_id)
+            } else {
+                None
+            }
+        })
+        .expect("initial gif search");
+
+    // Typing "cat" debounces 300ms (zero SearchGifs on individual keystrokes!).
+    for c in "cat".chars() {
+        let fx = app.handle_key(ch(c));
+        assert!(
+            actions(&fx).is_empty(),
+            "typing in GIF picker must debounce 300ms: {fx:?}"
+        );
+    }
+    let fx_early = app.tick(5_200);
+    assert!(actions(&fx_early).is_empty(), "must not fire before 300ms");
+    let fx_due = app.tick(5_350);
+    let req1 = actions(&fx_due)
+        .iter()
+        .find_map(|a| {
+            if let UiAction::SearchGifs { request_id, query } = a {
+                assert_eq!(query.query, "cat");
+                assert!(!query.trending);
+                Some(*request_id)
+            } else {
+                None
+            }
+        })
+        .expect("debounced gif search after 300ms");
+    assert_ne!(req0, req1);
+
+    // GifSearchFailed shows error instead of hanging on "searching…".
+    let _ = app.handle_event(bbs_core::BackendEvent::GifSearchFailed {
+        request_id: req1,
+        error: "upstream 429 rate limited".to_string(),
+    });
+    let buf = render(&mut app, 120, 40);
+    let dump = common::dump(&buf);
+    assert!(dump.contains("GIF error:"), "{dump}");
+    assert!(dump.contains("upstream 429"), "{dump}");
+    let _ = app.handle_key(key(KeyCode::Esc));
+
+    // MessagePatched merges EmbedKind::Gifv WITH title, invalidates cache, and resizes Discord proxy URL.
+    let ch_id = app.active_channel.expect("ch");
+    let guild_id = app.active_guild;
+    let me = app.store.me.clone().expect("me");
+    let m1_id = bbs_core::Snowflake::new(1_300_000_000_000_000_000);
+    let m2_id = bbs_core::Snowflake::new(1_300_000_000_000_000_000 + (90_000_000 << 22)); // next day!
+    let proxy_url =
+        "https://media.discordapp.net/attachments/1/2/dance.gif?ex=aaa&is=bbb&hm=ccc".to_string();
+    let base_msg = |id: bbs_core::Snowflake, text: &str| bbs_core::Message {
+        id,
+        channel_id: ch_id,
+        guild_id,
+        author: me.clone(),
+        content: text.to_string(),
+        timestamp: String::new(),
+        edited_timestamp: None,
+        pinned: false,
+        reply_to: None,
+        mentions: Vec::new(),
+        mention_everyone: false,
+        attachments: Vec::new(),
+        embeds: Vec::new(),
+        reactions: Vec::new(),
+        poll: None,
+        flags: 0,
+        nonce: None,
+        author_nick: None,
+        author_role_ids: Vec::new(),
+        mention_roles: Vec::new(),
+    };
+    let _ = app.handle_event(bbs_core::BackendEvent::MessageCreated(base_msg(
+        m1_id,
+        "first day",
+    )));
+    let _ = app.handle_event(bbs_core::BackendEvent::MessageCreated(base_msg(
+        m2_id,
+        "second day",
+    )));
+    let _ = render(&mut app, 120, 40);
+
+    // Patch BOTH messages with identical GIFV thumbnail URL AND a title!
+    let gifv_embed = bbs_core::Embed {
+        kind: bbs_core::EmbedKind::Gifv,
+        title: Some("Dancing Cat".to_string()),
+        thumbnail: Some(bbs_core::EmbedMedia {
+            url: proxy_url.clone(),
+            proxy_url: Some(proxy_url.clone()),
+            width: Some(400),
+            height: Some(300),
+        }),
+        ..Default::default()
+    };
+    for id in [m1_id, m2_id] {
+        let _ = app.handle_event(bbs_core::BackendEvent::MessagePatched(
+            bbs_core::MessagePatch {
+                id,
+                channel_id: ch_id,
+                embeds: Some(vec![gifv_embed.clone()]),
+                ..Default::default()
+            },
+        ));
+    }
+    let buf = render(&mut app, 120, 40);
+    let dump = common::dump(&buf);
+    // Date separator rendered between m1 and m2!
+    assert!(
+        dump.contains(&bbs_tui::messages::fmt_date_separator(m2_id, 0)),
+        "date separator must appear on local date change: {dump}"
+    );
+    // Resized proxy URL with ex/is/hm preserved, animated=true, AND two distinct non-merged slots!
+    let matching_slots: Vec<_> = app
+        .image_slots()
+        .iter()
+        .filter(|s| s.url.contains("media.discordapp.net/attachments/1/2/dance.gif"))
+        .collect();
+    assert_eq!(
+        matching_slots.len(),
+        2,
+        "duplicate URLs in separate messages must NOT merge into one slot: {matching_slots:?}"
+    );
+    for s in &matching_slots {
+        assert!(s.animated, "Gifv embed must be marked animated");
+        assert!(s.url.contains("ex=aaa") && s.url.contains("width=") && s.url.contains("format=webp"));
+    }
+    assert!(
+        matching_slots.iter().any(|s| s.focused),
+        "newest visible animated chat GIF must be focused when no message is selected"
     );
 }

@@ -9,7 +9,9 @@ use std::sync::Arc;
 use bbs_core::{AnchorPart, Message, ScrollAnchor, ScrollState, Snowflake};
 use lru::LruCache;
 
-use crate::messages::{LayoutParams, Resolve, VLine, is_grouped, layout_message};
+use crate::messages::{
+    LayoutParams, Resolve, VLine, is_grouped, layout_message_with_date, same_local_date,
+};
 
 /// Cache capacity (§5).
 pub const CACHE_ENTRIES: usize = 4096;
@@ -57,6 +59,7 @@ pub fn params_key(p: &LayoutParams) -> u64 {
     p.max_img_rows.hash(&mut h);
     p.utc_offset_min.hash(&mut h);
     p.text_tags.hash(&mut h);
+    p.halfblock.hash(&mut h);
     h.finish()
 }
 
@@ -66,12 +69,28 @@ impl LayoutCache {
         self.lru.clear();
     }
 
-    /// Lines for a message.
+    /// Lines for a message (without a date separator).
     #[allow(clippy::too_many_arguments)]
     pub fn lines(
         &mut self,
         m: &Message,
         grouped: bool,
+        mentions_me: bool,
+        p: &LayoutParams,
+        pkey: u64,
+        res: &dyn Resolve,
+        playback: Option<&bbs_core::VoicePlaybackState>,
+    ) -> Arc<Vec<VLine>> {
+        self.lines_with_date(m, grouped, false, mentions_me, p, pkey, res, playback)
+    }
+
+    /// Lines for a message, optionally prepending a date separator.
+    #[allow(clippy::too_many_arguments)]
+    pub fn lines_with_date(
+        &mut self,
+        m: &Message,
+        grouped: bool,
+        show_date_sep: bool,
         mentions_me: bool,
         p: &LayoutParams,
         pkey: u64,
@@ -84,6 +103,11 @@ impl LayoutCache {
         m.edited_timestamp.hash(&mut h);
         m.content.hash(&mut h);
         m.pinned.hash(&mut h);
+        m.flags.hash(&mut h);
+        m.author_nick.hash(&mut h);
+        m.author_role_ids.hash(&mut h);
+        res.author_nick(m).hash(&mut h);
+        res.author_color(m).hash(&mut h);
         if let Some(poll) = &m.poll {
             poll.total_votes.hash(&mut h);
             for a in &poll.answers {
@@ -104,9 +128,31 @@ impl LayoutCache {
         }
         for a in &m.attachments {
             a.url.hash(&mut h);
+            a.proxy_url.hash(&mut h);
         }
         m.embeds.len().hash(&mut h);
+        for e in &m.embeds {
+            std::mem::discriminant(&e.kind).hash(&mut h);
+            e.title.hash(&mut h);
+            e.description.hash(&mut h);
+            e.url.hash(&mut h);
+            e.color.hash(&mut h);
+            e.fields.len().hash(&mut h);
+            if let Some(img) = &e.image {
+                img.url.hash(&mut h);
+                img.proxy_url.hash(&mut h);
+            }
+            if let Some(th) = &e.thumbnail {
+                th.url.hash(&mut h);
+                th.proxy_url.hash(&mut h);
+            }
+            if let Some(v) = &e.video {
+                v.url.hash(&mut h);
+                v.proxy_url.hash(&mut h);
+            }
+        }
         grouped.hash(&mut h);
+        show_date_sep.hash(&mut h);
         mentions_me.hash(&mut h);
         pkey.hash(&mut h);
         let key = h.finish();
@@ -115,7 +161,15 @@ impl LayoutCache {
             return Arc::clone(v);
         }
         self.misses += 1;
-        let v = Arc::new(layout_message(m, grouped, mentions_me, p, res, playback));
+        let v = Arc::new(layout_message_with_date(
+            m,
+            grouped,
+            show_date_sep,
+            mentions_me,
+            p,
+            res,
+            playback,
+        ));
         self.lru.put(key, Arc::clone(&v));
         v
     }
@@ -204,10 +258,13 @@ impl Timeline<'_> {
     fn lines(&self, cache: &mut LayoutCache, i: usize) -> Arc<Vec<VLine>> {
         let m = &self.msgs[i];
         let prev = if i > 0 { self.msgs.get(i - 1) } else { None };
-        let grouped = is_grouped(prev, m);
-        cache.lines(
+        let same_day = prev.is_some_and(|p| same_local_date(p.id, m.id, self.params.utc_offset_min));
+        let show_date_sep = prev.is_some() && !same_day;
+        let grouped = same_day && is_grouped(prev, m);
+        cache.lines_with_date(
             m,
             grouped,
+            show_date_sep,
             (self.mentions)(m),
             &self.params,
             self.pkey,

@@ -2,7 +2,7 @@
 //! Mentions inbox) and the shared image-box renderer (placeholder or HalfBlock, §6.2).
 
 use bbs_core::{
-    ChannelKind, DaveSessionState, GraphicsTier, PresenceStatus, RgbaFrame, Snowflake,
+    ChannelKind, DaveSessionState, GraphicsTier, PresenceStatus, RgbColor, RgbaFrame, Snowflake,
     VideoSinkKind, VoiceConnectionState,
 };
 use ratatui::buffer::Buffer;
@@ -67,9 +67,12 @@ pub fn render_sidebar(app: &mut App, area: Rect, buf: &mut Buffer, ctx: &Ctx<'_>
         app.sidebar.offset = app.sidebar.cursor + 1 - h;
     }
     let focused = app.focus == Focus::Sidebar;
+    let ascii_sym = ctx.g.is_ascii() || ctx.cfg.charset == bbs_core::ResolvedCharset::VtSafe;
     for (row, item) in items.iter().enumerate().skip(app.sidebar.offset).take(h) {
         let y = area.y + u16::try_from(row - app.sidebar.offset).unwrap_or(0);
-        let (label, badge, style) = match item {
+        app.sidebar_rows.push((y, item.clone()));
+        let selected = focused && row == app.sidebar.cursor;
+        match item {
             SideItem::Home => {
                 let (u, m) = app.store.dm_unread();
                 let open = app.sidebar.expanded.contains(&None);
@@ -78,13 +81,67 @@ pub fn render_sidebar(app: &mut App, area: Rect, buf: &mut Buffer, ctx: &Ctx<'_>
                 } else {
                     ctx.g.collapsed
                 };
-                (
-                    format!("{mark}DMs"),
-                    badge(m, u),
-                    ctx.s(Role::Title).add_modifier(Modifier::BOLD),
-                )
+                let b = sidebar_badge(m, u, false, ctx.g);
+                let st = if m > 0 {
+                    ctx.s(Role::Mention)
+                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                } else {
+                    ctx.s(Role::Title).add_modifier(Modifier::BOLD)
+                };
+                draw_sidebar_row(buf, ctx, area, y, &format!("{mark}DMs"), &b, selected, st);
             }
-            SideItem::Guild(id) => {
+            SideItem::Folder(idx) => {
+                let Some(f) = app.store.folders.get(*idx) else {
+                    continue;
+                };
+                let open = !app.sidebar.collapsed_folders.contains(idx);
+                let mark = if open {
+                    ctx.g.expanded
+                } else {
+                    ctx.g.collapsed
+                };
+                let fname = f
+                    .name
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .map(|s| sanitize_single_line(s).into_owned())
+                    .unwrap_or_else(|| "Folder".to_string());
+                let (mut unread, mut mentions) = (0u32, 0u32);
+                for gid in &f.guild_ids {
+                    if let Some(g) = app.store.guild(*gid) {
+                        if !g.muted && g.unread {
+                            unread = unread.saturating_add(1);
+                        }
+                        mentions = mentions.saturating_add(g.mention_count);
+                    }
+                }
+                let b = sidebar_badge(mentions, unread, false, ctx.g);
+                let st = if mentions > 0 {
+                    ctx.s(Role::Mention)
+                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                } else if let Some(rgb) = f.color.filter(|&c| c != 0)
+                    && ctx.cfg.depth != bbs_core::ColorDepth::Monochrome
+                {
+                    ctx.base()
+                        .fg(ctx.theme.rgb(RgbColor::from_u32(rgb)))
+                        .add_modifier(Modifier::BOLD)
+                } else if unread > 0 {
+                    ctx.s(Role::Fg).add_modifier(Modifier::BOLD)
+                } else {
+                    ctx.s(Role::Title).add_modifier(Modifier::BOLD)
+                };
+                draw_sidebar_row(
+                    buf,
+                    ctx,
+                    area,
+                    y,
+                    &format!("{mark}{fname}"),
+                    &b,
+                    selected,
+                    st,
+                );
+            }
+            SideItem::Guild(id, depth) => {
                 let g = app.store.guild(*id);
                 let name = g
                     .map(|g| sanitize_single_line(&g.name).into_owned())
@@ -95,19 +152,114 @@ pub fn render_sidebar(app: &mut App, area: Rect, buf: &mut Buffer, ctx: &Ctx<'_>
                 } else {
                     ctx.g.collapsed
                 };
-                let (u, m) = g.map_or((0, 0), |g| (u32::from(g.unread), g.mention_count));
-                let st = if u > 0 || m > 0 {
+                let (u, m, muted) = g.map_or((0, 0, false), |g| {
+                    (u32::from(g.unread), g.mention_count, g.muted)
+                });
+                let st = if m > 0 {
+                    ctx.s(Role::Mention)
+                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                } else if muted {
+                    ctx.s(Role::Inactive).add_modifier(Modifier::DIM)
+                } else if u > 0 {
                     ctx.s(Role::Fg).add_modifier(Modifier::BOLD)
                 } else {
-                    ctx.s(Role::Fg)
+                    ctx.s(Role::Inactive)
                 };
-                (format!("{mark}{name}"), badge(m, u), st)
+                let indent = " ".repeat(usize::from(*depth));
+                let b = sidebar_badge(m, u, muted, ctx.g);
+                draw_sidebar_row(
+                    buf,
+                    ctx,
+                    area,
+                    y,
+                    &format!("{indent}{mark}{name}"),
+                    &b,
+                    selected,
+                    st,
+                );
             }
             SideItem::Channel(id, depth) => {
                 let Some(c) = app.store.channel(*id) else {
                     continue;
                 };
                 let indent = " ".repeat(usize::from(*depth));
+                let active = app.active_channel == Some(c.id);
+                let muted = app.store.is_channel_muted(c.id);
+                let in_voice = app
+                    .store
+                    .voice
+                    .as_ref()
+                    .is_some_and(|v| v.channel_id == c.id);
+                let b = if in_voice {
+                    ctx.g.speaking.to_string()
+                } else {
+                    sidebar_badge(c.mention_count, c.unread_count, muted, ctx.g)
+                };
+
+                // 1:1 DM: paint presence dot and friend name with semantic presence coloring.
+                if c.kind == ChannelKind::DirectMessage
+                    && let Some(r) = c.recipients.first()
+                {
+                    let status = app.store.presence.get(&r.id).copied().unwrap_or(r.presence);
+                    let psym = ctx.n(if ascii_sym {
+                        status.ascii_symbol()
+                    } else {
+                        status.utf8_symbol()
+                    });
+                    let pres_fg = ctx.theme.presence_color(status);
+                    let name = sanitize_single_line(&c.display_label()).into_owned();
+                    let name_st = if active {
+                        ctx.s(Role::Hotkey).add_modifier(Modifier::BOLD)
+                    } else if c.mention_count > 0 {
+                        ctx.s(Role::Mention)
+                            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                    } else if muted {
+                        ctx.s(Role::Inactive).add_modifier(Modifier::DIM)
+                    } else if c.unread_count > 0 {
+                        if matches!(status, PresenceStatus::Offline | PresenceStatus::Invisible) {
+                            ctx.s(Role::Fg).add_modifier(Modifier::BOLD)
+                        } else {
+                            ctx.base().fg(pres_fg).add_modifier(Modifier::BOLD)
+                        }
+                    } else if matches!(status, PresenceStatus::Offline | PresenceStatus::Invisible)
+                    {
+                        ctx.s(Role::Inactive)
+                    } else {
+                        ctx.base().fg(pres_fg)
+                    };
+                    let bw = u16::try_from(str_width(&b)).unwrap_or(0);
+                    let lw = area.width.saturating_sub(if bw > 0 { bw + 1 } else { 0 });
+                    let fill_st = if selected {
+                        ctx.s(Role::Selected)
+                    } else {
+                        ctx.base()
+                    };
+                    draw::fill(buf, Rect::new(area.x, y, area.width, 1), fill_st);
+                    let mut x = area.x;
+                    x += draw::put(buf, x, y, &indent, lw.saturating_sub(x - area.x), fill_st);
+                    let sym_st = if selected {
+                        fill_st
+                    } else if muted {
+                        ctx.s(Role::Inactive).add_modifier(Modifier::DIM)
+                    } else {
+                        ctx.base().fg(pres_fg)
+                    };
+                    x += draw::put(buf, x, y, &psym, lw.saturating_sub(x - area.x), sym_st);
+                    x += draw::put(buf, x, y, " ", lw.saturating_sub(x - area.x), fill_st);
+                    let rem = lw.saturating_sub(x - area.x);
+                    let lbl = text::truncate(&ctx.n(&name), usize::from(rem), ctx.g.ellipsis);
+                    draw::put(
+                        buf,
+                        x,
+                        y,
+                        &lbl,
+                        rem,
+                        if selected { fill_st } else { name_st },
+                    );
+                    draw_sidebar_badge(buf, ctx, area, y, lw, &b, in_voice);
+                    continue;
+                }
+
                 let name = if c.kind == ChannelKind::GuildCategory {
                     let open = !app.sidebar.collapsed.contains(&c.id);
                     format!(
@@ -126,60 +278,191 @@ pub fn render_sidebar(app: &mut App, area: Rect, buf: &mut Buffer, ctx: &Ctx<'_>
                         sanitize_single_line(&c.display_label())
                     )
                 };
-                let active = app.active_channel == Some(c.id);
-                let unread = c.unread_count > 0 || c.mention_count > 0;
-                let st = if active {
+                let st = if active || in_voice {
                     ctx.s(Role::Hotkey).add_modifier(Modifier::BOLD)
                 } else if c.kind == ChannelKind::GuildCategory {
-                    ctx.s(Role::Inactive).add_modifier(Modifier::BOLD)
-                } else if unread {
+                    if muted {
+                        ctx.s(Role::Inactive)
+                            .add_modifier(Modifier::BOLD | Modifier::DIM)
+                    } else {
+                        ctx.s(Role::Inactive).add_modifier(Modifier::BOLD)
+                    }
+                } else if c.mention_count > 0 {
+                    ctx.s(Role::Mention)
+                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                } else if muted {
+                    ctx.s(Role::Inactive).add_modifier(Modifier::DIM)
+                } else if c.unread_count > 0 {
                     ctx.s(Role::Fg).add_modifier(Modifier::BOLD)
                 } else {
                     ctx.s(Role::Inactive)
                 };
-                let in_voice = app
-                    .store
-                    .voice
-                    .as_ref()
-                    .is_some_and(|v| v.channel_id == c.id);
-                let b = if in_voice {
-                    ctx.g.speaking.to_string()
-                } else {
-                    badge(c.mention_count, c.unread_count)
-                };
-                (format!("{indent}{name}"), b, st)
+                draw_sidebar_row(
+                    buf,
+                    ctx,
+                    area,
+                    y,
+                    &format!("{indent}{name}"),
+                    &b,
+                    selected,
+                    st,
+                );
             }
-        };
-        let selected = focused && row == app.sidebar.cursor;
-        let bw = u16::try_from(str_width(&badge)).unwrap_or(0);
-        let lw = area.width.saturating_sub(if bw > 0 { bw + 1 } else { 0 });
-        draw::list_row(buf, ctx, area.x, y, lw, &ctx.n(&label), selected, style);
-        if bw > 0 && area.width > bw {
-            let st = if badge.starts_with('@') {
-                ctx.s(Role::Mention).add_modifier(Modifier::BOLD)
-            } else {
-                ctx.s(Role::Hotkey)
-            };
-            draw::put_right(buf, area.x + lw, y, &badge, area.width - lw, st);
+            SideItem::VoiceMember(ch_id, user_id, depth) => {
+                let occ = app
+                    .store
+                    .effective_voice_occupants(*ch_id)
+                    .into_iter()
+                    .find(|p| p.user_id == *user_id);
+                let Some(p) = occ else {
+                    continue;
+                };
+                let guild_id = app.store.channel(*ch_id).and_then(|c| c.guild_id);
+                let display = guild_id
+                    .and_then(|gid| app.store.member_nick(gid, p.user_id))
+                    .map(|s| sanitize_single_line(s).into_owned())
+                    .unwrap_or_else(|| sanitize_single_line(&p.display_name).into_owned());
+                let indent = " ".repeat(usize::from(*depth));
+                let dot = if p.speaking {
+                    ctx.g.speaking
+                } else {
+                    ctx.g.silent
+                };
+                let mut tail = String::new();
+                if p.self_mute || p.server_mute {
+                    tail.push('M');
+                }
+                if p.self_deaf || p.server_deaf {
+                    tail.push('D');
+                }
+                if p.streaming {
+                    tail.push('S');
+                }
+                if p.volume != 100 {
+                    if !tail.is_empty() {
+                        tail.push(' ');
+                    }
+                    tail.push_str(&format!("{}%", p.volume));
+                }
+                let bw = u16::try_from(str_width(&tail)).unwrap_or(0);
+                let lw = area.width.saturating_sub(if bw > 0 { bw + 1 } else { 0 });
+                let fill_st = if selected {
+                    ctx.s(Role::Selected)
+                } else {
+                    ctx.base()
+                };
+                draw::fill(buf, Rect::new(area.x, y, area.width, 1), fill_st);
+                let mut x = area.x;
+                x += draw::put(buf, x, y, &indent, lw.saturating_sub(x - area.x), fill_st);
+                let dot_st = if selected {
+                    fill_st
+                } else if p.speaking {
+                    ctx.base()
+                        .fg(ctx.theme.presence_color(PresenceStatus::Online))
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    ctx.s(Role::Inactive)
+                };
+                x += draw::put(buf, x, y, dot, lw.saturating_sub(x - area.x), dot_st);
+                x += draw::put(buf, x, y, " ", lw.saturating_sub(x - area.x), fill_st);
+                let name_st = if selected {
+                    fill_st
+                } else if p.speaking {
+                    ctx.s(Role::Fg).add_modifier(Modifier::BOLD)
+                } else if let Some(rgb) =
+                    guild_id.and_then(|gid| app.store.member_role_color(gid, p.user_id, &[]))
+                    && ctx.cfg.depth != bbs_core::ColorDepth::Monochrome
+                {
+                    ctx.base().fg(ctx.theme.rgb(RgbColor::from_u32(rgb)))
+                } else {
+                    ctx.s(Role::Inactive)
+                };
+                let rem = lw.saturating_sub(x - area.x);
+                let lbl = text::truncate(&ctx.n(&display), usize::from(rem), ctx.g.ellipsis);
+                draw::put(buf, x, y, &lbl, rem, name_st);
+                if bw > 0 && area.width > bw {
+                    draw::put_right(
+                        buf,
+                        area.x + lw,
+                        y,
+                        &tail,
+                        area.width - lw,
+                        if selected {
+                            fill_st
+                        } else {
+                            ctx.s(Role::Inactive)
+                        },
+                    );
+                }
+            }
         }
     }
 }
 
-fn badge(mentions: u32, unread: u32) -> String {
+#[allow(clippy::too_many_arguments)]
+fn draw_sidebar_row(
+    buf: &mut Buffer,
+    ctx: &Ctx<'_>,
+    area: Rect,
+    y: u16,
+    label: &str,
+    badge: &str,
+    selected: bool,
+    style: Style,
+) {
+    let bw = u16::try_from(str_width(badge)).unwrap_or(0);
+    let lw = area.width.saturating_sub(if bw > 0 { bw + 1 } else { 0 });
+    draw::list_row(buf, ctx, area.x, y, lw, &ctx.n(label), selected, style);
+    draw_sidebar_badge(buf, ctx, area, y, lw, badge, false);
+}
+
+fn draw_sidebar_badge(
+    buf: &mut Buffer,
+    ctx: &Ctx<'_>,
+    area: Rect,
+    y: u16,
+    lw: u16,
+    badge: &str,
+    voice_active: bool,
+) {
+    let bw = u16::try_from(str_width(badge)).unwrap_or(0);
+    if bw > 0 && area.width > bw {
+        let st = if badge.starts_with('@') {
+            ctx.s(Role::Mention).add_modifier(Modifier::BOLD)
+        } else if voice_active {
+            ctx.base()
+                .fg(ctx.theme.presence_color(PresenceStatus::Online))
+                .add_modifier(Modifier::BOLD)
+        } else {
+            ctx.s(Role::Hotkey).add_modifier(Modifier::BOLD)
+        };
+        draw::put_right(buf, area.x + lw, y, badge, area.width - lw, st);
+    }
+}
+
+fn sidebar_badge(mentions: u32, unread: u32, muted: bool, g: crate::charset::Glyphs) -> String {
     if mentions > 0 {
         format!("@{}", mentions.min(99))
-    } else if unread > 0 {
-        format!("{}", unread.min(99))
+    } else if !muted && unread > 0 {
+        if unread == 1 {
+            g.dot.to_string()
+        } else {
+            format!("{}{}", g.dot, unread.min(99))
+        }
     } else {
         String::new()
     }
 }
 
-/// Members list (authors seen + DM recipients + voice participants).
-pub fn render_members(app: &App, area: Rect, buf: &mut Buffer, ctx: &Ctx<'_>, overlay: bool) {
+/// Members list (guild members + authors seen + DM recipients + voice participants).
+pub fn render_members(app: &mut App, area: Rect, buf: &mut Buffer, ctx: &Ctx<'_>, overlay: bool) {
     if area.width == 0 || area.height == 0 {
         return;
     }
+    let active_guild = app
+        .active_channel
+        .and_then(|cid| app.store.channel(cid).and_then(|c| c.guild_id))
+        .or(app.active_guild);
     let mut ids: Vec<Snowflake> = Vec::new();
     if let Some(ch) = app.active_channel {
         if let Some(c) = app.store.channel(ch) {
@@ -193,15 +476,40 @@ pub fn render_members(app: &App, area: Rect, buf: &mut Buffer, ctx: &Ctx<'_>, ov
             }
         }
     }
-    let mut members: Vec<(PresenceStatus, String, Snowflake)> = ids
+    if let Some(gid) = active_guild
+        && let Some(gm) = app.store.guild_members.get(&gid)
+    {
+        for uid in gm.keys() {
+            if !ids.contains(uid) {
+                ids.push(*uid);
+            }
+        }
+    }
+    if let Some(v) = &app.store.voice {
+        for p in &v.participants {
+            if !ids.contains(&p.user_id) {
+                ids.push(p.user_id);
+            }
+        }
+    }
+    let mut members: Vec<(PresenceStatus, String, Snowflake, Option<u32>)> = ids
         .iter()
-        .filter_map(|id| app.store.users.get(id))
-        .map(|u| {
-            (
-                app.store.presence.get(&u.id).copied().unwrap_or(u.presence),
-                sanitize_single_line(u.display_name()).into_owned(),
-                u.id,
-            )
+        .filter_map(|id| {
+            let u = app.store.users.get(id);
+            let nick = active_guild.and_then(|gid| app.store.member_nick(gid, *id));
+            let name = nick
+                .map(|s| sanitize_single_line(s).into_owned())
+                .or_else(|| u.map(|u| sanitize_single_line(u.display_name()).into_owned()))?;
+            let status = app
+                .store
+                .presence
+                .get(id)
+                .copied()
+                .or_else(|| u.map(|u| u.presence))
+                .unwrap_or(PresenceStatus::Offline);
+            let role_rgb =
+                active_guild.and_then(|gid| app.store.member_role_color(gid, *id, &[]));
+            Some((status, name, *id, role_rgb))
         })
         .collect();
     let rank = |p: PresenceStatus| match p {
@@ -219,28 +527,52 @@ pub fn render_members(app: &App, area: Rect, buf: &mut Buffer, ctx: &Ctx<'_>, ov
     let focused = overlay || app.focus == Focus::Members;
     let cursor = app.members_cursor.min(members.len().saturating_sub(1));
     let start = cursor.saturating_sub(h.saturating_sub(1));
-    for (i, (p, name, id)) in members.iter().enumerate().skip(start).take(h) {
+    let ascii_sym = ctx.g.is_ascii() || ctx.cfg.charset == bbs_core::ResolvedCharset::VtSafe;
+    for (i, (p, name, id, role_rgb)) in members.iter().enumerate().skip(start).take(h) {
         let y = area.y + u16::try_from(i - start).unwrap_or(0);
-        let sym = if ctx.g.is_ascii() || ctx.cfg.charset == bbs_core::ResolvedCharset::VtSafe {
+        if overlay {
+            app.modal_rows
+                .push((Rect::new(area.x, y, area.width, 1), i));
+        } else {
+            app.member_rows.push((y, *id));
+        }
+        let sym = ctx.n(if ascii_sym {
             p.ascii_symbol()
         } else {
             p.utf8_symbol()
+        });
+        let is_selected = focused && i == cursor;
+        let fill_st = if is_selected {
+            ctx.s(Role::Selected)
+        } else {
+            ctx.base()
         };
-        let st = match p {
-            PresenceStatus::Online => ctx.base().fg(ctx.theme.nick_color(id.as_u64())),
-            PresenceStatus::Offline | PresenceStatus::Invisible => ctx.s(Role::Inactive),
-            _ => ctx.s(Role::Fg),
+        draw::fill(buf, Rect::new(area.x, y, area.width, 1), fill_st);
+        let offline = matches!(p, PresenceStatus::Offline | PresenceStatus::Invisible);
+        let dot_st = if is_selected {
+            fill_st
+        } else if offline {
+            ctx.s(Role::Inactive).add_modifier(Modifier::DIM)
+        } else {
+            ctx.base().fg(ctx.theme.presence_color(*p))
         };
-        draw::list_row(
-            buf,
-            ctx,
-            area.x,
-            y,
-            area.width,
-            &ctx.n(&format!("{sym} {name}")),
-            focused && i == cursor,
-            st,
-        );
+        let name_st = if is_selected {
+            fill_st
+        } else if offline {
+            ctx.s(Role::Inactive).add_modifier(Modifier::DIM)
+        } else if let Some(rgb) = role_rgb
+            && ctx.cfg.depth != bbs_core::ColorDepth::Monochrome
+        {
+            ctx.base().fg(ctx.theme.rgb(RgbColor::from_u32(*rgb)))
+        } else {
+            ctx.base().fg(ctx.theme.nick_color(id.as_u64()))
+        };
+        let mut x = area.x;
+        x += draw::put(buf, x, y, &sym, area.right().saturating_sub(x), dot_st);
+        x += draw::put(buf, x, y, " ", area.right().saturating_sub(x), fill_st);
+        let rem = area.right().saturating_sub(x);
+        let lbl = text::truncate(&ctx.n(name), usize::from(rem), ctx.g.ellipsis);
+        draw::put(buf, x, y, &lbl, rem, name_st);
     }
 }
 
@@ -489,6 +821,12 @@ pub fn render_stage(app: &mut App, area: Rect, buf: &mut Buffer, ctx: &Ctx<'_>, 
             if verified { ctx.g.check } else { " " }
         );
         let ry = y + u16::try_from(i - start).unwrap_or(0);
+        if overlay {
+            app.modal_rows
+                .push((Rect::new(area.x, ry, area.width, 1), i));
+        } else {
+            app.deck_rows.push((ry, i));
+        }
         let selected = focused && i == cursor;
         let base = if selected {
             ctx.s(Role::Selected)
@@ -663,12 +1001,13 @@ fn render_media(app: &mut App, area: Rect, buf: &mut Buffer, ctx: &Ctx<'_>) {
                 })
             })
         });
-    let Some((url, w, h, name, animated)) = media else {
+    let Some((raw_url, w, h, name, mut animated)) = media else {
         return;
     };
+    animated = animated || crate::messages::url_looks_animated(&raw_url);
     let info = format!(
         "{} {}",
-        sanitize_single_line(m.author.display_name()),
+        sanitize_single_line(&app.store.author_display_name(&m)),
         sanitize_single_line(&name)
     );
     draw::put(
@@ -692,7 +1031,18 @@ fn render_media(app: &mut App, area: Rect, buf: &mut Buffer, ctx: &Ctx<'_>) {
         bw,
         bh.min(area.height.saturating_sub(1)),
     );
-    let frame = app.images.get(&url).cloned();
+    let url = crate::messages::resize_proxy_for_box(
+        &raw_url,
+        rect.width,
+        rect.height,
+        ctx.cfg.cell_px,
+        matches!(ctx.cfg.graphics, GraphicsTier::HalfBlock),
+    );
+    let frame = app
+        .images
+        .get(&url)
+        .or_else(|| app.images.get(&raw_url))
+        .cloned();
     render_image_box(
         app,
         buf,

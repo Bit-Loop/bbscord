@@ -27,7 +27,51 @@ pub fn resolve_mention(store: &Store, k: MentionKind, id: u64) -> Option<String>
     match k {
         MentionKind::User => store.user_name(sf),
         MentionKind::Channel => store.channel(sf).map(bbs_core::Channel::display_label),
-        MentionKind::Role => None,
+        MentionKind::Role => store
+            .guilds
+            .iter()
+            .find_map(|g| store.role_name(g.id, sf).map(str::to_string)),
+    }
+}
+
+/// Guild-aware resolver for `<@user>`, `<#channel>`, `<@&role>`, author nicknames, and role colors.
+pub struct StoreResolver<'a> {
+    store: &'a Store,
+    guild_id: Option<Snowflake>,
+}
+
+impl<'a> StoreResolver<'a> {
+    /// Construct a resolver scoped to `store` and optional `guild_id`.
+    #[must_use]
+    pub const fn new(store: &'a Store, guild_id: Option<Snowflake>) -> Self {
+        Self { store, guild_id }
+    }
+}
+
+impl crate::messages::Resolve for StoreResolver<'_> {
+    fn resolve(&self, k: MentionKind, id: u64) -> Option<String> {
+        let sf = Snowflake::new(id);
+        match k {
+            MentionKind::User => self
+                .guild_id
+                .and_then(|gid| self.store.member_nick(gid, sf).map(str::to_string))
+                .or_else(|| self.store.user_name(sf)),
+            MentionKind::Channel => self.store.channel(sf).map(bbs_core::Channel::display_label),
+            MentionKind::Role => self
+                .guild_id
+                .and_then(|gid| self.store.role_name(gid, sf).map(str::to_string))
+                .or_else(|| resolve_mention(self.store, MentionKind::Role, id)),
+        }
+    }
+
+    fn author_nick(&self, m: &bbs_core::Message) -> Option<String> {
+        Some(self.store.author_display_name(m))
+    }
+
+    fn author_color(&self, m: &bbs_core::Message) -> Option<u32> {
+        let gid = m.guild_id.or(self.guild_id)?;
+        self.store
+            .member_role_color(gid, m.author.id, &m.author_role_ids)
     }
 }
 
@@ -48,6 +92,7 @@ pub fn messages_view_params(app: &App) -> Option<(LayoutParams, u64, u16)> {
         max_img_rows: (l.messages.height / 2).clamp(1, 16),
         utc_offset_min: app.utc_offset_min,
         text_tags: app.cfg.graphics == GraphicsTier::TextTagOnly,
+        halfblock: app.cfg.graphics == GraphicsTier::HalfBlock,
     };
     let k = params_key(&p);
     Some((p, k, l.messages.height))
@@ -67,6 +112,15 @@ impl App {
     pub fn render_buffer(&mut self, area: Rect, buf: &mut Buffer) -> Option<(u16, u16)> {
         self.size = (area.width, area.height);
         self.image_slots.clear();
+        self.sidebar_rows.clear();
+        self.visible_message_rows.clear();
+        self.member_rows.clear();
+        self.deck_rows.clear();
+        self.modal_rect = None;
+        self.modal_rows.clear();
+        self.confirm_buttons = None;
+        self.autocomplete_rect = None;
+        self.autocomplete_rows.clear();
         // Composer line demand depends on chat width, which depends on layout: solve twice cheaply.
         let mut input = LayoutInput::new(area.width, area.height);
         input.show_sidebar = self.show_sidebar;
@@ -121,6 +175,9 @@ impl App {
         self.draw_banners(&layout, buf, &ctx);
         self.draw_separator(&layout, buf, &ctx);
         let mut cursor = self.draw_composer(&layout, buf, &ctx);
+        if self.mode == Mode::Insert && self.modals.is_empty() && self.autocomplete.is_open() {
+            self.draw_autocomplete(&layout, buf, &ctx);
+        }
         if let Some(m) = self.modals.last().cloned() {
             let c = crate::modals::render(self, &m, area, buf, &ctx);
             cursor = if m.has_input() { c } else { None };
@@ -137,9 +194,11 @@ impl App {
             .voice
             .as_ref()
             .is_some_and(|vc| matches!(vc.dave, bbs_core::DaveSessionState::Degraded { .. }));
+        let err_banner = bordered && !self.store.banners.is_empty();
         u16::from(ring)
             + u16::from(dave_degraded)
             + u16::from(!self.composer.attachments.is_empty())
+            + u16::from(err_banner)
     }
 
     fn pane_title(&self, kind: PaneKind, idx: u8, ctx: &Ctx<'_>) -> String {
@@ -411,8 +470,29 @@ impl App {
             vec![(mode, ctx.s(Role::Title).add_modifier(Modifier::BOLD))],
             1,
         ));
-        let menu = if l.chat().width >= 60 {
-            "[k]jump [i]nsert [V]oice [T]heme [?]help [q]uit"
+        let menu = if l.chat().width >= 56 {
+            match self.mode {
+                Mode::Insert => {
+                    if self.autocomplete.is_open() {
+                        "[Tab/Enter]complete [↑/↓]pick [Esc]close"
+                    } else if matches!(self.composer.target, ComposeTarget::Reply { .. }) {
+                        "[Enter]send [Tab]ping [Ctrl+J]nl [Esc]cancel"
+                    } else if matches!(self.composer.target, ComposeTarget::Edit { .. }) {
+                        "[Enter]save [Ctrl+J]nl [Esc]cancel"
+                    } else {
+                        "[Enter]send [@:#]complete [Ctrl+J]nl [Esc]normal"
+                    }
+                }
+                Mode::Normal => match self.focus {
+                    Focus::Sidebar => "[↑/↓]nav [Enter]open [/]jump [v]oice [?]help",
+                    Focus::Messages if self.selected.is_some() => {
+                        "[r]eply [R]eact [e]dit [d]el [o]pen [y]copy [?]help"
+                    }
+                    Focus::Messages => "[i]nsert [↑/↓]select [/]jump [f]ind [G]if [?]help",
+                    Focus::Deck(_) => "[-/+]vol [m]ute [D]eaf [w]atch [v]erify [?]help",
+                    Focus::Members => "[↑/↓]nav [Tab]pane [/]jump [?]help",
+                },
+            }
         } else {
             "[?]help"
         };
@@ -426,6 +506,8 @@ impl App {
                     ctx.s(Role::Hotkey).add_modifier(Modifier::BOLD),
                 ));
                 menu_pieces.push((format!("{} ", &part[b..]), ctx.s(Role::Inactive)));
+            } else if !part.is_empty() {
+                menu_pieces.push((format!("{part} "), ctx.s(Role::Inactive)));
             }
         }
         if let Some(last) = menu_pieces.last_mut() {
@@ -502,10 +584,17 @@ impl App {
         match sem {
             Sem::Text(md) => md_style(md, ctx, revealed),
             Sem::Time => ctx.s(Role::Inactive),
-            Sem::Nick(id) => ctx
-                .base()
-                .fg(ctx.theme.nick_color(id))
-                .add_modifier(Modifier::BOLD),
+            Sem::Nick(id, role_rgb) => {
+                let fg = match role_rgb {
+                    Some(rgb)
+                        if rgb != 0 && ctx.cfg.depth != bbs_core::ColorDepth::Monochrome =>
+                    {
+                        ctx.theme.rgb(bbs_core::RgbColor::from_u32(rgb))
+                    }
+                    _ => ctx.theme.nick_color(id),
+                };
+                ctx.base().fg(fg).add_modifier(Modifier::BOLD)
+            }
             Sem::Gutter => ctx.s(Role::Divider),
             Sem::Dim => ctx.s(Role::Inactive),
             Sem::EmbedBar(c) => match c {
@@ -577,7 +666,11 @@ impl App {
             );
             return;
         }
-        let res = |k, i| resolve_mention(store, k, i);
+        let active_guild = store
+            .channel(ch)
+            .and_then(|c| c.guild_id)
+            .or(self.active_guild);
+        let res = StoreResolver::new(store, active_guild);
         let ment = |m: &bbs_core::Message| store.mentions_me(m);
         let tl = Timeline {
             msgs: &entry.messages,
@@ -602,6 +695,7 @@ impl App {
         let selected = self.selected;
         for (i, vl) in view.lines.iter().enumerate() {
             let y = area.y + pad + u16::try_from(i).unwrap_or(0);
+            self.visible_message_rows.push((y, vl.message_id));
             let is_sel = selected == Some(vl.message_id);
             let revealed = self.revealed.contains(&vl.message_id);
             let row_style = if is_sel {
@@ -653,13 +747,13 @@ impl App {
                 };
                 let w = img.cols.min(maxx.saturating_sub(x0));
                 if w > 0 {
-                    // Collect/extend the slot for this image.
+                    // Collect/extend the slot for this image (require vertical adjacency so
+                    // duplicate image URLs in distinct messages never merge into one giant slot).
                     let box_top = y.saturating_sub(img.row.min(y - area.y));
                     let clip_top = img.row.saturating_sub(y - box_top);
-                    if let Some(s) = slots
-                        .iter_mut()
-                        .find(|s| s.url == img.url && s.rect.x == x0)
-                    {
+                    if let Some(s) = slots.iter_mut().find(|s| {
+                        s.url == img.url && s.rect.x == x0 && s.visible.bottom() == y
+                    }) {
                         s.visible.height = (y + 1).saturating_sub(s.visible.y);
                     } else {
                         let full_y = i32::from(y) - i32::from(img.row);
@@ -680,6 +774,12 @@ impl App {
                     }
                 }
             }
+        }
+        // When no message is explicitly selected, animate the newest visible chat GIF at full cadence.
+        if selected.is_none()
+            && let Some(slot) = slots.iter_mut().rev().find(|s| s.animated)
+        {
+            slot.focused = true;
         }
         // Draw image boxes (placeholder / halfblock) over their visible rects.
         for s in &slots {
@@ -768,6 +868,20 @@ impl App {
             let s = format!("{} {}: {}", ctx.g.clip, names.len(), names.join(", "));
             draw::put(buf, r.x, r.y, &ctx.n(&s), r.width, ctx.s(Role::Hotkey));
         }
+        if l.header.is_none()
+            && let Some(banner) = self.store.banners.last()
+            && let Some(r) = rows.next()
+        {
+            let s = format!("! [{}] {}", banner.scope, banner.message);
+            draw::put(
+                buf,
+                r.x,
+                r.y,
+                &ctx.n(&s),
+                r.width,
+                ctx.s(Role::Mention).add_modifier(Modifier::BOLD),
+            );
+        }
     }
 
     fn draw_separator(&self, l: &Layout, buf: &mut Buffer, ctx: &Ctx<'_>) {
@@ -790,20 +904,29 @@ impl App {
         let mut parts: Vec<(String, Style)> = Vec::new();
         match &self.composer.target {
             ComposeTarget::Reply {
-                author, snippet, ..
+                author,
+                snippet,
+                mention,
+                ..
             } => {
+                let ping_badge = if *mention { "[@]" } else { "[silent]" };
                 parts.push((
                     format!(
-                        "{} {}: {}",
+                        "{} {} {}: {}",
                         ctx.g.reply,
+                        ping_badge,
                         sanitize_single_line(author),
                         snippet
                     ),
-                    ctx.s(Role::Hotkey),
+                    if *mention {
+                        ctx.s(Role::Hotkey).add_modifier(Modifier::BOLD)
+                    } else {
+                        ctx.s(Role::Inactive)
+                    },
                 ));
             }
             ComposeTarget::Edit { .. } => {
-                parts.push(("editing (Esc keeps draft)".to_string(), ctx.s(Role::Hotkey)))
+                parts.push(("editing (Esc cancels)".to_string(), ctx.s(Role::Hotkey)))
             }
             ComposeTarget::New => {}
         }
@@ -851,9 +974,12 @@ impl App {
         // Short chrome: reply prefix inline.
         let prefix = if l.separator.is_none() {
             match &self.composer.target {
-                ComposeTarget::Reply { author, .. } => format!(
-                    "{}{}>",
+                ComposeTarget::Reply {
+                    author, mention, ..
+                } => format!(
+                    "{}{}{}>",
                     ctx.g.reply,
+                    if *mention { "@" } else { "" },
                     text::truncate(&sanitize_single_line(author), 8, ctx.g.ellipsis)
                 ),
                 ComposeTarget::Edit { .. } => "edit>".to_string(),
@@ -887,9 +1013,9 @@ impl App {
                 .map(|c| sanitize_single_line(&c.display_label()).into_owned())
                 .unwrap_or_default();
             let hint = if insert {
-                format!("Message {ch_name} - Enter send, Ctrl+J newline, Esc normal")
+                format!("Message {ch_name} - Enter send, @/#/: complete, Ctrl+J newline, Esc normal")
             } else {
-                "[i] compose  [k] jump  [?] help".to_string()
+                "[i] compose  [/] jump  [?] help".to_string()
             };
             draw::put(buf, tx, r.y, &ctx.n(&hint), tw, ctx.s(Role::Inactive));
             return insert.then_some((tx, r.y));
@@ -919,6 +1045,80 @@ impl App {
             draw::put_right(buf, r.x, r.bottom() - 1, &s, r.width, st);
         }
         insert.then_some((tx + ccol.min(tw.saturating_sub(1)), r.y + crow - first))
+    }
+
+    fn draw_autocomplete(&mut self, l: &Layout, buf: &mut Buffer, ctx: &Ctx<'_>) {
+        if !self.autocomplete.is_open() {
+            return;
+        }
+        let anchor_y = l.separator.map_or(l.composer.y, |s| s.y);
+        let avail_h = anchor_y.saturating_sub(l.messages.y);
+        if avail_h < 3 || l.composer.width < 12 {
+            return;
+        }
+        let items_n = u16::try_from(self.autocomplete.items.len()).unwrap_or(1);
+        let pop_h = items_n.saturating_add(2).min(avail_h).min(10);
+        let pop_w = l.composer.width.min(48);
+        let rect = Rect::new(l.composer.x, anchor_y.saturating_sub(pop_h), pop_w, pop_h)
+            .intersection(buf.area);
+        if rect.width < 4 || rect.height < 3 {
+            return;
+        }
+        // Prevent chat images from painting over the autocomplete popup.
+        self.image_slots
+            .retain(|s| s.visible.intersection(rect).is_empty());
+        let title = match self.autocomplete.kind {
+            Some(crate::composer::CompletionKind::Mention) => "Mention",
+            Some(crate::composer::CompletionKind::Emoji) => "Emoji",
+            Some(crate::composer::CompletionKind::Channel) => "Channel",
+            None => "Complete",
+        };
+        let inner = draw::boxed(buf, ctx, rect, title, Role::BoxMembers);
+        self.autocomplete_rect = Some(rect);
+        let rows = usize::from(inner.height);
+        if rows == 0 || inner.width == 0 {
+            return;
+        }
+        let start = self.autocomplete.cursor.saturating_sub(rows.saturating_sub(1));
+        for (i, item) in self
+            .autocomplete
+            .items
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(rows)
+        {
+            let y = inner.y + u16::try_from(i - start).unwrap_or(0);
+            self.autocomplete_rows
+                .push((Rect::new(inner.x, y, inner.width, 1), i));
+            let selected = i == self.autocomplete.cursor;
+            let dw = u16::try_from(str_width(&item.detail)).unwrap_or(0);
+            let lw = inner.width.saturating_sub(if dw > 0 { dw + 1 } else { 0 });
+            draw::list_row(
+                buf,
+                ctx,
+                inner.x,
+                y,
+                lw,
+                &ctx.n(&item.label),
+                selected,
+                ctx.s(Role::Fg),
+            );
+            if dw > 0 && inner.width > dw {
+                draw::put_right(
+                    buf,
+                    inner.x + lw,
+                    y,
+                    &ctx.n(&item.detail),
+                    inner.width - lw,
+                    if selected {
+                        ctx.s(Role::Selected)
+                    } else {
+                        ctx.s(Role::Inactive)
+                    },
+                );
+            }
+        }
     }
 }
 
