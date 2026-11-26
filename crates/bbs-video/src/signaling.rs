@@ -1015,6 +1015,8 @@ async fn run_stream_rtc_loop<S>(
 
     let mut heartbeat_task: Option<tokio::task::JoinHandle<()>> = None;
     let seq_ack = Arc::new(std::sync::atomic::AtomicI64::new(-1));
+    let awaiting_heartbeat_ack = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (control_tx, mut control_rx) = mpsc::channel::<String>(4);
     let mut known_users: HashSet<u64> =
         HashSet::from([config.user_id.as_u64(), config.stream_key.user_id().as_u64()]);
     let mut received_clients_connect = false;
@@ -1025,7 +1027,12 @@ async fn run_stream_rtc_loop<S>(
     };
 
     let disconnect_reason = loop {
-        match ws_reader.next().await {
+        let next_msg = tokio::select! {
+            biased;
+            Some(reason) = control_rx.recv() => break reason,
+            msg = ws_reader.next() => msg,
+        };
+        match next_msg {
             Some(Ok(WsMessage::Text(text))) => {
                 let parsed: Value = match serde_json::from_str(text.as_str()) {
                     Ok(v) => v,
@@ -1049,18 +1056,32 @@ async fn run_stream_rtc_loop<S>(
                         let interval_ms = d
                             .get("heartbeat_interval")
                             .and_then(Value::as_f64)
-                            .map_or(15_000u64, |v| (v as u64).clamp(1_000, 120_000));
+                            .map_or(15_000u64, |v| (v as u64).clamp(50, 120_000));
                         if let Some(prev) = heartbeat_task.take() {
                             prev.abort();
                         }
+                        awaiting_heartbeat_ack
+                            .store(false, std::sync::atomic::Ordering::Release);
                         let hb_tx = outbound_tx.clone();
                         let hb_seq = Arc::clone(&seq_ack);
+                        let hb_awaiting = Arc::clone(&awaiting_heartbeat_ack);
+                        let hb_control = control_tx.clone();
                         heartbeat_task = Some(tokio::spawn(async move {
                             let mut ticker = tokio::time::interval(Duration::from_millis(interval_ms));
                             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                             ticker.tick().await;
                             loop {
                                 ticker.tick().await;
+                                if hb_awaiting.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                                    warn!(
+                                        "Stream RTC heartbeat ACK missed (zombie connection); closing socket"
+                                    );
+                                    let _ = hb_tx.send(WsMessage::Close(None)).await;
+                                    let _ = hb_control
+                                        .send("heartbeat ACK missed (zombie connection)".to_string())
+                                        .await;
+                                    break;
+                                }
                                 let nonce = SystemTime::now()
                                     .duration_since(UNIX_EPOCH)
                                     .map_or(0, |d| d.as_millis() as u64);
@@ -1220,6 +1241,8 @@ async fn run_stream_rtc_loop<S>(
                         let _ = events_tx.send(StreamRtcEvent::DaveStateChanged(dave.session_state()));
                     }
                     rtc_op::HEARTBEAT_ACK => {
+                        awaiting_heartbeat_ack
+                            .store(false, std::sync::atomic::Ordering::Release);
                         trace!("received Stream RTC HEARTBEAT_ACK");
                     }
                     other => {
@@ -1289,14 +1312,14 @@ async fn run_stream_rtc_loop<S>(
                             }
                             Ok(false) => {}
                             Err(err) => {
-                                warn!(error = %err, transition_id, "invalid DAVE commit");
-                                let invalid = json!({
-                                    "op": rtc_op::DAVE_MLS_INVALID_COMMIT_WELCOME,
-                                    "d": { "transition_id": transition_id }
-                                });
-                                if let Ok(s) = serde_json::to_string(&invalid) {
-                                    let _ = outbound_tx.send(WsMessage::text(s)).await;
-                                }
+                                warn!(error = %err, transition_id, "invalid DAVE commit; sending Op 31 and re-uploading KeyPackage");
+                                send_dave_invalid_and_recover(
+                                    &dave,
+                                    &outbound_tx,
+                                    transition_id,
+                                    negotiated_dave_version,
+                                )
+                                .await;
                             }
                         }
                         let _ = events_tx.send(StreamRtcEvent::DaveStateChanged(dave.session_state()));
@@ -1326,14 +1349,14 @@ async fn run_stream_rtc_loop<S>(
                                 }
                             }
                             Err(err) => {
-                                warn!(error = %err, transition_id, "invalid DAVE welcome");
-                                let invalid = json!({
-                                    "op": rtc_op::DAVE_MLS_INVALID_COMMIT_WELCOME,
-                                    "d": { "transition_id": transition_id }
-                                });
-                                if let Ok(s) = serde_json::to_string(&invalid) {
-                                    let _ = outbound_tx.send(WsMessage::text(s)).await;
-                                }
+                                warn!(error = %err, transition_id, "invalid DAVE welcome; sending Op 31 and re-uploading KeyPackage");
+                                send_dave_invalid_and_recover(
+                                    &dave,
+                                    &outbound_tx,
+                                    transition_id,
+                                    negotiated_dave_version,
+                                )
+                                .await;
                             }
                         }
                         let _ = events_tx.send(StreamRtcEvent::DaveStateChanged(dave.session_state()));
@@ -1364,6 +1387,35 @@ async fn run_stream_rtc_loop<S>(
     let _ = events_tx.send(StreamRtcEvent::Disconnected {
         reason: disconnect_reason,
     });
+}
+
+async fn send_dave_invalid_and_recover(
+    dave: &DaveVideoContext,
+    outbound_tx: &mpsc::Sender<WsMessage>,
+    transition_id: u16,
+    protocol_version: u16,
+) {
+    let invalid = json!({
+        "op": rtc_op::DAVE_MLS_INVALID_COMMIT_WELCOME,
+        "d": { "transition_id": transition_id }
+    });
+    if let Ok(s) = serde_json::to_string(&invalid) {
+        let _ = outbound_tx.send(WsMessage::text(s)).await;
+    }
+
+    match dave.recover_from_invalid_commit_welcome(protocol_version) {
+        Ok(kp) => {
+            let msg = encode_client_dave_binary_frame(rtc_op::DAVE_MLS_KEY_PACKAGE, &kp);
+            let _ = outbound_tx.send(WsMessage::binary(msg)).await;
+        }
+        Err(err) => {
+            warn!(
+                error = %err,
+                transition_id,
+                "failed to reinit DAVE session and regenerate KeyPackage after Op 31"
+            );
+        }
+    }
 }
 
 fn parse_ready_ssrcs(d: &Value) -> StreamSsrcMap {
@@ -1644,5 +1696,150 @@ mod tests {
         assert_eq!(payload["op"], 1);
         assert_eq!(payload["d"]["protocol"], "webrtc");
         assert!(payload["d"]["codecs"].as_array().is_some_and(|a| !a.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn zombie_heartbeat_disconnects_on_missed_ack() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local mock WS");
+        let addr = listener.local_addr().expect("local addr");
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept client");
+            let mut ws = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("ws handshake");
+            // Read IDENTIFY then send HELLO with 60ms heartbeat interval and never send HEARTBEAT_ACK.
+            let _ = ws.next().await;
+            let hello = json!({ "op": rtc_op::HELLO, "d": { "heartbeat_interval": 60 } });
+            let _ = ws.send(WsMessage::text(hello.to_string())).await;
+            // Drain incoming messages without acknowledging heartbeats until client disconnects.
+            while let Some(Ok(msg)) = ws.next().await {
+                if matches!(msg, WsMessage::Close(_)) {
+                    break;
+                }
+            }
+        });
+
+        let dave = DaveVideoContext::new(Snowflake::new(10), Snowflake::new(20), 1).expect("dave");
+        let cfg = StreamRtcConfig {
+            stream_key: StreamKey::Call {
+                channel_id: Snowflake::new(20),
+                user_id: Snowflake::new(10),
+            },
+            rtc_server_id: Snowflake::new(99),
+            user_id: Snowflake::new(10),
+            session_id: "sess".to_string(),
+            endpoint: format!("ws://{addr}"),
+            token: RedactedStreamToken::new("tok".to_string()),
+            codecs: Vec::new(),
+            local_sdp_offer: "v=0\r\n".to_string(),
+            broadcast_quality: None,
+            enable_dave: true,
+        };
+
+        let mut client = StreamRtcClient::connect(cfg, dave).await.expect("connect");
+        let mut rx = client.subscribe();
+
+        let event = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(ev @ StreamRtcEvent::Disconnected { .. }) = rx.recv().await {
+                    return ev;
+                }
+            }
+        })
+        .await
+        .expect("zombie connection should disconnect promptly on missed ACK");
+
+        match event {
+            StreamRtcEvent::Disconnected { reason } => {
+                assert!(
+                    reason.contains("heartbeat ACK missed"),
+                    "unexpected disconnect reason: {reason}"
+                );
+            }
+            other => panic!("expected Disconnected event, got {other:?}"),
+        }
+
+        client.disconnect().await;
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn invalid_dave_welcome_sends_op31_and_reuploads_key_package() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local mock WS");
+        let addr = listener.local_addr().expect("local addr");
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept client");
+            let mut ws = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("ws handshake");
+            // Read IDENTIFY.
+            let _ = ws.next().await;
+            // Send corrupt Op 30 (Welcome): seq=1, op=30, transition_id=7, garbage welcome bytes.
+            let corrupt_welcome = vec![0x00, 0x01, rtc_op::DAVE_MLS_WELCOME, 0x00, 0x07, 0xDE, 0xAD, 0xBE, 0xEF];
+            ws.send(WsMessage::binary(corrupt_welcome))
+                .await
+                .expect("send corrupt welcome");
+
+            // Expect JSON Op 31 DAVE_MLS_INVALID_COMMIT_WELCOME followed by binary Op 26 KeyPackage.
+            let mut saw_op31 = false;
+            let mut saw_op26 = false;
+            while let Ok(Some(Ok(msg))) =
+                tokio::time::timeout(Duration::from_secs(2), ws.next()).await
+            {
+                match msg {
+                    WsMessage::Text(txt) => {
+                        if let Ok(val) = serde_json::from_str::<Value>(txt.as_str())
+                            && val["op"] == rtc_op::DAVE_MLS_INVALID_COMMIT_WELCOME
+                            && val["d"]["transition_id"] == 7
+                        {
+                            saw_op31 = true;
+                        }
+                    }
+                    WsMessage::Binary(bin)
+                        if bin.first().copied() == Some(rtc_op::DAVE_MLS_KEY_PACKAGE)
+                            && bin.len() > 16 =>
+                    {
+                        saw_op26 = true;
+                    }
+                    _ => {}
+                }
+                if saw_op31 && saw_op26 {
+                    break;
+                }
+            }
+            (saw_op31, saw_op26)
+        });
+
+        let dave = DaveVideoContext::new(Snowflake::new(10), Snowflake::new(20), 1).expect("dave");
+        let cfg = StreamRtcConfig {
+            stream_key: StreamKey::Call {
+                channel_id: Snowflake::new(20),
+                user_id: Snowflake::new(10),
+            },
+            rtc_server_id: Snowflake::new(99),
+            user_id: Snowflake::new(10),
+            session_id: "sess".to_string(),
+            endpoint: format!("ws://{addr}"),
+            token: RedactedStreamToken::new("tok".to_string()),
+            codecs: Vec::new(),
+            local_sdp_offer: "v=0\r\n".to_string(),
+            broadcast_quality: None,
+            enable_dave: true,
+        };
+
+        let mut client = StreamRtcClient::connect(cfg, dave).await.expect("connect");
+        let (saw_op31, saw_op26) = server.await.expect("server task");
+        assert!(saw_op31, "client must report Op 31 on invalid DAVE welcome");
+        assert!(
+            saw_op26,
+            "client must re-init MLS and upload fresh Op 26 KeyPackage after Op 31"
+        );
+        client.disconnect().await;
     }
 }

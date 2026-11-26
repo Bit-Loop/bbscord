@@ -148,9 +148,26 @@ impl GStreamerVideoStreamEngine {
         })
     }
 
-    /// Record the active Discord Main Gateway `session_id` needed for Stream RTC `IDENTIFY`.
+    /// Record the active Discord Main Gateway `session_id` needed for Stream RTC `IDENTIFY`,
+    /// immediately advancing any Go Live sessions whose RTC credentials arrived earlier.
     pub async fn set_gateway_session_id(&self, session_id: impl Into<String>) {
         *self.gateway_session_id.write().await = Some(session_id.into());
+        let pending_keys: Vec<StreamKey> = self
+            .pending_rtc
+            .read()
+            .await
+            .keys()
+            .filter_map(|k| StreamKey::parse(k).ok())
+            .collect();
+        for key in pending_keys {
+            if let Err(err) = self.try_connect_stream_rtc(key).await {
+                warn!(
+                    stream_key = %key,
+                    error = %err,
+                    "deferred Stream RTC connection attempt failed"
+                );
+            }
+        }
     }
 
     /// Subscribe to outbound [`GatewayStreamCommand`]s (`STREAM_CREATE`, `STREAM_WATCH`,
@@ -334,31 +351,16 @@ impl GStreamerVideoStreamEngine {
             return Ok(());
         };
 
-        let creds = {
-            let mut pending = self.pending_rtc.write().await;
-            let ready = pending.get(&canonical).is_some_and(|p| {
-                p.rtc_server_id.is_some() && p.endpoint.is_some() && p.token.is_some()
-            });
-            if !ready {
-                return Ok(());
-            }
-            pending.remove(&canonical)
-        };
-
-        let Some(PendingStreamRtcInfo {
-            rtc_server_id: Some(rtc_server_id),
-            endpoint: Some(endpoint),
-            token: Some(token),
-        }) = creds
-        else {
+        // Ensure all required credentials are buffered BEFORE probing/allocating offers.
+        let creds_ready = self.pending_rtc.read().await.get(&canonical).is_some_and(|p| {
+            p.rtc_server_id.is_some() && p.endpoint.is_some() && p.token.is_some()
+        });
+        if !creds_ready {
             return Ok(());
-        };
+        }
 
-        let codecs = tokio::task::spawn_blocking(VideoCodec::negotiate_host_codec_specs)
-            .await
-            .map_err(|err| CoreError::Video(format!("codec negotiation probe failed: {err}")))?;
-
-        // Case 1: Active outbound broadcast matching this stream key.
+        // Confirm an active broadcast or watcher exists BEFORE claiming buffered credentials so
+        // early STREAM_CREATE / STREAM_SERVER_UPDATE dispatches are never discarded.
         let broadcast_target = {
             let guard = self.broadcast.read().await;
             guard.as_ref().and_then(|b| {
@@ -379,11 +381,73 @@ impl GStreamerVideoStreamEngine {
             })
         };
 
+        let watch_target = if broadcast_target.is_none() {
+            let guard = self.watchers.read().await;
+            guard
+                .get(&canonical)
+                .map(|w| (Arc::clone(&w.pipeline), w.dave.clone()))
+        } else {
+            None
+        };
+
+        if broadcast_target.is_none() && watch_target.is_none() {
+            debug!(
+                stream_key = %canonical,
+                "buffering Stream RTC credentials until watch_stream or start_broadcast activates"
+            );
+            return Ok(());
+        }
+
+        // Generate the local WebRTC SDP offer BEFORE removing credentials; propagate errors rather
+        // than sending an empty SDP string in `SELECT_PROTOCOL`.
+        let local_sdp = if let Some((ref pipeline_arc, _, _)) = broadcast_target {
+            let pipe = pipeline_arc.lock().await;
+            pipe.create_webrtc_offer().await.map_err(|err| {
+                warn!(stream_key = %canonical, error = %err, "broadcast create_webrtc_offer failed");
+                err
+            })?
+        } else if let Some((ref pipeline_arc, _)) = watch_target {
+            let pipe = pipeline_arc.lock().await;
+            pipe.create_webrtc_offer().await.map_err(|err| {
+                warn!(stream_key = %canonical, error = %err, "watch create_webrtc_offer failed");
+                err
+            })?
+        } else {
+            return Ok(());
+        };
+
+        if local_sdp.trim().is_empty() {
+            return Err(CoreError::Video(format!(
+                "webrtcbin produced empty SDP offer for stream `{canonical}`"
+            )));
+        }
+
+        let codecs = tokio::task::spawn_blocking(VideoCodec::negotiate_host_codec_specs)
+            .await
+            .map_err(|err| CoreError::Video(format!("codec negotiation probe failed: {err}")))?;
+
+        let creds = {
+            let mut pending = self.pending_rtc.write().await;
+            let still_ready = pending.get(&canonical).is_some_and(|p| {
+                p.rtc_server_id.is_some() && p.endpoint.is_some() && p.token.is_some()
+            });
+            if !still_ready {
+                return Ok(());
+            }
+            pending.remove(&canonical)
+        };
+
+        let Some(PendingStreamRtcInfo {
+            rtc_server_id: Some(rtc_server_id),
+            endpoint: Some(endpoint),
+            token: Some(token),
+        }) = creds
+        else {
+            return Ok(());
+        };
+
+        // Case 1: Active outbound broadcast matching this stream key.
         if let Some((pipeline_arc, dave, quality)) = broadcast_target {
-            let local_sdp = {
-                let pipe = pipeline_arc.lock().await;
-                pipe.create_webrtc_offer().await.unwrap_or_default()
-            };
             let rtc_cfg = StreamRtcConfig {
                 stream_key,
                 rtc_server_id,
@@ -414,28 +478,26 @@ impl GStreamerVideoStreamEngine {
                     }
                 }
             });
-            if let Some(active) = self.broadcast.write().await.as_mut()
-                && active.descriptor.stream_key == canonical
-            {
-                active.rtc_client = Some(client);
-                active.bridge_task = Some(bridge);
-            }
+
+            let (cleanup_rtc, cleanup_bridge) = {
+                let mut guard = self.broadcast.write().await;
+                if let Some(active) = guard.as_mut()
+                    && active.descriptor.stream_key == canonical
+                {
+                    let prev_rtc = active.rtc_client.replace(client);
+                    let prev_bridge = active.bridge_task.replace(bridge);
+                    (prev_rtc, prev_bridge)
+                } else {
+                    // Broadcast stopped concurrently while `connect()` was awaiting.
+                    (Some(client), Some(bridge))
+                }
+            };
+            cleanup_rtc_and_bridge(cleanup_rtc, cleanup_bridge).await;
             return Ok(());
         }
 
         // Case 2: Active watch session matching this stream key.
-        let watch_target = {
-            let guard = self.watchers.read().await;
-            guard
-                .get(&canonical)
-                .map(|w| (Arc::clone(&w.pipeline), w.dave.clone()))
-        };
-
         if let Some((pipeline_arc, dave)) = watch_target {
-            let local_sdp = {
-                let pipe = pipeline_arc.lock().await;
-                pipe.create_webrtc_offer().await.unwrap_or_default()
-            };
             let rtc_cfg = StreamRtcConfig {
                 stream_key,
                 rtc_server_id,
@@ -466,10 +528,19 @@ impl GStreamerVideoStreamEngine {
                     }
                 }
             });
-            if let Some(active) = self.watchers.write().await.get_mut(&canonical) {
-                active.rtc_client = Some(client);
-                active.bridge_task = Some(bridge);
-            }
+
+            let (cleanup_rtc, cleanup_bridge) = {
+                let mut guard = self.watchers.write().await;
+                if let Some(active) = guard.get_mut(&canonical) {
+                    let prev_rtc = active.rtc_client.replace(client);
+                    let prev_bridge = active.bridge_task.replace(bridge);
+                    (prev_rtc, prev_bridge)
+                } else {
+                    // Watcher stopped concurrently while `connect()` was awaiting.
+                    (Some(client), Some(bridge))
+                }
+            };
+            cleanup_rtc_and_bridge(cleanup_rtc, cleanup_bridge).await;
         }
 
         Ok(())
@@ -569,6 +640,9 @@ impl VideoStreamEngine for GStreamerVideoStreamEngine {
         let _ = self.gateway_cmd_tx.send(GatewayStreamCommand::Watch {
             stream_key: parsed_key,
         });
+
+        // Claim any Stream RTC credentials that were already buffered before watch_stream ran.
+        self.try_connect_stream_rtc(parsed_key).await?;
 
         Ok(descriptor)
     }
@@ -688,6 +762,9 @@ impl VideoStreamEngine for GStreamerVideoStreamEngine {
             preferred_region: None,
         });
 
+        // Claim any Stream RTC credentials that were already buffered before start_broadcast ran.
+        self.try_connect_stream_rtc(stream_key).await?;
+
         Ok(descriptor)
     }
 
@@ -727,14 +804,21 @@ impl VideoStreamEngine for GStreamerVideoStreamEngine {
     }
 }
 
-async fn teardown_watch_session(mut session: ActiveWatchSession) {
-    if let Some(handle) = session.bridge_task.take() {
+async fn cleanup_rtc_and_bridge(
+    rtc_client: Option<StreamRtcClient>,
+    bridge_task: Option<tokio::task::JoinHandle<()>>,
+) {
+    if let Some(handle) = bridge_task {
         handle.abort();
         let _ = handle.await;
     }
-    if let Some(mut rtc) = session.rtc_client.take() {
+    if let Some(mut rtc) = rtc_client {
         rtc.disconnect().await;
     }
+}
+
+async fn teardown_watch_session(mut session: ActiveWatchSession) {
+    cleanup_rtc_and_bridge(session.rtc_client.take(), session.bridge_task.take()).await;
     session.pipeline.lock().await.stop().await;
 }
 
@@ -823,6 +907,105 @@ mod tests {
 
         engine.stop_broadcast().await.expect("stop broadcast");
         assert!(engine.active_broadcast().await.expect("query").is_none());
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn buffered_rtc_credentials_survive_until_watch_and_session_id_arrive() {
+        use futures::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local mock RTC WS");
+        let addr = listener.local_addr().expect("local addr");
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept client");
+            let mut ws = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("ws accept");
+            // 1. Expect IDENTIFY, then send READY so client sends SELECT_PROTOCOL with SDP offer.
+            let _identify = ws.next().await;
+            let ready = serde_json::json!({
+                "op": signaling::rtc_op::READY,
+                "d": {
+                    "ssrc": 1000,
+                    "ip": "127.0.0.1",
+                    "port": 50000,
+                    "modes": ["aead_xchacha20_poly1305_rtpsize"],
+                    "streams": [{ "type": "video", "ssrc": 1001, "rtx_ssrc": 1002, "rid": "100", "quality": 100, "active": true }]
+                }
+            });
+            ws.send(WsMessage::text(ready.to_string()))
+                .await
+                .expect("send READY");
+
+            let mut captured_sdp = String::new();
+            while let Ok(Some(Ok(msg))) =
+                tokio::time::timeout(std::time::Duration::from_secs(3), ws.next()).await
+            {
+                if let WsMessage::Text(txt) = msg
+                    && let Ok(val) = serde_json::from_str::<serde_json::Value>(txt.as_str())
+                    && val["op"] == signaling::rtc_op::SELECT_PROTOCOL
+                {
+                    captured_sdp = val["d"]["sdp"].as_str().unwrap_or_default().to_string();
+                    break;
+                }
+            }
+            captured_sdp
+        });
+
+        let engine = GStreamerVideoStreamEngine::new(VideoEngineConfig::new(
+            Snowflake::new(1001),
+            "bitloop",
+        ))
+        .expect("init video engine");
+
+        let stream_key = StreamKey::Call {
+            channel_id: Snowflake::new(777),
+            user_id: Snowflake::new(2002),
+        };
+
+        // Arrive BEFORE watch_stream AND BEFORE set_gateway_session_id: must stay buffered!
+        engine
+            .apply_gateway_event(GatewayStreamEvent::StreamCreate {
+                stream_key,
+                rtc_server_id: Snowflake::new(5555),
+                rtc_channel_id: None,
+                region: Some("us-central".to_string()),
+                viewer_ids: Vec::new(),
+                paused: false,
+            })
+            .await
+            .expect("apply STREAM_CREATE");
+
+        engine
+            .apply_gateway_event(GatewayStreamEvent::StreamServerUpdate {
+                stream_key,
+                endpoint: format!("ws://{addr}"),
+                token: RedactedStreamToken::new("ephemeral-test-token".to_string()),
+            })
+            .await
+            .expect("apply STREAM_SERVER_UPDATE");
+
+        // Now start watching, then supply Gateway session_id -> deferred credentials must connect!
+        engine
+            .watch_stream(&stream_key.to_canonical_string(), VideoSinkKind::InlineTerminal)
+            .await
+            .expect("watch_stream");
+        engine.set_gateway_session_id("gw-session-123").await;
+
+        let sdp_offer = server.await.expect("mock server result");
+        assert!(
+            sdp_offer.contains("m=video"),
+            "SELECT_PROTOCOL SDP offer must contain m=video, got:\n{sdp_offer}"
+        );
+        assert!(
+            sdp_offer.contains("a=recvonly"),
+            "SELECT_PROTOCOL SDP offer must contain a=recvonly, got:\n{sdp_offer}"
+        );
+
         engine.shutdown().await;
     }
 }

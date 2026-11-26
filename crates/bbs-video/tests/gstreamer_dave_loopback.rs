@@ -416,3 +416,67 @@ fn dave_rejects_tampered_video_ciphertext_without_panicking() {
     assert!(err.to_string().contains("DAVE video decrypt failed"));
     assert_eq!(viewer_dave.stats().crypto_errors, 1);
 }
+
+#[test]
+fn dave_downgrade_to_protocol_version_zero_disables_state_and_allows_passthrough() {
+    let (broadcaster_dave, viewer_dave) =
+        establish_active_dave_pair(TEST_CHANNEL_ID, BROADCASTER_USER_ID, VIEWER_USER_ID);
+
+    let mut vp8_frame = vec![0x10u8, 0x00, 0x00, 0x9D, 0x01, 0x2A, 0x40, 0x01, 0xF0, 0x00];
+    vp8_frame.extend_from_slice(&[0x42u8; 48]);
+
+    // Before downgrade: active epoch 1 encrypts & decrypts cleanly.
+    let encrypted = broadcaster_dave
+        .encrypt_video_frame(VideoCodec::Vp8, &vp8_frame)
+        .expect("encrypt in epoch 1");
+    assert_ne!(encrypted, vp8_frame);
+    let decrypted = viewer_dave
+        .decrypt_video_frame(BROADCASTER_USER_ID, &encrypted)
+        .expect("decrypt in epoch 1");
+    assert_eq!(decrypted, vp8_frame);
+
+    // Prepare downgrade to protocol_version = 0 (Op 21): viewer immediately allows unencrypted
+    // frames during transition without crypto errors.
+    broadcaster_dave
+        .prepare_transition(2, 0)
+        .expect("broadcaster prepare downgrade");
+    viewer_dave
+        .prepare_transition(2, 0)
+        .expect("viewer prepare downgrade");
+
+    let transition_plain = viewer_dave
+        .decrypt_video_frame(BROADCASTER_USER_ID, &vp8_frame)
+        .expect("viewer must accept unencrypted frame during downgrade transition");
+    assert_eq!(transition_plain, vp8_frame);
+
+    // Execute downgrade (Op 22): session_state() must report Disabled (not Active epoch 0) and
+    // both encrypt & decrypt must cleanly pass through unencrypted frames.
+    assert!(
+        broadcaster_dave
+            .execute_transition(2)
+            .expect("broadcaster execute downgrade")
+    );
+    assert!(
+        viewer_dave
+            .execute_transition(2)
+            .expect("viewer execute downgrade")
+    );
+
+    assert_eq!(broadcaster_dave.session_state(), DaveSessionState::Disabled);
+    assert_eq!(viewer_dave.session_state(), DaveSessionState::Disabled);
+    assert!(!broadcaster_dave.can_encrypt());
+
+    let post_enc = broadcaster_dave
+        .encrypt_video_frame(VideoCodec::Vp8, &vp8_frame)
+        .expect("broadcaster passthrough after downgrade");
+    assert_eq!(post_enc, vp8_frame);
+    let post_dec = viewer_dave
+        .decrypt_video_frame(BROADCASTER_USER_ID, &post_enc)
+        .expect("viewer passthrough after downgrade");
+    assert_eq!(post_dec, vp8_frame);
+
+    assert_eq!(broadcaster_dave.stats().crypto_errors, 0);
+    assert_eq!(viewer_dave.stats().crypto_errors, 0);
+    assert!(broadcaster_dave.stats().passthrough_frames >= 1);
+    assert!(viewer_dave.stats().passthrough_frames >= 1);
+}

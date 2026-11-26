@@ -329,6 +329,21 @@ impl WatchPipeline {
             .add(&webrtcbin)
             .map_err(|err| CoreError::Video(format!("failed to add webrtcbin: {err}")))?;
 
+        // Register a Recvonly video transceiver so `create_webrtc_offer()` emits an `m=video`
+        // section with `a=recvonly` for Discord's Stream RTC `SELECT_PROTOCOL` handshake.
+        let recv_video_caps = config
+            .codec
+            .rtp_caps_str(config.codec.default_payload_type())
+            .parse::<gst::Caps>()
+            .map_err(|err| CoreError::Video(format!("invalid recvonly RTP video caps: {err}")))?;
+        let _transceiver = webrtcbin.emit_by_name::<gst_webrtc::WebRTCRTPTransceiver>(
+            "add-transceiver",
+            &[
+                &gst_webrtc::WebRTCRTPTransceiverDirection::Recvonly,
+                &recv_video_caps,
+            ],
+        );
+
         let active_sink = sink_branch.active_sink;
         let mpv_sink = sink_branch.mpv_sink;
         let frames_emitted = sink_branch.frames_emitted.clone();
@@ -339,25 +354,44 @@ impl WatchPipeline {
         let default_codec = config.codec;
         let sink_entry_elem = sink_branch.entry_element;
         let linked = Arc::new(AtomicBool::new(false));
+        let fakesink_seq = Arc::new(AtomicU64::new(0));
 
         webrtcbin.connect_pad_added(move |_webrtc, pad| {
             if pad.direction() != gst::PadDirection::Src {
-                return;
-            }
-            if linked.swap(true, Ordering::AcqRel) {
-                debug!("ignoring secondary incoming webrtcbin pad");
                 return;
             }
             let Some(pipeline) = pipeline_weak.upgrade() else {
                 return;
             };
 
-            let codec = pad
-                .current_caps()
-                .or_else(|| Some(pad.query_caps(None)))
-                .and_then(|caps| caps.structure(0).and_then(|s| s.get::<String>("encoding-name").ok()))
-                .and_then(|name| VideoCodec::from_sdp_name(&name))
-                .unwrap_or(default_codec);
+            let caps = pad.current_caps().or_else(|| Some(pad.query_caps(None)));
+            let (is_video, detected_codec) = classify_rtp_pad_caps(caps.as_ref());
+
+            if !is_video {
+                debug!(
+                    pad = %pad.name(),
+                    "routing non-video incoming WebRTC RTP pad to fakesink"
+                );
+                let idx = fakesink_seq.fetch_add(1, Ordering::Relaxed);
+                if let Err(err) = attach_fakesink_for_pad(&pipeline, pad, idx) {
+                    warn!(error = %err, pad = %pad.name(), "failed to park non-video WebRTC pad");
+                }
+                return;
+            }
+
+            if linked.swap(true, Ordering::AcqRel) {
+                debug!(
+                    pad = %pad.name(),
+                    "routing secondary incoming WebRTC video pad to fakesink"
+                );
+                let idx = fakesink_seq.fetch_add(1, Ordering::Relaxed);
+                if let Err(err) = attach_fakesink_for_pad(&pipeline, pad, idx) {
+                    warn!(error = %err, pad = %pad.name(), "failed to park secondary video pad");
+                }
+                return;
+            }
+
+            let codec = detected_codec.unwrap_or(default_codec);
 
             if let Err(err) = attach_rtp_decrypt_decode_chain(
                 &pipeline,
@@ -842,6 +876,78 @@ fn build_sink_branch(
     }
 }
 
+/// Inspect incoming `webrtcbin` RTP pad caps to determine whether the pad carries video and
+/// which [`VideoCodec`] was negotiated.
+fn classify_rtp_pad_caps(caps: Option<&gst::Caps>) -> (bool, Option<VideoCodec>) {
+    let Some(structure) = caps.and_then(|c| c.structure(0)) else {
+        return (false, None);
+    };
+    let media = structure.get::<String>("media").ok();
+    let encoding = structure.get::<String>("encoding-name").ok();
+    let codec = encoding.as_deref().and_then(VideoCodec::from_sdp_name);
+    let is_video = matches!(media.as_deref(), Some("video"));
+    (is_video, codec)
+}
+
+/// Route an auxiliary (e.g., audio or secondary simulcast) `webrtcbin` src pad to a `fakesink`
+/// so `webrtcbin` never stalls with `GST_FLOW_NOT_LINKED`.
+fn attach_fakesink_for_pad(
+    pipeline: &gst::Pipeline,
+    src_pad: &gst::Pad,
+    seq: u64,
+) -> CoreResult<()> {
+    let sink = gst::ElementFactory::make("fakesink")
+        .name(format!("watch_aux_fakesink_{seq}"))
+        .build()
+        .map_err(|err| CoreError::Video(format!("failed to create aux fakesink: {err}")))?;
+    if sink.find_property("sync").is_some() {
+        sink.set_property("sync", false);
+    }
+    if sink.find_property("async").is_some() {
+        sink.set_property("async", false);
+    }
+
+    pipeline
+        .add(&sink)
+        .map_err(|err| CoreError::Video(format!("failed to add aux fakesink: {err}")))?;
+
+    let link_res = (|| -> CoreResult<()> {
+        let sink_pad = sink
+            .static_pad("sink")
+            .ok_or_else(|| CoreError::Video("aux fakesink missing static sink pad".to_string()))?;
+        src_pad
+            .link(&sink_pad)
+            .map_err(|err| CoreError::Video(format!("failed to link aux pad to fakesink: {err}")))?;
+        sink.sync_state_with_parent()
+            .map_err(|err| CoreError::Video(format!("failed to sync aux fakesink state: {err}")))?;
+        Ok(())
+    })();
+
+    if let Err(err) = link_res {
+        let _ = sink.set_state(gst::State::Null);
+        let _ = pipeline.remove(&sink);
+        return Err(err);
+    }
+    Ok(())
+}
+
+fn rollback_added_elements(
+    pipeline: &gst::Pipeline,
+    elements: &[gst::Element],
+    sink_entry: &gst::Element,
+) {
+    if let Some(last) = elements.last() {
+        last.unlink(sink_entry);
+    }
+    for pair in elements.windows(2) {
+        pair[0].unlink(&pair[1]);
+    }
+    for elem in elements {
+        let _ = elem.set_state(gst::State::Null);
+        let _ = pipeline.remove(elem);
+    }
+}
+
 fn attach_rtp_decrypt_decode_chain(
     pipeline: &gst::Pipeline,
     src_pad: &gst::Pad,
@@ -890,28 +996,46 @@ fn attach_rtp_decrypt_decode_chain(
             ))
         })?;
 
+    let chain = [depay, capsfilter, dave_decrypt, decoder];
+    let refs: [&gst::Element; 4] = [&chain[0], &chain[1], &chain[2], &chain[3]];
+
     pipeline
-        .add_many([&depay, &capsfilter, &dave_decrypt, &decoder])
+        .add_many(refs)
         .map_err(|err| CoreError::Video(format!("failed to add RTP decode chain: {err}")))?;
 
-    gst::Element::link_many([&depay, &capsfilter, &dave_decrypt, &decoder, sink_entry])
-        .map_err(|err| CoreError::Video(format!("failed to link RTP decode chain: {err}")))?;
-
-    for elem in [&depay, &capsfilter, &dave_decrypt, &decoder] {
-        elem.sync_state_with_parent().map_err(|err| {
-            CoreError::Video(format!(
-                "failed to sync state of `{}`: {err}",
-                elem.name()
-            ))
+    let attach_result = (|| -> CoreResult<()> {
+        let depay_sink_pad = chain[0].static_pad("sink").ok_or_else(|| {
+            CoreError::Video("RTP depayloader missing static sink pad".to_string())
         })?;
-    }
 
-    let sink_pad = depay.static_pad("sink").ok_or_else(|| {
-        CoreError::Video("RTP depayloader missing static sink pad".to_string())
-    })?;
-    src_pad
-        .link(&sink_pad)
-        .map_err(|err| CoreError::Video(format!("failed to link webrtcbin pad to depay: {err}")))?;
+        // Link upstream `webrtcbin` pad -> `depay` FIRST so caps mismatches fail cleanly before
+        // touching `sink_entry`.
+        src_pad.link(&depay_sink_pad).map_err(|err| {
+            CoreError::Video(format!("failed to link webrtcbin pad to depay: {err}"))
+        })?;
+
+        gst::Element::link_many([&chain[0], &chain[1], &chain[2], &chain[3], sink_entry]).map_err(
+            |err| CoreError::Video(format!("failed to link RTP decode chain: {err}")),
+        )?;
+
+        for elem in &chain {
+            elem.sync_state_with_parent().map_err(|err| {
+                CoreError::Video(format!(
+                    "failed to sync state of `{}`: {err}",
+                    elem.name()
+                ))
+            })?;
+        }
+        Ok(())
+    })();
+
+    if let Err(err) = attach_result {
+        if let Some(depay_sink_pad) = chain[0].static_pad("sink") {
+            let _ = src_pad.unlink(&depay_sink_pad);
+        }
+        rollback_added_elements(pipeline, &chain, sink_entry);
+        return Err(err);
+    }
 
     info!(
         codec = ?codec,
@@ -1139,5 +1263,99 @@ mod tests {
         )
         .expect_err("missing mpv binary should fail cleanly");
         assert!(err.to_string().contains("failed to spawn pop-out player"));
+    }
+
+    #[test]
+    fn rtp_pad_caps_classification_distinguishes_audio_and_video() {
+        ensure_gst_init().expect("gst init");
+        let audio_caps: gst::Caps =
+            "application/x-rtp,media=audio,encoding-name=OPUS,payload=111,clock-rate=48000"
+                .parse()
+                .expect("parse audio caps");
+        assert_eq!(classify_rtp_pad_caps(Some(&audio_caps)), (false, None));
+
+        let video_caps: gst::Caps =
+            "application/x-rtp,media=video,encoding-name=H264,payload=101,clock-rate=90000"
+                .parse()
+                .expect("parse video caps");
+        assert_eq!(
+            classify_rtp_pad_caps(Some(&video_caps)),
+            (true, Some(VideoCodec::H264))
+        );
+        assert_eq!(classify_rtp_pad_caps(None), (false, None));
+    }
+
+    #[tokio::test]
+    async fn webrtc_watch_offer_includes_recvonly_video_mline() {
+        let dave = DaveVideoContext::passthrough(Snowflake::new(11), Snowflake::new(22));
+        let mut cfg = WatchConfig::new(
+            "call:22:11",
+            Snowflake::new(11),
+            VideoCodec::H264,
+            VideoSinkKind::InlineTerminal,
+            dave,
+        );
+        cfg.prefer_software_decoder = true;
+        let (tx, _rx) = broadcast::channel(8);
+        let mut watch = WatchPipeline::start_webrtc(cfg, tx).expect("start webrtc watch");
+
+        let offer = watch
+            .create_webrtc_offer()
+            .await
+            .expect("create webrtc offer");
+        assert!(
+            offer.contains("m=video"),
+            "watch WebRTC offer must include m=video line, got:\n{offer}"
+        );
+        assert!(
+            offer.contains("a=recvonly"),
+            "watch WebRTC offer must include a=recvonly attribute, got:\n{offer}"
+        );
+        watch.stop().await;
+    }
+
+    #[test]
+    fn failed_rtp_chain_attachment_rolls_back_all_elements() {
+        ensure_gst_init().expect("gst init");
+        let pipeline = gst::Pipeline::new();
+        let audio_src = gst::ElementFactory::make("audiotestsrc")
+            .name("test_audio_src")
+            .build()
+            .expect("audiotestsrc");
+        let sink_entry = gst::ElementFactory::make("videoconvert")
+            .name("test_sink_entry")
+            .build()
+            .expect("videoconvert");
+        pipeline
+            .add_many([&audio_src, &sink_entry])
+            .expect("add test elements");
+
+        let audio_pad = audio_src.static_pad("src").expect("audio src pad");
+        let dave = DaveVideoContext::passthrough(Snowflake::new(1), Snowflake::new(2));
+
+        let err = attach_rtp_decrypt_decode_chain(
+            &pipeline,
+            &audio_pad,
+            VideoCodec::H264,
+            true,
+            dave,
+            Snowflake::new(1),
+            &sink_entry,
+        )
+        .expect_err("raw audio pad must fail to link to rtph264depay");
+        assert!(err.to_string().contains("failed to link"));
+
+        // Verify zero orphaned elements remain in pipeline and sink_entry stays unlinked.
+        assert!(pipeline.by_name("watch_rtp_depay").is_none());
+        assert!(pipeline.by_name("watch_encoded_caps").is_none());
+        assert!(pipeline.by_name("dave_decrypt").is_none());
+        assert!(pipeline.by_name("watch_dynamic_decoder").is_none());
+        assert!(
+            !sink_entry
+                .static_pad("sink")
+                .expect("sink_entry sink pad")
+                .is_linked()
+        );
+        let _ = pipeline.set_state(gst::State::Null);
     }
 }

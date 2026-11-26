@@ -5,7 +5,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bbs_core::{CoreError, CoreResult, DaveSessionState, Snowflake};
-use davey::{CommitWelcome, DAVE_PROTOCOL_VERSION, DaveSession, MediaType, ProposalsOperationType};
+use davey::{
+    CommitWelcome, DAVE_PROTOCOL_VERSION, DaveSession, MediaType, ProposalsOperationType,
+    SessionStatus,
+};
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use tracing::{debug, trace, warn};
@@ -165,7 +168,7 @@ impl DaveVideoContext {
             return DaveSessionState::Disabled;
         };
 
-        if session.is_ready() {
+        if is_session_actively_encrypted(session) {
             let epoch = session.epoch().map_or(0, |ep| ep.as_u64());
             let verification_code = session
                 .voice_privacy_code()
@@ -176,6 +179,8 @@ impl DaveVideoContext {
                 protocol_version: session.protocol_version().get(),
                 verification_code,
             }
+        } else if guard.allow_passthrough && session.status() == SessionStatus::INACTIVE {
+            DaveSessionState::Disabled
         } else {
             DaveSessionState::Handshaking
         }
@@ -187,7 +192,11 @@ impl DaveVideoContext {
         self.inner
             .lock()
             .ok()
-            .and_then(|g| g.session.as_ref().map(DaveSession::can_encrypt))
+            .and_then(|g| {
+                g.session
+                    .as_ref()
+                    .map(|s| s.can_encrypt() && is_session_actively_encrypted(s))
+            })
             .unwrap_or(false)
     }
 
@@ -313,10 +322,16 @@ impl DaveVideoContext {
         let mut guard = self.lock_inner()?;
         if protocol_version == 0 {
             guard.allow_passthrough = true;
+            guard.degraded_reason = None;
         }
         let Some(session) = guard.session.as_mut() else {
             return Ok(());
         };
+        if protocol_version == 0 {
+            // Enable passthrough on decryptors immediately so unencrypted frames arriving during
+            // or after a downgrade to protocol_version 0 pass through without crypto errors.
+            session.set_passthrough_mode(true, Some(0));
+        }
         session
             .prepare_transition(transition_id, protocol_version)
             .map_err(|err| CoreError::Video(format!("DAVE prepare_transition failed: {err}")))?;
@@ -326,15 +341,23 @@ impl DaveVideoContext {
     /// Execute a previously prepared key transition (Op 22).
     pub fn execute_transition(&self, transition_id: u16) -> CoreResult<bool> {
         let mut guard = self.lock_inner()?;
+        let allow_passthrough = guard.allow_passthrough;
         let Some(session) = guard.session.as_mut() else {
             return Ok(false);
         };
         let executed = session
             .execute_transition(transition_id)
             .map_err(|err| CoreError::Video(format!("DAVE execute_transition failed: {err}")))?;
-        if executed && session.can_encrypt() {
+        if executed && session.can_encrypt() && is_session_actively_encrypted(session) {
+            session.set_passthrough_mode(false, None);
             guard.allow_passthrough = false;
             guard.degraded_reason = None;
+        } else if executed && !is_session_actively_encrypted(session) {
+            session.set_passthrough_mode(true, Some(0));
+            guard.allow_passthrough = true;
+            guard.degraded_reason = None;
+        } else if allow_passthrough && !is_session_actively_encrypted(session) {
+            session.set_passthrough_mode(true, Some(0));
         }
         Ok(executed)
     }
@@ -349,7 +372,9 @@ impl DaveVideoContext {
         let mut guard = self.lock_inner()?;
         if protocol_version == 0 {
             guard.allow_passthrough = true;
+            guard.degraded_reason = None;
             if let Some(session) = guard.session.as_mut() {
+                session.set_passthrough_mode(true, Some(0));
                 session
                     .reset()
                     .map_err(|err| CoreError::Video(format!("DAVE reset failed: {err}")))?;
@@ -385,6 +410,41 @@ impl DaveVideoContext {
         }
     }
 
+    /// Recover after reporting Op 31 (`DAVE_MLS_INVALID_COMMIT_WELCOME`): re-initializes the local
+    /// MLS session and produces a fresh serialized KeyPackage for immediate Op 26 upload.
+    pub fn recover_from_invalid_commit_welcome(&self, protocol_version: u16) -> CoreResult<Vec<u8>> {
+        let mut guard = self.lock_inner()?;
+        let ver_u16 = if protocol_version == 0 {
+            DAVE_PROTOCOL_VERSION
+        } else {
+            protocol_version
+        };
+        let ver = NonZeroU16::new(ver_u16)
+            .ok_or_else(|| CoreError::Video("invalid DAVE protocol version".to_string()))?;
+        let user_id = guard.user_id.as_u64();
+        let channel_id = guard.channel_id.as_u64();
+
+        if let Some(session) = guard.session.as_mut() {
+            session
+                .reinit(ver, user_id, channel_id, None)
+                .map_err(|err| CoreError::Video(format!("DAVE recovery reinit failed: {err}")))?;
+            let kp = session.create_key_package().map_err(|err| {
+                CoreError::Video(format!("DAVE recovery create_key_package failed: {err}"))
+            })?;
+            guard.degraded_reason = None;
+            Ok(kp)
+        } else {
+            let mut sess = DaveSession::new(ver, user_id, channel_id, None)
+                .map_err(|err| CoreError::Video(format!("DAVE recovery init failed: {err}")))?;
+            let kp = sess.create_key_package().map_err(|err| {
+                CoreError::Video(format!("DAVE recovery create_key_package failed: {err}"))
+            })?;
+            guard.session = Some(sess);
+            guard.degraded_reason = None;
+            Ok(kp)
+        }
+    }
+
     /// Compute the pairwise verification code for a remote participant in the active MLS group.
     pub fn verification_code_for_user(&self, remote_user_id: Snowflake) -> CoreResult<String> {
         let guard = self.lock_inner()?;
@@ -402,7 +462,7 @@ impl DaveVideoContext {
         let mut guard = self.lock_inner()?;
         let allow_passthrough = guard.allow_passthrough;
         match guard.session.as_mut() {
-            Some(session) if session.can_encrypt() => {
+            Some(session) if session.can_encrypt() && is_session_actively_encrypted(session) => {
                 let mut encrypted = Vec::with_capacity(plaintext.len().saturating_add(64));
                 session
                     .encrypt_into(
@@ -444,7 +504,7 @@ impl DaveVideoContext {
         let mut guard = self.lock_inner()?;
         let allow_passthrough = guard.allow_passthrough;
         match guard.session.as_mut() {
-            Some(session) if session.is_ready() => {
+            Some(session) if is_session_actively_encrypted(session) => {
                 match session.decrypt(sender_user_id.as_u64(), MediaType::VIDEO, payload) {
                     Ok(plaintext) => {
                         self.metrics
@@ -478,6 +538,16 @@ impl DaveVideoContext {
             .lock()
             .map_err(|_| CoreError::Internal("DAVE video context lock poisoned".to_string()))
     }
+}
+
+/// Returns `true` only when `davey::DaveSession` has an established, active MLS group (`epoch > 0`).
+///
+/// Necessary because `davey 0.2.0`'s `apply_transition(0)` calls `reset()` (clearing `group` and
+/// setting `status = INACTIVE`) without resetting `is_ready = false`.
+fn is_session_actively_encrypted(session: &DaveSession) -> bool {
+    session.is_ready()
+        && session.status() == SessionStatus::ACTIVE
+        && session.group().is_some_and(|group| group.epoch().as_u64() > 0)
 }
 
 /// Install a GStreamer buffer pad probe on `element`'s `"src"` pad to DAVE-encrypt every encoded
