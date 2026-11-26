@@ -5,7 +5,9 @@
 
 use std::env;
 use std::io;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 use bbs_core::theme::ColorDepth;
 use bbs_core::viewport::{

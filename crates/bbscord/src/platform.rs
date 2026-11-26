@@ -31,16 +31,27 @@ pub fn format_osc52_clipboard(text: &str) -> Vec<u8> {
 }
 
 /// Copy `text` to the system clipboard using `wl-copy` (Wayland), `xclip`/`xsel` (X11),
-/// or OSC 52 escape sequence fallback when supported by the attached terminal.
+/// `pbcopy` (macOS), `clip` (Windows), or OSC 52 escape sequence fallback.
 pub fn copy_to_clipboard(text: &str, osc52_supported: bool) -> Result<()> {
-    if try_pipe_command("wl-copy", &[], text) {
+    #[cfg(target_os = "macos")]
+    if try_pipe_command("pbcopy", &[], text) {
         return Ok(());
     }
-    if try_pipe_command("xclip", &["-selection", "clipboard"], text) {
+    #[cfg(target_os = "windows")]
+    if try_pipe_command("clip", &[], text) {
         return Ok(());
     }
-    if try_pipe_command("xsel", &["--clipboard", "--input"], text) {
-        return Ok(());
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        if try_pipe_command("wl-copy", &[], text) {
+            return Ok(());
+        }
+        if try_pipe_command("xclip", &["-selection", "clipboard"], text) {
+            return Ok(());
+        }
+        if try_pipe_command("xsel", &["--clipboard", "--input"], text) {
+            return Ok(());
+        }
     }
     if osc52_supported {
         let seq = format_osc52_clipboard(text);
@@ -49,7 +60,7 @@ pub fn copy_to_clipboard(text: &str, osc52_supported: bool) -> Result<()> {
         stdout.flush()?;
         return Ok(());
     }
-    bail!("no clipboard helper (`wl-copy`, `xclip`, `xsel`) found and OSC 52 is disabled")
+    bail!("no clipboard helper found and OSC 52 is disabled")
 }
 
 fn try_pipe_command(program: &str, args: &[&str], input: &str) -> bool {
@@ -74,26 +85,48 @@ fn try_pipe_command(program: &str, args: &[&str], input: &str) -> bool {
     child.wait().is_ok_and(|status| status.success())
 }
 
-/// Open an external `http://` or `https://` URL in the user's browser via `xdg-open` (detached, quiet).
+/// Open an external `http://` or `https://` URL in the user's browser (detached, quiet).
 pub fn open_external_url(url: &str) -> Result<()> {
     let trimmed = url.trim();
     if !is_safe_http_url(trimmed) {
         bail!("refusing to open non-HTTP(S) or unsafe URL");
     }
 
-    #[cfg(target_os = "macos")]
-    let opener = "open";
-    #[cfg(not(target_os = "macos"))]
-    let opener = "xdg-open";
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("rundll32")
+            .args(["url.dll,FileProtocolHandler", trimmed])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("failed to launch Windows URL handler")?;
+        return Ok(());
+    }
 
-    Command::new(opener)
-        .arg(trimmed)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .with_context(|| format!("failed to launch `{opener}`"))?;
-    Ok(())
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .arg(trimmed)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("failed to launch `open`")?;
+        return Ok(());
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        Command::new("xdg-open")
+            .arg(trimmed)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("failed to launch `xdg-open`")?;
+        Ok(())
+    }
 }
 
 /// Suspend the TUI cleanly, edit `initial` in `$VISUAL`/`$EDITOR` (fallback `vi`), and resume.
@@ -132,16 +165,21 @@ pub fn run_external_editor(
             .with_context(|| format!("failed to seed editor temp file {}", tmp_path.display()))?;
     }
 
+    let default_editor = if cfg!(target_os = "windows") {
+        "notepad"
+    } else {
+        "vi"
+    };
     let editor_cmd = env::var("VISUAL")
         .ok()
         .filter(|s| !s.trim().is_empty())
         .or_else(|| env::var("EDITOR").ok().filter(|s| !s.trim().is_empty()))
-        .unwrap_or_else(|| "vi".to_string());
+        .unwrap_or_else(|| default_editor.to_string());
 
     restore_terminal().context("failed to restore terminal before launching $EDITOR")?;
 
     let mut parts = editor_cmd.split_whitespace();
-    let program = parts.next().unwrap_or("vi");
+    let program = parts.next().unwrap_or(default_editor);
     let status_res = Command::new(program).args(parts).arg(&tmp_path).status();
 
     let resume = tty_guard
@@ -178,22 +216,48 @@ pub fn parse_utc_offset_hhmm(raw: &str) -> Option<i32> {
 }
 
 /// Detect the system's current local UTC offset in minutes (`+0900` -> `540`, `-0500` -> `-300`)
-/// using `#![forbid(unsafe_code)]`-safe POSIX `date +%z`, falling back to `0` (UTC) if unavailable.
+/// using `#![forbid(unsafe_code)]`-safe OS helpers (`date +%z` on Unix, PowerShell on Windows),
+/// falling back to `0` (UTC) if unavailable.
 #[must_use]
 pub fn detect_local_utc_offset_minutes() -> i32 {
-    let Ok(output) = Command::new("date")
-        .arg("+%z")
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-    else {
-        return 0;
-    };
-    if !output.status.success() {
-        return 0;
+    #[cfg(target_os = "windows")]
+    {
+        let Ok(output) = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "[int][System.TimeZoneInfo]::Local.GetUtcOffset([DateTime]::Now).TotalMinutes",
+            ])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+        else {
+            return 0;
+        };
+        if output.status.success() {
+            return String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .parse::<i32>()
+                .unwrap_or(0);
+        }
+        0
     }
-    let text = String::from_utf8_lossy(&output.stdout);
-    parse_utc_offset_hhmm(&text).unwrap_or(0)
+    #[cfg(not(target_os = "windows"))]
+    {
+        let Ok(output) = Command::new("date")
+            .arg("+%z")
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+        else {
+            return 0;
+        };
+        if !output.status.success() {
+            return 0;
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        parse_utc_offset_hhmm(&text).unwrap_or(0)
+    }
 }
 
 static CLIPBOARD_TEMP_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -236,16 +300,21 @@ pub fn cleanup_managed_clipboard_temps_for_pid() {
     }
 }
 
-fn write_clipboard_temp_image(bytes: &[u8], ext: &str) -> Result<PathBuf> {
+fn next_clipboard_temp_path(ext: &str) -> PathBuf {
     let seq = CLIPBOARD_TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let path = env::temp_dir().join(format!(
+    env::temp_dir().join(format!(
         "bbscord-clip-{}-{seq}-{nanos}.{ext}",
         std::process::id()
-    ));
+    ))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn write_clipboard_temp_image(bytes: &[u8], ext: &str) -> Result<PathBuf> {
+    let path = next_clipboard_temp_path(ext);
     #[cfg(unix)]
     let mut file = {
         use std::os::unix::fs::OpenOptionsExt as _;
@@ -281,6 +350,7 @@ fn run_capture(program: &str, args: &[&str]) -> Option<Vec<u8>> {
     }
 }
 
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn preferred_image_mime(targets: &str) -> Option<(&'static str, &'static str)> {
     let candidates = [
         ("image/png", "png"),
@@ -296,6 +366,7 @@ fn preferred_image_mime(targets: &str) -> Option<(&'static str, &'static str)> {
     None
 }
 
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn parse_uri_list_files(raw: &str) -> Vec<PathBuf> {
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut files = Vec::new();
@@ -313,78 +384,8 @@ fn parse_uri_list_files(raw: &str) -> Vec<PathBuf> {
 }
 
 /// Read an image, file URI list, or text payload from the system clipboard (`wl-paste` on Wayland,
-/// `xclip` on X11, or `pngpaste`/`pbpaste` on macOS).
+/// `xclip` on X11, `pngpaste`/`pbpaste` on macOS, or PowerShell `Get-Clipboard` on Windows).
 pub fn read_clipboard_payload() -> Result<Option<ClipboardPayload>> {
-    // 1. Wayland (`wl-paste`).
-    if env::var_os("WAYLAND_DISPLAY").is_some()
-        && let Some(types_bytes) = run_capture("wl-paste", &["--list-types"])
-    {
-        let types = String::from_utf8_lossy(&types_bytes);
-        if let Some((mime, ext)) = preferred_image_mime(&types)
-            && let Some(img) = run_capture("wl-paste", &["--no-newline", "--type", mime])
-            && !img.is_empty()
-        {
-            return Ok(Some(ClipboardPayload::ImageFile(
-                write_clipboard_temp_image(&img, ext)?,
-            )));
-        }
-        if types
-            .lines()
-            .any(|l| l.trim().eq_ignore_ascii_case("text/uri-list"))
-            && let Some(uri_bytes) =
-                run_capture("wl-paste", &["--no-newline", "--type", "text/uri-list"])
-        {
-            let files = parse_uri_list_files(&String::from_utf8_lossy(&uri_bytes));
-            if !files.is_empty() {
-                return Ok(Some(ClipboardPayload::Files(files)));
-            }
-        }
-        if let Some(txt) = run_capture("wl-paste", &["--no-newline"]) {
-            let s = String::from_utf8_lossy(&txt).into_owned();
-            if !s.is_empty() {
-                return Ok(Some(ClipboardPayload::Text(s)));
-            }
-        }
-        return Ok(None);
-    }
-
-    // 2. X11 (`xclip`).
-    if let Some(targets_bytes) =
-        run_capture("xclip", &["-selection", "clipboard", "-t", "TARGETS", "-o"])
-    {
-        let targets = String::from_utf8_lossy(&targets_bytes);
-        if let Some((mime, ext)) = preferred_image_mime(&targets)
-            && let Some(img) =
-                run_capture("xclip", &["-selection", "clipboard", "-t", mime, "-o"])
-            && !img.is_empty()
-        {
-            return Ok(Some(ClipboardPayload::ImageFile(
-                write_clipboard_temp_image(&img, ext)?,
-            )));
-        }
-        if targets
-            .lines()
-            .any(|l| l.trim().eq_ignore_ascii_case("text/uri-list"))
-            && let Some(uri_bytes) = run_capture(
-                "xclip",
-                &["-selection", "clipboard", "-t", "text/uri-list", "-o"],
-            )
-        {
-            let files = parse_uri_list_files(&String::from_utf8_lossy(&uri_bytes));
-            if !files.is_empty() {
-                return Ok(Some(ClipboardPayload::Files(files)));
-            }
-        }
-        if let Some(txt) = run_capture("xclip", &["-selection", "clipboard", "-o"]) {
-            let s = String::from_utf8_lossy(&txt).into_owned();
-            if !s.is_empty() {
-                return Ok(Some(ClipboardPayload::Text(s)));
-            }
-        }
-        return Ok(None);
-    }
-
-    // 3. macOS (`pngpaste` / `pbpaste`).
     #[cfg(target_os = "macos")]
     {
         if let Some(img) = run_capture("pngpaste", &["-"])
@@ -400,10 +401,120 @@ pub fn read_clipboard_payload() -> Result<Option<ClipboardPayload>> {
                 return Ok(Some(ClipboardPayload::Text(s)));
             }
         }
-        return Ok(None);
+        Ok(None)
     }
 
-    bail!("no clipboard reader (`wl-paste` or `xclip`) available")
+    #[cfg(target_os = "windows")]
+    {
+        let tmp_img = next_clipboard_temp_path("png");
+        let ps_img = format!(
+            "Add-Type -AssemblyName System.Windows.Forms; \
+             if ([System.Windows.Forms.Clipboard]::ContainsImage()) {{ \
+               $i = [System.Windows.Forms.Clipboard]::GetImage(); \
+               $i.Save('{}', [System.Drawing.Imaging.ImageFormat]::Png); \
+               'IMG' \
+             }}",
+            tmp_img.to_string_lossy().replace('\'', "''")
+        );
+        if let Some(out) = run_capture("powershell", &["-NoProfile", "-STA", "-Command", &ps_img])
+            && String::from_utf8_lossy(&out).trim() == "IMG"
+            && tmp_img.is_file()
+        {
+            return Ok(Some(ClipboardPayload::ImageFile(tmp_img)));
+        }
+        let ps_files = "Get-Clipboard -Format FileDropList | ForEach-Object { $_.FullName }";
+        if let Some(out) = run_capture("powershell", &["-NoProfile", "-Command", ps_files]) {
+            let files: Vec<PathBuf> = String::from_utf8_lossy(&out)
+                .lines()
+                .map(|l| PathBuf::from(l.trim()))
+                .filter(|p| p.is_file())
+                .collect();
+            if !files.is_empty() {
+                return Ok(Some(ClipboardPayload::Files(files)));
+            }
+        }
+        if let Some(txt) = run_capture("powershell", &["-NoProfile", "-Command", "Get-Clipboard -Raw"]) {
+            let s = String::from_utf8_lossy(&txt).into_owned();
+            if !s.is_empty() {
+                return Ok(Some(ClipboardPayload::Text(s)));
+            }
+        }
+        Ok(None)
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        // 1. Wayland (`wl-paste`).
+        if env::var_os("WAYLAND_DISPLAY").is_some()
+            && let Some(types_bytes) = run_capture("wl-paste", &["--list-types"])
+        {
+            let types = String::from_utf8_lossy(&types_bytes);
+            if let Some((mime, ext)) = preferred_image_mime(&types)
+                && let Some(img) = run_capture("wl-paste", &["--no-newline", "--type", mime])
+                && !img.is_empty()
+            {
+                return Ok(Some(ClipboardPayload::ImageFile(
+                    write_clipboard_temp_image(&img, ext)?,
+                )));
+            }
+            if types
+                .lines()
+                .any(|l| l.trim().eq_ignore_ascii_case("text/uri-list"))
+                && let Some(uri_bytes) =
+                    run_capture("wl-paste", &["--no-newline", "--type", "text/uri-list"])
+            {
+                let files = parse_uri_list_files(&String::from_utf8_lossy(&uri_bytes));
+                if !files.is_empty() {
+                    return Ok(Some(ClipboardPayload::Files(files)));
+                }
+            }
+            if let Some(txt) = run_capture("wl-paste", &["--no-newline"]) {
+                let s = String::from_utf8_lossy(&txt).into_owned();
+                if !s.is_empty() {
+                    return Ok(Some(ClipboardPayload::Text(s)));
+                }
+            }
+            return Ok(None);
+        }
+
+        // 2. X11 (`xclip`).
+        if let Some(targets_bytes) =
+            run_capture("xclip", &["-selection", "clipboard", "-t", "TARGETS", "-o"])
+        {
+            let targets = String::from_utf8_lossy(&targets_bytes);
+            if let Some((mime, ext)) = preferred_image_mime(&targets)
+                && let Some(img) =
+                    run_capture("xclip", &["-selection", "clipboard", "-t", mime, "-o"])
+                && !img.is_empty()
+            {
+                return Ok(Some(ClipboardPayload::ImageFile(
+                    write_clipboard_temp_image(&img, ext)?,
+                )));
+            }
+            if targets
+                .lines()
+                .any(|l| l.trim().eq_ignore_ascii_case("text/uri-list"))
+                && let Some(uri_bytes) = run_capture(
+                    "xclip",
+                    &["-selection", "clipboard", "-t", "text/uri-list", "-o"],
+                )
+            {
+                let files = parse_uri_list_files(&String::from_utf8_lossy(&uri_bytes));
+                if !files.is_empty() {
+                    return Ok(Some(ClipboardPayload::Files(files)));
+                }
+            }
+            if let Some(txt) = run_capture("xclip", &["-selection", "clipboard", "-o"]) {
+                let s = String::from_utf8_lossy(&txt).into_owned();
+                if !s.is_empty() {
+                    return Ok(Some(ClipboardPayload::Text(s)));
+                }
+            }
+            return Ok(None);
+        }
+
+        bail!("no clipboard reader (`wl-paste` or `xclip`) available")
+    }
 }
 
 fn split_shell_drop_tokens(raw: &str) -> Vec<String> {
@@ -451,11 +562,23 @@ fn split_shell_drop_tokens(raw: &str) -> Vec<String> {
     tokens
 }
 
+fn looks_like_filesystem_path(tok: &str) -> bool {
+    if tok.starts_with('/')
+        || tok.starts_with("~/")
+        || tok.starts_with("~\\")
+        || tok.starts_with("file://")
+    {
+        return true;
+    }
+    let b = tok.as_bytes();
+    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'\\' | b'/')
+}
+
 /// Detect drag-and-drop local file paths inside a terminal bracketed-paste string.
 ///
 /// Returns non-empty paths ONLY when every non-empty token looks like a filesystem path (absolute,
-/// `~/...`, or `file://...`) and resolves to an existing regular file on disk, so normal text,
-/// code snippets, and web URLs are never hijacked.
+/// `~/...`, `file://...`, or Windows `C:\...`) and resolves to an existing regular file on disk,
+/// so normal text, code snippets, and web URLs are never hijacked.
 #[must_use]
 pub fn extract_dropped_file_paths(pasted: &str) -> Vec<PathBuf> {
     let trimmed = pasted.trim();
@@ -464,15 +587,12 @@ pub fn extract_dropped_file_paths(pasted: &str) -> Vec<PathBuf> {
     }
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     // Try single-line / full-string path first (handles unquoted paths containing spaces).
-    if !trimmed.contains('\n')
-        && (trimmed.starts_with('/')
-            || trimmed.starts_with("~/")
-            || trimmed.starts_with("file://")
-            || trimmed.starts_with("'/")
-            || trimmed.starts_with("\"/")
-            || trimmed.starts_with("'file://")
-            || trimmed.starts_with("\"file://"))
-    {
+    let unquoted = trimmed
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .or_else(|| trimmed.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+        .unwrap_or(trimmed);
+    if !trimmed.contains('\n') && looks_like_filesystem_path(unquoted) {
         let single = bbs_tui::modals::expand_user_path(trimmed, &cwd);
         if single.is_file() {
             return vec![single];
@@ -485,9 +605,7 @@ pub fn extract_dropped_file_paths(pasted: &str) -> Vec<PathBuf> {
     }
     let mut resolved = Vec::with_capacity(tokens.len());
     for tok in &tokens {
-        let looks_like_path =
-            tok.starts_with('/') || tok.starts_with("~/") || tok.starts_with("file://");
-        if !looks_like_path {
+        if !looks_like_filesystem_path(tok) {
             return Vec::new();
         }
         let path = bbs_tui::modals::expand_user_path(tok, &cwd);

@@ -388,9 +388,15 @@ pub fn expand_user_path(raw: &str, base_dir: &Path) -> PathBuf {
         out
     };
     let candidate = if unescaped == "~" {
-        std::env::var_os("HOME").map_or_else(|| PathBuf::from("~"), PathBuf::from)
-    } else if let Some(rest) = unescaped.strip_prefix("~/") {
         std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map_or_else(|| PathBuf::from("~"), PathBuf::from)
+    } else if let Some(rest) = unescaped
+        .strip_prefix("~/")
+        .or_else(|| unescaped.strip_prefix("~\\"))
+    {
+        std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
             .map_or_else(|| PathBuf::from(&unescaped), |h| PathBuf::from(h).join(rest))
     } else {
         PathBuf::from(&unescaped)
@@ -792,7 +798,11 @@ impl Modal {
         let dir = start_dir
             .filter(|d| d.is_dir())
             .or_else(|| std::env::current_dir().ok())
-            .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .or_else(|| std::env::var_os("USERPROFILE"))
+                    .map(PathBuf::from)
+            })
             .unwrap_or_else(|| PathBuf::from("."));
         Self::Attach(AttachState::new(dir))
     }

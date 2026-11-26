@@ -216,6 +216,16 @@ const ENCODER_CASCADE: &[ProbeCandidate] = &[
     },
     ProbeCandidate {
         codec: VideoCodec::H264,
+        element_name: "vtenc_h264_hw",
+        hardware_accelerated: true,
+    },
+    ProbeCandidate {
+        codec: VideoCodec::H264,
+        element_name: "mfh264enc",
+        hardware_accelerated: true,
+    },
+    ProbeCandidate {
+        codec: VideoCodec::H264,
         element_name: "x264enc",
         hardware_accelerated: false,
     },
@@ -250,6 +260,16 @@ const H264_DECODER_CASCADE: &[ProbeCandidate] = &[
     ProbeCandidate {
         codec: VideoCodec::H264,
         element_name: "nvh264dec",
+        hardware_accelerated: true,
+    },
+    ProbeCandidate {
+        codec: VideoCodec::H264,
+        element_name: "vtdec_hw",
+        hardware_accelerated: true,
+    },
+    ProbeCandidate {
+        codec: VideoCodec::H264,
+        element_name: "d3d11h264dec",
         hardware_accelerated: true,
     },
     ProbeCandidate {

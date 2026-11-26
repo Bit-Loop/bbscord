@@ -1,14 +1,18 @@
-//! Wayland/X11 XDG Desktop Portal + PipeWire screen capture and GStreamer WebRTC broadcast engine.
+//! Cross-platform screen capture (Wayland/X11 XDG Desktop Portal + PipeWire on Linux,
+//! AVFoundation on macOS, D3D11/GDI on Windows) and GStreamer WebRTC broadcast engine.
 
+#[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
+#[cfg(target_os = "linux")]
 use ashpd::desktop::screencast::{
     CursorMode, OpenPipeWireRemoteOptions, Screencast, SelectSourcesOptions, SourceType,
     StartCastOptions,
 };
+#[cfg(target_os = "linux")]
 use ashpd::desktop::{PersistMode, Session};
 use bbs_core::{CoreError, CoreResult, StreamQuality, StreamSourceKind};
 use gstreamer as gst;
@@ -17,7 +21,10 @@ use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
 use gstreamer_webrtc as gst_webrtc;
 use tokio::sync::mpsc;
+#[cfg(target_os = "linux")]
 use tracing::{debug, info};
+#[cfg(not(target_os = "linux"))]
+use tracing::info;
 
 use crate::codec::{
     EncoderSelection, VideoCodec, create_configured_encoder, create_configured_payloader,
@@ -28,7 +35,9 @@ use crate::watch::{
     install_h264_strip_sprop_probe, sanitize_gst_name, webrtc_create_sdp, webrtc_set_remote_sdp,
 };
 
-/// Active XDG Desktop Portal ScreenCast session owning the authorized PipeWire remote FD.
+/// Active XDG Desktop Portal ScreenCast session owning the authorized PipeWire remote FD (Linux),
+/// or a lightweight native screen-capture token on macOS/Windows.
+#[cfg(target_os = "linux")]
 pub struct PortalCaptureSession {
     session: Session<Screencast>,
     pipewire_fd: OwnedFd,
@@ -38,6 +47,12 @@ pub struct PortalCaptureSession {
     source_type: Option<SourceType>,
 }
 
+/// Active screen capture token on non-Linux platforms (macOS `avfvideosrc`, Windows `d3d11screencapturesrc`).
+#[cfg(not(target_os = "linux"))]
+#[derive(Debug)]
+pub struct PortalCaptureSession;
+
+#[cfg(target_os = "linux")]
 impl std::fmt::Debug for PortalCaptureSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PortalCaptureSession")
@@ -49,6 +64,7 @@ impl std::fmt::Debug for PortalCaptureSession {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl PortalCaptureSession {
     /// Open an XDG Desktop Portal ScreenCast picker (Wayland & X11) and acquire an authorized
     /// PipeWire remote file descriptor and stream `node_id`.
@@ -170,6 +186,40 @@ impl PortalCaptureSession {
             debug!(error = %err, "portal screencast session close returned error");
         }
     }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl PortalCaptureSession {
+    /// Acquire a native screen capture handle on macOS (`avfvideosrc`) or Windows
+    /// (`d3d11screencapturesrc` / `gdiscreencapturesrc`).
+    pub async fn acquire(source_kind: StreamSourceKind) -> CoreResult<Self> {
+        if source_kind == StreamSourceKind::SyntheticTestCard {
+            return Err(CoreError::Video(
+                "SyntheticTestCard does not require a platform capture session".to_string(),
+            ));
+        }
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            info!(source = ?source_kind, "using native OS GStreamer screen capture source");
+            Ok(Self)
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            Err(CoreError::Video(
+                "screen capture is supported on Linux (PipeWire), macOS (AVFoundation), and Windows (D3D11/GDI)"
+                    .to_string(),
+            ))
+        }
+    }
+
+    /// Natural capture resolution hint (determined dynamically by GStreamer on macOS/Windows).
+    #[must_use]
+    pub const fn natural_size(&self) -> Option<(u32, u32)> {
+        None
+    }
+
+    /// Close the native capture token (no-op on macOS/Windows).
+    pub async fn close(&self) {}
 }
 
 /// Encoded (and DAVE-encrypted) video frame emitted when running a broadcast pipeline in
@@ -329,22 +379,66 @@ impl BroadcastPipeline {
                 src
             }
             (_, Some(portal)) => {
-                let src = gst::ElementFactory::make("pipewiresrc")
-                    .name("broadcast_pipewire_src")
-                    .build()
-                    .map_err(|err| {
-                        CoreError::Video(format!("failed to create pipewiresrc: {err}"))
-                    })?;
-                src.set_property("fd", portal.raw_fd());
-                src.set_property("do-timestamp", true);
-                if let Some(serial) = portal.pipewire_serial()
-                    && src.find_property("target-object").is_some()
+                #[cfg(target_os = "linux")]
                 {
-                    src.set_property("target-object", serial.to_string());
-                } else {
-                    src.set_property("path", portal.node_id().to_string());
+                    let src = gst::ElementFactory::make("pipewiresrc")
+                        .name("broadcast_pipewire_src")
+                        .build()
+                        .map_err(|err| {
+                            CoreError::Video(format!("failed to create pipewiresrc: {err}"))
+                        })?;
+                    src.set_property("fd", portal.raw_fd());
+                    src.set_property("do-timestamp", true);
+                    if let Some(serial) = portal.pipewire_serial()
+                        && src.find_property("target-object").is_some()
+                    {
+                        src.set_property("target-object", serial.to_string());
+                    } else {
+                        src.set_property("path", portal.node_id().to_string());
+                    }
+                    src
                 }
-                src
+                #[cfg(target_os = "macos")]
+                {
+                    let _ = portal;
+                    let src = gst::ElementFactory::make("avfvideosrc")
+                        .name("broadcast_avf_src")
+                        .build()
+                        .map_err(|err| {
+                            CoreError::Video(format!("failed to create avfvideosrc: {err}"))
+                        })?;
+                    if src.find_property("capture-screen").is_some() {
+                        src.set_property("capture-screen", true);
+                    }
+                    if src.find_property("capture-screen-cursor").is_some() {
+                        src.set_property("capture-screen-cursor", true);
+                    }
+                    src
+                }
+                #[cfg(target_os = "windows")]
+                {
+                    let _ = portal;
+                    gst::ElementFactory::make("d3d11screencapturesrc")
+                        .name("broadcast_win_src")
+                        .build()
+                        .or_else(|_| {
+                            gst::ElementFactory::make("gdiscreencapturesrc")
+                                .name("broadcast_win_src")
+                                .build()
+                        })
+                        .map_err(|err| {
+                            CoreError::Video(format!(
+                                "failed to create Windows screen capture source: {err}"
+                            ))
+                        })?
+                }
+                #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+                {
+                    let _ = portal;
+                    return Err(CoreError::Video(
+                        "native screen capture is unavailable on this OS".to_string(),
+                    ));
+                }
             }
             (_, None) => {
                 return Err(CoreError::Video(

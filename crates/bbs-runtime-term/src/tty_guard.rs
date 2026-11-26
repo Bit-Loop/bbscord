@@ -7,6 +7,7 @@ use std::sync::{Mutex, Once};
 
 use bbs_core::viewport::{KeyboardProtocol, ResolvedCharset, ViewportGeometry};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+#[cfg(unix)]
 use tokio::sync::mpsc;
 
 use crate::probe::{ProbeReport, query_stdout_winsize};

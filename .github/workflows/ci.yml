@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -21,10 +25,22 @@ jobs:
       - name: Scan entire git history for secrets
         run: ./scripts/secret-scan.sh --all-commits
 
-  build-and-test:
-    name: Clippy, Workspace Tests & Release Smoke
-    runs-on: ubuntu-24.04
+  linux-debian-ubuntu:
+    name: Linux (${{ matrix.label }}) — Clippy, Tests & .deb E2E
     needs: [secret-firewall]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: x86_64
+            runner: ubuntu-24.04
+            deb_arch: amd64
+            pkg_arch: x86_64
+          - label: arm64
+            runner: ubuntu-24.04-arm
+            deb_arch: arm64
+            pkg_arch: aarch64
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
 
@@ -45,7 +61,8 @@ jobs:
             gstreamer1.0-plugins-bad \
             gstreamer1.0-plugins-ugly \
             gstreamer1.0-libav \
-            gstreamer1.0-nice
+            gstreamer1.0-nice \
+            zstd
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -53,6 +70,8 @@ jobs:
           components: clippy
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: linux-${{ matrix.label }}
 
       - name: Clippy (strict -D warnings)
         run: cargo clippy --workspace --all-targets -- -D warnings
@@ -63,8 +82,227 @@ jobs:
       - name: Release Build
         run: cargo build --release -p bbscord
 
-      - name: Binary CLI & Headless Smoke E2E
+      - name: Package & Install-Test Debian/Ubuntu .deb (${{ matrix.deb_arch }})
         run: |
+          VERSION="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print([p["version"] for p in json.load(sys.stdin)["packages"] if p["name"]=="bbscord"][0])')"
+          ./scripts/package-deb.sh "$VERSION" "${{ matrix.deb_arch }}" target/release/bbscord dist
+          sudo apt-get install -y "./dist/bbscord_${VERSION}_${{ matrix.deb_arch }}.deb"
+          /usr/bin/bbscord --version
+          /usr/bin/bbscord --help >/dev/null
+          /usr/bin/bbscord --headless-smoke
+
+      - name: Verify Arch/Manjaro ARM64 packaging
+        if: matrix.pkg_arch == 'aarch64'
+        run: |
+          VERSION="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print([p["version"] for p in json.load(sys.stdin)["packages"] if p["name"]=="bbscord"][0])')"
+          ./scripts/package-arch.sh "$VERSION" aarch64 target/release/bbscord dist
+
+  linux-arch-manjaro:
+    name: Arch / Manjaro (x86_64) — Native Container & Pacman E2E
+    needs: [secret-firewall]
+    runs-on: ubuntu-24.04
+    container:
+      image: archlinux:latest
+    steps:
+      - name: Install Arch/Manjaro build & runtime dependencies
+        run: |
+          pacman -Syu --noconfirm --needed \
+            base-devel \
+            git \
+            rust \
+            clang \
+            cmake \
+            pkgconf \
+            opus \
+            alsa-lib \
+            dbus \
+            gstreamer \
+            gst-plugins-base \
+            gst-plugins-good \
+            gst-plugins-bad \
+            gst-plugins-ugly \
+            gst-libav \
+            python \
+            zstd
+
+      - uses: actions/checkout@v4
+
+      - name: Clippy (strict -D warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Workspace Unit & Integration Tests
+        run: cargo test --workspace
+
+      - name: Release Build & Native Pacman Package Install E2E
+        run: |
+          cargo build --release -p bbscord
+          VERSION="$(cargo metadata --no-deps --format-version 1 | python -c 'import json,sys; print([p["version"] for p in json.load(sys.stdin)["packages"] if p["name"]=="bbscord"][0])')"
+          ./scripts/package-arch.sh "$VERSION" x86_64 target/release/bbscord dist
+          pacman -U --noconfirm "./dist/bbscord-${VERSION}-1-x86_64.pkg.tar.zst"
+          /usr/bin/bbscord --version
+          /usr/bin/bbscord --headless-smoke
+
+  macos:
+    name: macOS (${{ matrix.label }}) — Clippy, Tests & Release Smoke
+    needs: [secret-firewall]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: arm64
+            runner: macos-15
+          - label: x86_64
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install GStreamer, Opus, pkg-config, and CMake via Homebrew
+        run: |
+          brew update
+          brew install gstreamer opus pkg-config cmake
+          BREW_PREFIX="$(brew --prefix)"
+          echo "PKG_CONFIG_PATH=${BREW_PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH:-}" >> "$GITHUB_ENV"
+          echo "GST_PLUGIN_PATH=${BREW_PREFIX}/lib/gstreamer-1.0" >> "$GITHUB_ENV"
+          echo "${BREW_PREFIX}/bin" >> "$GITHUB_PATH"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: macos-${{ matrix.label }}
+
+      - name: Clippy (strict -D warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Workspace Unit & Integration Tests
+        run: cargo test --workspace
+
+      - name: Release Build & Headless Smoke
+        run: |
+          cargo build --release -p bbscord
           ./target/release/bbscord --version
-          ./target/release/bbscord --help
           ./target/release/bbscord --headless-smoke
+
+  windows:
+    name: Windows (${{ matrix.label }}) — Clippy, Tests & Release Smoke
+    needs: [secret-firewall]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: x86_64
+            runner: windows-2025
+            gst_arch: x86_64
+            install_nasm: true
+          - label: arm64
+            runner: windows-11-arm
+            gst_arch: arm64
+            install_nasm: false
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install GStreamer 1.28.9 MSVC (runtime + devel + Opus) & build tools
+        shell: pwsh
+        run: |
+          $gstVer = "1.28.9"
+          $arch = "${{ matrix.gst_arch }}"
+          $installer = "gstreamer-1.0-msvc-$arch-$gstVer.exe"
+          $url = "https://gstreamer.freedesktop.org/data/pkg/windows/$gstVer/msvc/$installer"
+          $gstDir = "C:\gstreamer\1.0\msvc_$arch"
+
+          Write-Host "Downloading $url ..."
+          curl.exe -fsSL "$url" -o "$env:TEMP\$installer"
+          Start-Process -FilePath "$env:TEMP\$installer" `
+            -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-", "/TYPE=devel", "/DIR=$gstDir" `
+            -Wait -NoNewWindow
+
+          if (!(Test-Path "$gstDir\lib\pkgconfig\gstreamer-1.0.pc")) {
+            Write-Error "GStreamer devel pkg-config files missing under $gstDir"
+            exit 1
+          }
+
+          "$gstDir\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "PKG_CONFIG=$gstDir\bin\pkg-config.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "PKG_CONFIG_PATH=$gstDir\lib\pkgconfig" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "GST_PLUGIN_PATH=$gstDir\lib\gstreamer-1.0" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          # Ensure LLVM libclang (for bindgen / boring-sys2), Strawberry Perl, and NASM (x86_64).
+          if (-not (Get-Command clang -ErrorAction SilentlyContinue)) {
+            choco install -y llvm --no-progress
+          }
+          if (-not (Get-Command perl -ErrorAction SilentlyContinue)) {
+            choco install -y strawberryperl --no-progress
+            "C:\Strawberry\perl\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          }
+          if ("${{ matrix.install_nasm }}" -eq "true" -and -not (Get-Command nasm -ErrorAction SilentlyContinue)) {
+            choco install -y nasm --no-progress
+            "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          }
+          if (Test-Path "C:\Program Files\LLVM\bin") {
+            "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            "C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          }
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: windows-${{ matrix.label }}
+
+      - name: Clippy (strict -D warnings)
+        shell: pwsh
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Workspace Unit & Integration Tests
+        shell: pwsh
+        run: cargo test --workspace
+
+      - name: Release Build & Headless Smoke
+        shell: pwsh
+        run: |
+          cargo build --release -p bbscord
+          .\target\release\bbscord.exe --version
+          .\target\release\bbscord.exe --headless-smoke
+
+  esp32-firmware:
+    name: ESP32 (esp32 / esp32s3 / esp32c3 / esp32c6) — VT16x2 Tests & Firmware Builds
+    needs: [secret-firewall]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run host C++17 unit tests for VT100 16x2 LCD parser & keypad encoder
+        run: |
+          g++ -std=c++17 -Wall -Wextra -Werror firmware/bbscord-esp32/tests/test_vt16x2.cpp -o /tmp/test_vt16x2
+          /tmp/test_vt16x2
+
+      - name: Set up Python & PlatformIO
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache PlatformIO toolchains & packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-${{ runner.os }}-${{ hashFiles('firmware/bbscord-esp32/platformio.ini') }}
+
+      - name: Install PlatformIO & esptool
+        run: pip install --quiet platformio esptool
+
+      - name: Build ESP32, ESP32-S3, ESP32-C3, and ESP32-C6 firmware binaries
+        working-directory: firmware/bbscord-esp32
+        run: |
+          pio run -e esp32 -e esp32s3 -e esp32c3 -e esp32c6
+          for chip in esp32 esp32s3 esp32c3 esp32c6; do
+            test -s ".pio/build/${chip}/firmware.bin"
+            ls -lh ".pio/build/${chip}/firmware.bin"
+          done

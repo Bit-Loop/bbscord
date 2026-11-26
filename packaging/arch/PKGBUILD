@@ -1,6 +1,6 @@
 # Maintainer: Bit-Loop <https://github.com/Bit-Loop/bbscord>
 pkgname=bbscord
-pkgver=0.1.0
+pkgver=1.0.0
 pkgrel=1
 pkgdesc="Retro BBS-styled Rust Discord TUI client with DAVE E2EE voice, Group DMs, WebRTC screensharing, animated GIFs, btop themes, and 16x2 LCD to 4K layouts"
 arch=('x86_64' 'aarch64')

@@ -72,9 +72,33 @@
 
 ## 📦 Install
 
-### 1. System Dependencies
+### Pre-Built Releases (Linux, macOS, Windows & ESP32)
 
-- **Arch Linux:**
+Download checksum-verified packages from **[GitHub Releases](https://github.com/Bit-Loop/bbscord/releases)**:
+
+- **Debian / Ubuntu (`amd64` & `arm64`):**
+  ```bash
+  sudo apt install ./bbscord_1.0.0_amd64.deb   # or _arm64.deb
+  ```
+- **Arch Linux / Manjaro (`x86_64` & `aarch64`):**
+  ```bash
+  sudo pacman -U ./bbscord-1.0.0-1-x86_64.pkg.tar.zst   # or -aarch64.pkg.tar.zst
+  # Or build from PKGBUILD:
+  cd packaging/arch && makepkg -si
+  ```
+- **macOS (Apple Silicon `arm64` & Intel `x86_64`):**
+  ```bash
+  brew install gstreamer opus
+  tar -xzf bbscord-1.0.0-macos-arm64.tar.gz   # or -x86_64.tar.gz
+  ```
+- **Windows (`x86_64` & `arm64`):** Install the [GStreamer MSVC runtime](https://gstreamer.freedesktop.org/download/#windows) (`1.28+`) and extract `bbscord-1.0.0-windows-x86_64.zip` (or `-arm64.zip`).
+- **ESP32 (`16×2` HD44780 LCD Hardware Bridge — `esp32`, `esp32s3`, `esp32c3`, `esp32c6`):** Flash `bbscord-esp32-1.0.0-<chip>-factory.bin` at `0x0` via `esptool.py` and connect with `./scripts/bbscord-esp32-bridge.sh /dev/ttyUSB0` (see [`firmware/bbscord-esp32/README.md`](firmware/bbscord-esp32/README.md)).
+
+### Build From Source
+
+#### 1. System Dependencies
+
+- **Arch / Manjaro:**
   ```bash
   sudo pacman -S opus alsa-lib gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad clang cmake pkgconf
   ```
@@ -84,20 +108,15 @@
     libgstreamer-plugins-bad1.0-dev gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-nice \
     pkg-config cmake libclang-dev
   ```
-*(Optional: install `mpv` for borderless 60 fps screenshare pop-out windows and `wl-clipboard` / `xclip` for clipboard copy.)*
+*(Optional: install `mpv` for borderless 60 fps screenshare pop-out windows and `wl-clipboard` / `xclip` for clipboard copy and `Ctrl+V` image paste.)*
 
-### 2. Build & Install
+#### 2. Compile & Install
 
 ```bash
 git clone https://github.com/Bit-Loop/bbscord.git
 cd bbscord
 cargo build --release -p bbscord
 install -Dm755 target/release/bbscord ~/.local/bin/bbscord
-```
-
-**Arch Linux package (`PKGBUILD`):**
-```bash
-cd packaging/arch && makepkg -si
 ```
 
 ---

@@ -11,14 +11,16 @@ use bbs_core::{
     BackendEvent, CharsetMode, GraphicsTier, OsKeyringStore, ResolvedCharset, RgbaFrame, UiAction,
     VideoSinkKind, ViewportGeometry, mock_ids,
 };
+#[cfg(unix)]
+use bbs_runtime_term::TerminalSignal;
 use bbs_runtime_term::{
     DEFAULT_DECODE_CONCURRENCY, DEFAULT_ENCODE_CONCURRENCY, DEFAULT_MEDIA_CACHE_BYTES,
     DecodeLimits, DecodedMedia, FramePacer, GifAnimationPlayer, MediaDecoderPool,
     MediaEncodeRequest, MediaEncoderPool, MediaFitMode, MediaRenderer, MediaWidget, ProbeOptions,
     ProbeReport, PtyBandwidthGovernor, RenderedMedia, RenderedMediaFrame, ResizeDebouncer,
-    ScrollProxyDebouncer, TerminalEnv, TerminalSignal, TtyGuard, TtyGuardConfig,
-    install_panic_hook, kitty_delete_image_data_seq_for, negotiate_capabilities,
-    normalize_key_event, probe_terminal_async, query_stdout_winsize,
+    ScrollProxyDebouncer, TerminalEnv, TtyGuard, TtyGuardConfig, install_panic_hook,
+    kitty_delete_image_data_seq_for, negotiate_capabilities, normalize_key_event,
+    probe_terminal_async, query_stdout_winsize,
 };
 use bbs_tui::theme::{ThemeCatalog, ThemeDirs};
 use bbs_tui::{App, Effect, ImageSlot, Mode, TuiConfig};
@@ -1240,7 +1242,8 @@ pub async fn run_interactive(
                         }
                     }
                     Some(Ok(Event::Resize(cols, rows))) => {
-                        let geom = ViewportGeometry::new(cols, rows);
+                        let geom = query_stdout_winsize()
+                            .unwrap_or_else(|| ViewportGeometry::new(cols, rows));
                         debouncer.on_resize_now(geom);
                         effects.extend(app.handle_resize(cols, rows));
                     }

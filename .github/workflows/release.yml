@@ -1,0 +1,433 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish (e.g. v1.0.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  secret-firewall:
+    name: Secret Firewall (Full History)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Scan entire git history for secrets
+        run: ./scripts/secret-scan.sh --all-commits
+
+  build-linux-deb-tarball:
+    name: Release Linux (${{ matrix.label }}) — .tar.gz + .deb + ARM64 Pacman
+    needs: [secret-firewall]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: x86_64
+            runner: ubuntu-24.04
+            deb_arch: amd64
+            pkg_arch: x86_64
+          - label: arm64
+            runner: ubuntu-24.04-arm
+            deb_arch: arm64
+            pkg_arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install native audio, Opus, and GStreamer WebRTC dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            cmake \
+            libclang-dev \
+            libopus-dev \
+            libasound2-dev \
+            libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev \
+            libgstreamer-plugins-bad1.0-dev \
+            gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad \
+            gstreamer1.0-plugins-ugly \
+            gstreamer1.0-libav \
+            gstreamer1.0-nice \
+            zstd
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: release-linux-${{ matrix.label }}
+
+      - name: Verify tests, build release, and package artifacts
+        run: |
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace
+          cargo build --release -p bbscord
+          ./target/release/bbscord --headless-smoke
+
+          TAG="${{ inputs.tag || github.ref_name }}"
+          VERSION="${TAG#v}"
+          mkdir -p dist
+
+          # 1. Portable Linux tarball (.tar.gz)
+          STAGE="$(mktemp -d)"
+          install -Dm755 target/release/bbscord "$STAGE/bbscord"
+          install -Dm644 LICENSE "$STAGE/LICENSE"
+          install -Dm644 README.md "$STAGE/README.md"
+          tar -C "$STAGE" -czf "dist/bbscord-${VERSION}-linux-${{ matrix.label }}.tar.gz" bbscord LICENSE README.md
+          rm -rf "$STAGE"
+
+          # 2. Debian / Ubuntu package (.deb) + install smoke check
+          ./scripts/package-deb.sh "$VERSION" "${{ matrix.deb_arch }}" target/release/bbscord dist
+          sudo apt-get install -y "./dist/bbscord_${VERSION}_${{ matrix.deb_arch }}.deb"
+          /usr/bin/bbscord --headless-smoke
+
+          # 3. Arch Linux ARM / Manjaro ARM Pacman package (.pkg.tar.zst) on arm64
+          if [[ "${{ matrix.pkg_arch }}" == "aarch64" ]]; then
+            ./scripts/package-arch.sh "$VERSION" aarch64 target/release/bbscord dist
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-linux-${{ matrix.label }}
+          path: dist/*
+
+  build-arch-manjaro-x86_64:
+    name: Release Arch / Manjaro (x86_64) — Native .pkg.tar.zst
+    needs: [secret-firewall]
+    runs-on: ubuntu-24.04
+    container:
+      image: archlinux:latest
+    steps:
+      - name: Install Arch/Manjaro build & runtime dependencies
+        run: |
+          pacman -Syu --noconfirm --needed \
+            base-devel \
+            git \
+            rust \
+            clang \
+            cmake \
+            pkgconf \
+            opus \
+            alsa-lib \
+            dbus \
+            gstreamer \
+            gst-plugins-base \
+            gst-plugins-good \
+            gst-plugins-bad \
+            gst-plugins-ugly \
+            gst-libav \
+            python \
+            zstd
+
+      - uses: actions/checkout@v4
+
+      - name: Build native Arch/Manjaro package & verify pacman install
+        run: |
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace
+          cargo build --release -p bbscord
+          ./target/release/bbscord --headless-smoke
+
+          TAG="${{ inputs.tag || github.ref_name }}"
+          VERSION="${TAG#v}"
+          mkdir -p dist
+          ./scripts/package-arch.sh "$VERSION" x86_64 target/release/bbscord dist
+          cp packaging/arch/PKGBUILD dist/PKGBUILD
+          pacman -U --noconfirm "./dist/bbscord-${VERSION}-1-x86_64.pkg.tar.zst"
+          /usr/bin/bbscord --headless-smoke
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-arch-x86_64
+          path: dist/*
+
+  build-macos:
+    name: Release macOS (${{ matrix.label }}) — .tar.gz
+    needs: [secret-firewall]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: arm64
+            runner: macos-15
+          - label: x86_64
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install GStreamer, Opus, pkg-config, and CMake via Homebrew
+        run: |
+          brew update
+          brew install gstreamer opus pkg-config cmake
+          BREW_PREFIX="$(brew --prefix)"
+          echo "PKG_CONFIG_PATH=${BREW_PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH:-}" >> "$GITHUB_ENV"
+          echo "GST_PLUGIN_PATH=${BREW_PREFIX}/lib/gstreamer-1.0" >> "$GITHUB_ENV"
+          echo "${BREW_PREFIX}/bin" >> "$GITHUB_PATH"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: release-macos-${{ matrix.label }}
+
+      - name: Verify tests, build release, and package macOS tarball
+        run: |
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace
+          cargo build --release -p bbscord
+          ./target/release/bbscord --headless-smoke
+
+          TAG="${{ inputs.tag || github.ref_name }}"
+          VERSION="${TAG#v}"
+          mkdir -p dist
+          STAGE="$(mktemp -d)"
+          install -m755 target/release/bbscord "$STAGE/bbscord"
+          install -m644 LICENSE "$STAGE/LICENSE"
+          install -m644 README.md "$STAGE/README.md"
+          tar -C "$STAGE" -czf "dist/bbscord-${VERSION}-macos-${{ matrix.label }}.tar.gz" bbscord LICENSE README.md
+          rm -rf "$STAGE"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-macos-${{ matrix.label }}
+          path: dist/*
+
+  build-windows:
+    name: Release Windows (${{ matrix.label }}) — .zip
+    needs: [secret-firewall]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: x86_64
+            runner: windows-2025
+            gst_arch: x86_64
+            install_nasm: true
+          - label: arm64
+            runner: windows-11-arm
+            gst_arch: arm64
+            install_nasm: false
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install GStreamer 1.28.9 MSVC (runtime + devel + Opus) & build tools
+        shell: pwsh
+        run: |
+          $gstVer = "1.28.9"
+          $arch = "${{ matrix.gst_arch }}"
+          $installer = "gstreamer-1.0-msvc-$arch-$gstVer.exe"
+          $url = "https://gstreamer.freedesktop.org/data/pkg/windows/$gstVer/msvc/$installer"
+          $gstDir = "C:\gstreamer\1.0\msvc_$arch"
+
+          curl.exe -fsSL "$url" -o "$env:TEMP\$installer"
+          Start-Process -FilePath "$env:TEMP\$installer" `
+            -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-", "/TYPE=devel", "/DIR=$gstDir" `
+            -Wait -NoNewWindow
+
+          "$gstDir\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "PKG_CONFIG=$gstDir\bin\pkg-config.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "PKG_CONFIG_PATH=$gstDir\lib\pkgconfig" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "GST_PLUGIN_PATH=$gstDir\lib\gstreamer-1.0" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          if (-not (Get-Command clang -ErrorAction SilentlyContinue)) {
+            choco install -y llvm --no-progress
+          }
+          if (-not (Get-Command perl -ErrorAction SilentlyContinue)) {
+            choco install -y strawberryperl --no-progress
+            "C:\Strawberry\perl\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          }
+          if ("${{ matrix.install_nasm }}" -eq "true" -and -not (Get-Command nasm -ErrorAction SilentlyContinue)) {
+            choco install -y nasm --no-progress
+            "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          }
+          if (Test-Path "C:\Program Files\LLVM\bin") {
+            "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            "C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          }
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: release-windows-${{ matrix.label }}
+
+      - name: Verify tests, build release, and package Windows zip
+        shell: pwsh
+        run: |
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace
+          cargo build --release -p bbscord
+          .\target\release\bbscord.exe --headless-smoke
+
+          $tag = "${{ inputs.tag || github.ref_name }}"
+          $version = $tag.TrimStart("v")
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $stage = Join-Path $env:TEMP "bbscord-win-stage"
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $stage
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item target\release\bbscord.exe "$stage\bbscord.exe"
+          Copy-Item LICENSE "$stage\LICENSE"
+          Copy-Item README.md "$stage\README.md"
+          Compress-Archive -Path "$stage\*" -DestinationPath "dist\bbscord-$version-windows-${{ matrix.label }}.zip" -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-windows-${{ matrix.label }}
+          path: dist/*
+
+  build-esp32-firmware:
+    name: Release ESP32 (esp32 / esp32s3 / esp32c3 / esp32c6) — Factory .bin Images
+    needs: [secret-firewall]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run host C++17 VT16x2 unit tests
+        run: |
+          g++ -std=c++17 -Wall -Wextra -Werror firmware/bbscord-esp32/tests/test_vt16x2.cpp -o /tmp/test_vt16x2
+          /tmp/test_vt16x2
+
+      - name: Set up Python & PlatformIO
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache PlatformIO toolchains & packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-${{ runner.os }}-${{ hashFiles('firmware/bbscord-esp32/platformio.ini') }}
+
+      - name: Install PlatformIO & esptool
+        run: pip install --quiet platformio esptool
+
+      - name: Build and merge 0x0 factory flash binaries for ESP32 / S3 / C3 / C6
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          VERSION="${TAG#v}"
+          mkdir -p dist
+
+          (cd firmware/bbscord-esp32 && pio run -e esp32 -e esp32s3 -e esp32c3 -e esp32c6)
+
+          merge_chip() {
+            local chip="$1"
+            local boot_off="$2"
+            local build_dir="firmware/bbscord-esp32/.pio/build/${chip}"
+            local out_bin="dist/bbscord-esp32-${VERSION}-${chip}-factory.bin"
+            local args=(--chip "$chip" merge_bin -o "$out_bin" "$boot_off" "${build_dir}/bootloader.bin" 0x8000 "${build_dir}/partitions.bin" 0x10000 "${build_dir}/firmware.bin")
+            python3 -m esptool "${args[@]}"
+            test -s "$out_bin"
+          }
+
+          merge_chip esp32 0x1000
+          merge_chip esp32s3 0x0
+          merge_chip esp32c3 0x0
+          merge_chip esp32c6 0x0
+
+          STAGE="$(mktemp -d)"
+          cp dist/bbscord-esp32-${VERSION}-*-factory.bin "$STAGE/"
+          cp firmware/bbscord-esp32/README.md "$STAGE/README.md"
+          cp scripts/bbscord-esp32-bridge.sh "$STAGE/bbscord-esp32-bridge.sh"
+          tar -C "$STAGE" -czf "dist/bbscord-esp32-${VERSION}-firmware.tar.gz" .
+          rm -rf "$STAGE"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-esp32
+          path: dist/*
+
+  publish-release:
+    name: Publish Multi-Platform GitHub Release
+    needs:
+      - build-linux-deb-tarball
+      - build-arch-manjaro-x86_64
+      - build-macos
+      - build-windows
+      - build-esp32-firmware
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all verified platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS.txt
+        working-directory: release-artifacts
+        run: |
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          VERSION="${TAG#v}"
+          cat > release-notes.md <<EOF
+          ## bbscord ${TAG} — Full Multi-Platform Release
+
+          Retro BBS-styled Rust Discord TUI client with DAVE MLS E2EE voice & Group DM calls, GStreamer WebRTC Go Live screensharing, spec-compliant Kitty Unicode placeholder graphics, smooth animated GIF search, file & image attachments (with live preview, Ctrl+V clipboard image paste, and drag-and-drop), 3-tab Initial Setup login (auto-detecting Discordo OS keyring / QR Remote-Auth v2 / Token Paste), btop-compatible themes, and dynamic \`16×2\` HD44780 LCD to 4K cockpit layouts.
+
+          ### Packages & Binaries
+
+          | Platform | Architecture | Artifact |
+          | :--- | :--- | :--- |
+          | **Debian / Ubuntu** | \`x86_64\` (\`amd64\`) | \`bbscord_${VERSION}_amd64.deb\` |
+          | **Debian / Ubuntu** | \`arm64\` (\`aarch64\`) | \`bbscord_${VERSION}_arm64.deb\` |
+          | **Arch Linux / Manjaro** | \`x86_64\` | \`bbscord-${VERSION}-1-x86_64.pkg.tar.zst\` + \`PKGBUILD\` |
+          | **Arch Linux ARM / Manjaro ARM** | \`aarch64\` (\`arm64\`) | \`bbscord-${VERSION}-1-aarch64.pkg.tar.zst\` |
+          | **Linux Portable** | \`x86_64\` / \`arm64\` | \`bbscord-${VERSION}-linux-{x86_64,arm64}.tar.gz\` |
+          | **macOS** | Apple Silicon (\`arm64\`) / Intel (\`x86_64\`) | \`bbscord-${VERSION}-macos-{arm64,x86_64}.tar.gz\` |
+          | **Windows** | \`x86_64\` / \`arm64\` | \`bbscord-${VERSION}-windows-{x86_64,arm64}.zip\` |
+          | **ESP32 Hardware \`16×2\` LCD Bridge** | \`esp32\`, \`esp32s3\`, \`esp32c3\`, \`esp32c6\` | \`bbscord-esp32-${VERSION}-{chip}-factory.bin\` & \`firmware.tar.gz\` |
+
+          ### Quick Install
+
+          - **Ubuntu / Debian:** \`sudo apt install ./bbscord_${VERSION}_amd64.deb\` (or \`_arm64.deb\`)
+          - **Arch / Manjaro:** \`sudo pacman -U ./bbscord-${VERSION}-1-x86_64.pkg.tar.zst\` (or \`-aarch64.pkg.tar.zst\`)
+          - **macOS:** \`brew install gstreamer opus\` then extract \`bbscord-${VERSION}-macos-arm64.tar.gz\` (or \`x86_64\`)
+          - **Windows:** Install GStreamer MSVC runtime (\`1.28+\`) and extract \`bbscord-${VERSION}-windows-x86_64.zip\` (or \`arm64\`)
+          - **ESP32 (\`16×2\` I²C LCD + 6-button bridge):** \`esptool.py --chip esp32 write_flash 0x0 bbscord-esp32-${VERSION}-esp32-factory.bin\`
+
+          Verify downloads with \`sha256sum -c SHA256SUMS.txt\`.
+          EOF
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" release-artifacts/* --clobber
+            gh release edit "$TAG" --notes-file release-notes.md
+          else
+            gh release create "$TAG" release-artifacts/* \
+              --title "bbscord ${TAG}" \
+              --notes-file release-notes.md
+          fi

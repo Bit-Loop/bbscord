@@ -20,11 +20,13 @@ zeroize.workspace = true
 tokio-tungstenite.workspace = true
 rustls.workspace = true
 davey.workspace = true
-ashpd = { workspace = true, features = ["screencast"] }
 gstreamer.workspace = true
 gstreamer-webrtc.workspace = true
 gstreamer-app.workspace = true
 gstreamer-video = "0.25"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ashpd = { workspace = true, features = ["screencast"] }
 
 [dev-dependencies]
 openmls = { version = "0.8.1", features = ["js"] }
