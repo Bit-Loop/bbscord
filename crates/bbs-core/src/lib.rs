@@ -36,10 +36,11 @@ pub use secrets::{
     TokenOrigin,
 };
 pub use theme::{
-    ColorDepth, ColorGradient, RgbColor, ThemePalette, ThemeSource, ThemeSpec, parse_btop_theme,
+    Ansi16Gradient, Ansi16Palette, ColorDepth, ColorGradient, RgbColor, ThemePalette, ThemeSource,
+    ThemeSpec, parse_btop_theme,
 };
 pub use traits::{DiscordBackend, GifProvider, VideoStreamEngine, VoiceEngine};
 pub use viewport::{
-    CharsetMode, GraphicsTier, KeyboardProtocol, LayoutProfile, MultiplexerKind, ResolvedCharset,
-    ScrollAnchor, ScrollState, TerminalCapabilities, ViewportGeometry,
+    AnchorPart, CharsetMode, GraphicsTier, KeyboardProtocol, LayoutProfile, MultiplexerKind,
+    ResolvedCharset, ScrollAnchor, ScrollState, TerminalCapabilities, ViewportGeometry,
 };

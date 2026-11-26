@@ -6,6 +6,7 @@ use std::str::FromStr;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 use crate::error::CoreError;
+use crate::viewport::GraphicsTier;
 
 /// Discord Snowflake 64-bit unique identifier.
 ///
@@ -1060,8 +1061,111 @@ pub enum VideoSinkKind {
     /// Hardware-accelerated native pop-out window (e.g. Wayland/X11 GStreamer sink).
     #[default]
     PopoutWindow,
-    /// Inline terminal viewport rendering (Kitty/Sixel/iTerm2/HalfBlock).
+    /// Inline terminal viewport rendering (Kitty/Sixel/iTerm2/HalfBlock), gated by §6.5 Stage-deck rules.
     InlineTerminal,
+}
+
+impl VideoSinkKind {
+    /// Minimum Stage deck inner/allocated width in columns required for inline screenshare (§6.5).
+    pub const INLINE_MIN_DECK_COLS: u16 = 64;
+    /// Minimum Stage deck height in rows required for inline screenshare (`>= 8` video + `>= 4` Stage rows).
+    pub const INLINE_MIN_DECK_ROWS: u16 = 12;
+    /// Rows strictly reserved inside the Stage deck for participants and DAVE E2EE status (§6.5).
+    pub const INLINE_RESERVED_STAGE_ROWS: u16 = 4;
+
+    /// Check whether [`VideoSinkKind::InlineTerminal`] is allowed under the §6.5 Stage-deck gate.
+    ///
+    /// Requires:
+    /// - `deck_cols >= 64` and `deck_rows >= 12` (never satisfied in `Short` V-chrome)
+    /// - `graphics_tier != GraphicsTier::TextTagOnly`
+    /// - `HalfBlock` and `Sixel` require explicit `allow_low_tier_opt_in`
+    /// - `over_ssh` requires explicit `allow_ssh_opt_in`
+    #[must_use]
+    pub const fn can_use_inline_terminal(
+        deck_cols: u16,
+        deck_rows: u16,
+        graphics_tier: GraphicsTier,
+        over_ssh: bool,
+        allow_low_tier_opt_in: bool,
+        allow_ssh_opt_in: bool,
+    ) -> bool {
+        if deck_cols < Self::INLINE_MIN_DECK_COLS || deck_rows < Self::INLINE_MIN_DECK_ROWS {
+            return false;
+        }
+        if over_ssh && !allow_ssh_opt_in {
+            return false;
+        }
+        match graphics_tier {
+            GraphicsTier::KittyPlaceholder
+            | GraphicsTier::KittyDirect
+            | GraphicsTier::ITerm2 => true,
+            GraphicsTier::Sixel | GraphicsTier::HalfBlock => allow_low_tier_opt_in,
+            GraphicsTier::TextTagOnly => false,
+        }
+    }
+
+    /// Resolve a requested sink against the §6.5 Stage-deck gate, falling back to [`Self::PopoutWindow`]
+    /// whenever [`Self::InlineTerminal`] is ineligible.
+    #[must_use]
+    pub const fn resolve_effective(
+        self,
+        deck_cols: u16,
+        deck_rows: u16,
+        graphics_tier: GraphicsTier,
+        over_ssh: bool,
+        allow_low_tier_opt_in: bool,
+        allow_ssh_opt_in: bool,
+    ) -> Self {
+        match self {
+            Self::PopoutWindow => Self::PopoutWindow,
+            Self::InlineTerminal => {
+                if Self::can_use_inline_terminal(
+                    deck_cols,
+                    deck_rows,
+                    graphics_tier,
+                    over_ssh,
+                    allow_low_tier_opt_in,
+                    allow_ssh_opt_in,
+                ) {
+                    Self::InlineTerminal
+                } else {
+                    Self::PopoutWindow
+                }
+            }
+        }
+    }
+
+    /// Compute the `(width_cols, height_rows)` box for an inline Stage video stream using the real
+    /// stream aspect ratio and cell pixel size (§6.5):
+    /// `w = deck_cols - 2`, `h = min(ceil(w * (fh / fw) * (cw / ch)), deck_rows - 4)`, clamped `>= 1`.
+    ///
+    /// Returns `None` when the Stage deck does not meet the `64×12` floor or frame dimensions are zero.
+    #[must_use]
+    pub fn inline_video_box(
+        deck_cols: u16,
+        deck_rows: u16,
+        frame_width: u32,
+        frame_height: u32,
+        cell_px: (u16, u16),
+    ) -> Option<(u16, u16)> {
+        if deck_cols < Self::INLINE_MIN_DECK_COLS
+            || deck_rows < Self::INLINE_MIN_DECK_ROWS
+            || frame_width == 0
+            || frame_height == 0
+        {
+            return None;
+        }
+        let w = deck_cols.saturating_sub(2).max(1);
+        let max_h = deck_rows
+            .saturating_sub(Self::INLINE_RESERVED_STAGE_ROWS)
+            .max(1);
+        let cw = f64::from(cell_px.0.max(1));
+        let ch = f64::from(cell_px.1.max(1));
+        let ideal_h =
+            (f64::from(w) * (f64::from(frame_height) / f64::from(frame_width)) * (cw / ch)).ceil();
+        let h = (ideal_h as u16).clamp(1, max_h);
+        Some((w, h))
+    }
 }
 
 /// Video capture source when broadcasting a local Go Live screenshare.
@@ -1228,5 +1332,97 @@ mod tests {
         assert!((p.normalized_vu() - 1.0).abs() < f32::EPSILON);
         p.set_volume(255);
         assert_eq!(p.volume, 200);
+    }
+
+    #[test]
+    fn video_sink_inline_stage_deck_gate_and_box_math() {
+        // Too narrow or too short (e.g., Short V-chrome rows=11) -> denied
+        assert!(!VideoSinkKind::can_use_inline_terminal(
+            63,
+            20,
+            GraphicsTier::KittyPlaceholder,
+            false,
+            true,
+            true
+        ));
+        assert!(!VideoSinkKind::can_use_inline_terminal(
+            80,
+            11,
+            GraphicsTier::KittyPlaceholder,
+            false,
+            true,
+            true
+        ));
+
+        // 64x12 Kitty local -> allowed
+        assert!(VideoSinkKind::can_use_inline_terminal(
+            64,
+            12,
+            GraphicsTier::KittyPlaceholder,
+            false,
+            false,
+            false
+        ));
+
+        // Sixel/HalfBlock require opt-in; TextTagOnly always denied
+        assert!(!VideoSinkKind::can_use_inline_terminal(
+            80,
+            24,
+            GraphicsTier::Sixel,
+            false,
+            false,
+            false
+        ));
+        assert!(VideoSinkKind::can_use_inline_terminal(
+            80,
+            24,
+            GraphicsTier::Sixel,
+            false,
+            true,
+            false
+        ));
+        assert!(!VideoSinkKind::can_use_inline_terminal(
+            80,
+            24,
+            GraphicsTier::TextTagOnly,
+            false,
+            true,
+            true
+        ));
+
+        // SSH requires explicit opt-in and resolve_effective falls back to PopoutWindow
+        assert_eq!(
+            VideoSinkKind::InlineTerminal.resolve_effective(
+                80,
+                24,
+                GraphicsTier::KittyPlaceholder,
+                true,
+                false,
+                false
+            ),
+            VideoSinkKind::PopoutWindow
+        );
+        assert_eq!(
+            VideoSinkKind::InlineTerminal.resolve_effective(
+                80,
+                24,
+                GraphicsTier::KittyPlaceholder,
+                true,
+                false,
+                true
+            ),
+            VideoSinkKind::InlineTerminal
+        );
+
+        // Real aspect box: 64x24 deck -> w=62; 16:9 @ 8x16 cells => ceil(62 * 9/16 * 0.5) = 18 <= 20
+        assert_eq!(
+            VideoSinkKind::inline_video_box(64, 24, 1920, 1080, (8, 16)),
+            Some((62, 18))
+        );
+        // Clamped to deck_rows - 4 (reserving >= 4 Stage rows)
+        assert_eq!(
+            VideoSinkKind::inline_video_box(64, 12, 1920, 1080, (8, 16)),
+            Some((62, 8))
+        );
     }
 }

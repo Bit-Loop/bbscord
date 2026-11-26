@@ -1,4 +1,4 @@
-//! `btop`-compatible semantic theme palette, 3-stop RGB gradients, and color-depth contracts.
+//! `btop`-compatible semantic theme palette, 3-stop RGB gradients, ANSI-16 palettes, and color-depth contracts.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -138,46 +138,44 @@ impl RgbColor {
             / 255.0
     }
 
-    /// Quantize to the nearest xterm-256 color index (`16..=255`).
+    /// Quantize to the nearest xterm-256 color index (`16..=255`) using perceptual redmean distance
+    /// over both the 6×6×6 color cube and the 24-step grayscale ramp (§1.4).
     #[must_use]
     pub fn to_ansi256(self) -> u8 {
-        // Nearest 6x6x6 color cube coordinate.
         const CUBE_LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
-        let nearest_cube_idx = |v: u8| -> usize {
-            let mut best_i = 0usize;
-            let mut best_d = u32::MAX;
-            for (i, &lvl) in CUBE_LEVELS.iter().enumerate() {
-                let d = u32::from(v.abs_diff(lvl));
-                if d < best_d {
-                    best_d = d;
-                    best_i = i;
+
+        let mut best_idx = 16u8;
+        let mut best_dist = u64::MAX;
+
+        // Evaluate all 216 cube colors.
+        for (ri, &rv) in CUBE_LEVELS.iter().enumerate() {
+            for (gi, &gv) in CUBE_LEVELS.iter().enumerate() {
+                for (bi, &bv) in CUBE_LEVELS.iter().enumerate() {
+                    let candidate = Self::new(rv, gv, bv);
+                    let d = self.redmean_dist_sq(candidate);
+                    if d < best_dist {
+                        best_dist = d;
+                        best_idx = 16 + (ri as u8) * 36 + (gi as u8) * 6 + (bi as u8);
+                    }
                 }
             }
-            best_i
-        };
-
-        let ri = nearest_cube_idx(self.r);
-        let gi = nearest_cube_idx(self.g);
-        let bi = nearest_cube_idx(self.b);
-        let cube_color = Self::new(CUBE_LEVELS[ri], CUBE_LEVELS[gi], CUBE_LEVELS[bi]);
-        let cube_index = 16u8 + (ri as u8) * 36 + (gi as u8) * 6 + (bi as u8);
-
-        // Nearest grayscale ramp step (indices 232..=255 represent 8 + 10*i).
-        let avg = ((u16::from(self.r) + u16::from(self.g) + u16::from(self.b)) / 3) as u8;
-        let gray_step = avg.saturating_sub(8) / 10;
-        let gray_step = gray_step.min(23);
-        let gray_val = 8 + gray_step * 10;
-        let gray_color = Self::new(gray_val, gray_val, gray_val);
-        let gray_index = 232u8 + gray_step;
-
-        if self.dist_sq(gray_color) < self.dist_sq(cube_color) {
-            gray_index
-        } else {
-            cube_index
         }
+
+        // Evaluate all 24 grayscale ramp entries (indices 232..=255 -> 8 + 10*i).
+        for step in 0..24u8 {
+            let v = 8 + step * 10;
+            let candidate = Self::new(v, v, v);
+            let d = self.redmean_dist_sq(candidate);
+            if d < best_dist {
+                best_dist = d;
+                best_idx = 232 + step;
+            }
+        }
+
+        best_idx
     }
 
-    /// Quantize to the nearest standard ANSI 16-color index (`0..=15`).
+    /// Quantize to the nearest standard ANSI 16-color index (`0..=15`) using redmean distance (§8.4).
     #[must_use]
     pub fn to_ansi16(self) -> u8 {
         const ANSI16: [RgbColor; 16] = [
@@ -200,9 +198,9 @@ impl RgbColor {
         ];
 
         let mut best_idx = 0u8;
-        let mut best_dist = u32::MAX;
+        let mut best_dist = u64::MAX;
         for (idx, candidate) in ANSI16.iter().enumerate() {
-            let d = self.dist_sq(*candidate);
+            let d = self.redmean_dist_sq(*candidate);
             if d < best_dist {
                 best_dist = d;
                 best_idx = idx as u8;
@@ -211,12 +209,15 @@ impl RgbColor {
         best_idx
     }
 
+    /// Integer-scaled perceptual redmean squared distance:
+    /// `((512 + r_mean) * dr^2) + (1024 * dg^2) + ((767 - r_mean) * db^2)`.
     #[must_use]
-    const fn dist_sq(self, other: Self) -> u32 {
-        let dr = self.r.abs_diff(other.r) as u32;
-        let dg = self.g.abs_diff(other.g) as u32;
-        let db = self.b.abs_diff(other.b) as u32;
-        dr * dr + dg * dg + db * db
+    const fn redmean_dist_sq(self, other: Self) -> u64 {
+        let r_mean = (self.r as u64 + other.r as u64) / 2;
+        let dr = self.r.abs_diff(other.r) as u64;
+        let dg = self.g.abs_diff(other.g) as u64;
+        let db = self.b.abs_diff(other.b) as u64;
+        (512 + r_mean) * dr * dr + 1024 * dg * dg + (767 - r_mean) * db * db
     }
 }
 
@@ -285,9 +286,231 @@ impl ColorGradient {
             (None, None) => self.start,
         }
     }
+
+    /// Convert each stop in this RGB gradient to its nearest ANSI-16 color index (`0..=15`).
+    #[must_use]
+    pub fn to_ansi16(self) -> Ansi16Gradient {
+        Ansi16Gradient {
+            start: self.start.to_ansi16(),
+            mid: self.mid.map(RgbColor::to_ansi16),
+            end: self.end.map(RgbColor::to_ansi16),
+        }
+    }
 }
 
-/// Complete `btop`-compatible semantic palette plus 3-stop meter/border gradients.
+/// 1-, 2-, or 3-stop ANSI-16 indexed gradient (`0..=15`) matching [`ColorGradient`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Ansi16Gradient {
+    /// Lower-stop ANSI-16 index (`0..=15`).
+    pub start: u8,
+    /// Optional midpoint ANSI-16 index (`0..=15`).
+    #[serde(default)]
+    pub mid: Option<u8>,
+    /// Optional upper-stop ANSI-16 index (`0..=15`).
+    #[serde(default)]
+    pub end: Option<u8>,
+}
+
+impl Ansi16Gradient {
+    /// Create a 3-stop ANSI-16 gradient.
+    #[must_use]
+    pub const fn new_3stop(start: u8, mid: u8, end: u8) -> Self {
+        Self {
+            start: start & 0x0F,
+            mid: Some(mid & 0x0F),
+            end: Some(end & 0x0F),
+        }
+    }
+
+    /// Create a 2-stop ANSI-16 gradient.
+    #[must_use]
+    pub const fn new_2stop(start: u8, end: u8) -> Self {
+        Self {
+            start: start & 0x0F,
+            mid: None,
+            end: Some(end & 0x0F),
+        }
+    }
+
+    /// Create a flat 1-color ANSI-16 gradient.
+    #[must_use]
+    pub const fn solid(color: u8) -> Self {
+        Self {
+            start: color & 0x0F,
+            mid: None,
+            end: None,
+        }
+    }
+
+    /// Sample the indexed gradient at normalized position `t` in `[0.0, 1.0]`.
+    #[must_use]
+    pub fn sample(&self, t: f32) -> u8 {
+        let t = t.clamp(0.0, 1.0);
+        let idx = match (self.mid, self.end) {
+            (Some(mid), Some(end)) => {
+                if t < 1.0 / 3.0 {
+                    self.start
+                } else if t < 2.0 / 3.0 {
+                    mid
+                } else {
+                    end
+                }
+            }
+            (None, Some(end)) => {
+                if t < 0.5 {
+                    self.start
+                } else {
+                    end
+                }
+            }
+            (Some(mid), None) => {
+                if t < 0.5 {
+                    self.start
+                } else {
+                    mid
+                }
+            }
+            (None, None) => self.start,
+        };
+        idx & 0x0F
+    }
+}
+
+impl Default for Ansi16Gradient {
+    fn default() -> Self {
+        Self::new_3stop(4, 6, 15)
+    }
+}
+
+/// Explicit ANSI-16 palette (`0..=15` SGR indices) mirroring every semantic key in [`ThemePalette`] (§8.3, §12.7).
+///
+/// Used both for `ColorDepth::Ansi16` themes and for the built-in `tty` theme which follows the
+/// user's terminal palette at every color depth.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Ansi16Palette {
+    /// Main background index (`None` = terminal default / SGR 49).
+    pub main_bg: Option<u8>,
+    /// Primary text color (`0..=15`).
+    pub main_fg: u8,
+    /// Box title color (`0..=15`).
+    pub title: u8,
+    /// Keyboard shortcut & highlight foreground (`0..=15`).
+    pub hi_fg: u8,
+    /// Selected list item background (`0..=15`).
+    pub selected_bg: u8,
+    /// Selected list item foreground (`0..=15`).
+    pub selected_fg: u8,
+    /// Muted / inactive text foreground (`0..=15`).
+    pub inactive_fg: u8,
+    /// Text drawn on top of graphs (`0..=15`).
+    pub graph_text: u8,
+    /// Meter track background color (`0..=15`).
+    pub meter_bg: u8,
+    /// Accent color for mentions and secondary telemetry (`0..=15`).
+    pub proc_misc: u8,
+    /// Sidebar / primary frame border (`0..=15`).
+    pub cpu_box: u8,
+    /// Chat / secondary frame border (`0..=15`).
+    pub mem_box: u8,
+    /// Voice / Stage / Gateway frame border (`0..=15`).
+    pub net_box: u8,
+    /// Members / decks frame border (`0..=15`).
+    pub proc_box: u8,
+    /// Internal divider line color (`0..=15`).
+    pub div_line: u8,
+
+    /// Latency / severity indexed gradient.
+    pub temp_gradient: Ansi16Gradient,
+    /// Border / primary VU indexed gradient.
+    pub cpu_gradient: Ansi16Gradient,
+    /// Free / fallback nick palette indexed gradient.
+    pub free_gradient: Ansi16Gradient,
+    /// Cached / fallback nick palette indexed gradient.
+    pub cached_gradient: Ansi16Gradient,
+    /// Available / fallback nick palette indexed gradient.
+    pub available_gradient: Ansi16Gradient,
+    /// Unread heat indexed gradient.
+    pub used_gradient: Ansi16Gradient,
+    /// Remote speaker VU indexed gradient.
+    pub download_gradient: Ansi16Gradient,
+    /// Local mic VU indexed gradient.
+    pub upload_gradient: Ansi16Gradient,
+    /// Selection list indexed gradient.
+    pub process_gradient: Ansi16Gradient,
+}
+
+impl Ansi16Palette {
+    /// Built-in `tty` 16-color indexed palette following the terminal's own SGR palette (§8.2).
+    #[must_use]
+    pub const fn tty_default() -> Self {
+        Self {
+            main_bg: Some(0),
+            main_fg: 7,
+            title: 15,
+            hi_fg: 14,
+            selected_bg: 4,
+            selected_fg: 15,
+            inactive_fg: 8,
+            graph_text: 15,
+            meter_bg: 8,
+            proc_misc: 13,
+            cpu_box: 4,
+            mem_box: 6,
+            net_box: 2,
+            proc_box: 12,
+            div_line: 8,
+            temp_gradient: Ansi16Gradient::new_3stop(2, 11, 9),
+            cpu_gradient: Ansi16Gradient::new_3stop(4, 6, 15),
+            free_gradient: Ansi16Gradient::new_3stop(6, 12, 14),
+            cached_gradient: Ansi16Gradient::new_3stop(2, 6, 14),
+            available_gradient: Ansi16Gradient::new_3stop(3, 11, 9),
+            used_gradient: Ansi16Gradient::new_3stop(2, 11, 9),
+            download_gradient: Ansi16Gradient::new_3stop(2, 6, 14),
+            upload_gradient: Ansi16Gradient::new_3stop(5, 13, 9),
+            process_gradient: Ansi16Gradient::new_3stop(4, 6, 15),
+        }
+    }
+
+    /// Auto-derive an [`Ansi16Palette`] from an RGB [`ThemePalette`] via redmean nearest-match (§8.4, §12.7).
+    #[must_use]
+    pub fn from_rgb_palette(p: &ThemePalette) -> Self {
+        Self {
+            main_bg: p.main_bg.map(RgbColor::to_ansi16),
+            main_fg: p.main_fg.to_ansi16(),
+            title: p.title.to_ansi16(),
+            hi_fg: p.hi_fg.to_ansi16(),
+            selected_bg: p.selected_bg.to_ansi16(),
+            selected_fg: p.selected_fg.to_ansi16(),
+            inactive_fg: p.inactive_fg.to_ansi16(),
+            graph_text: p.graph_text.to_ansi16(),
+            meter_bg: p.meter_bg.to_ansi16(),
+            proc_misc: p.proc_misc.to_ansi16(),
+            cpu_box: p.cpu_box.to_ansi16(),
+            mem_box: p.mem_box.to_ansi16(),
+            net_box: p.net_box.to_ansi16(),
+            proc_box: p.proc_box.to_ansi16(),
+            div_line: p.div_line.to_ansi16(),
+            temp_gradient: p.temp_gradient.to_ansi16(),
+            cpu_gradient: p.cpu_gradient.to_ansi16(),
+            free_gradient: p.free_gradient.to_ansi16(),
+            cached_gradient: p.cached_gradient.to_ansi16(),
+            available_gradient: p.available_gradient.to_ansi16(),
+            used_gradient: p.used_gradient.to_ansi16(),
+            download_gradient: p.download_gradient.to_ansi16(),
+            upload_gradient: p.upload_gradient.to_ansi16(),
+            process_gradient: p.process_gradient.to_ansi16(),
+        }
+    }
+}
+
+impl Default for Ansi16Palette {
+    fn default() -> Self {
+        Self::tty_default()
+    }
+}
+
+/// Complete `btop`-compatible semantic palette plus 3-stop meter/border gradients and optional ANSI-16 table.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThemePalette {
     /// Main background (`None` means terminal default / transparent).
@@ -323,7 +546,7 @@ pub struct ThemePalette {
 
     /// Temperature / alert severity gradient.
     pub temp_gradient: ColorGradient,
-    /// Primary activity / VU meter gradient (`cpu_*`).
+    /// Primary activity / border / VU meter gradient (`cpu_*`).
     pub cpu_gradient: ColorGradient,
     /// Available headroom gradient (`free_*`).
     pub free_gradient: ColorGradient,
@@ -333,12 +556,17 @@ pub struct ThemePalette {
     pub available_gradient: ColorGradient,
     /// Saturation / load gradient (`used_*`).
     pub used_gradient: ColorGradient,
-    /// Incoming traffic / RX sparkline gradient (`download_*`).
+    /// Incoming traffic / remote speakers VU gradient (`download_*`).
     pub download_gradient: ColorGradient,
-    /// Outgoing traffic / TX sparkline gradient (`upload_*`).
+    /// Outgoing traffic / mic VU gradient (`upload_*`).
     pub upload_gradient: ColorGradient,
-    /// Active process / speaker intensity gradient (`process_*`).
+    /// Active process / selection intensity gradient (`process_*`).
     pub process_gradient: ColorGradient,
+
+    /// Optional explicit ANSI-16 indexed palette (`[ansi16]` in TOML themes, §12.7).
+    /// When `None`, `bbs-tui` derives indices with [`RgbColor::to_ansi16`] via [`Self::resolved_ansi16`].
+    #[serde(default)]
+    pub ansi16: Option<Ansi16Palette>,
 }
 
 impl ThemePalette {
@@ -406,7 +634,16 @@ impl ThemePalette {
                 RgbColor::new(56, 189, 248),
                 RgbColor::new(168, 85, 247),
             ),
+            ansi16: None,
         }
+    }
+
+    /// Return the explicit [`Ansi16Palette`] when provided, or derive one via redmean [`RgbColor::to_ansi16`].
+    #[must_use]
+    pub fn resolved_ansi16(&self) -> Ansi16Palette {
+        self.ansi16
+            .clone()
+            .unwrap_or_else(|| Ansi16Palette::from_rgb_palette(self))
     }
 
     /// Semantic VU meter gradient (maps voice RMS `0.0..=1.0` cleanly onto `cpu_gradient`).
@@ -462,12 +699,14 @@ impl Default for ThemeSpec {
 
 /// Parse a real `btop` `.theme` file (`theme[key]="value"`) into a [`ThemeSpec`].
 ///
-/// Handles real-world quirks observed across `/usr/share/btop/themes`:
+/// Handles real-world quirks observed across `/usr/share/btop/themes` (§8.4 & §12.6):
 /// - Inline trailing comments after closing quote (e.g. `theme[cpu_mid]="#F8F8F2" #2eb398"`)
 /// - 2-hex grayscale shorthands (`"#80"`)
 /// - Space-separated RGB decimals (`"40 42 54"`)
-/// - Empty `""` values (`main_bg=""` = transparent, `*_mid=""` = 2-stop gradient, both empty = flat)
-/// - Optional/newer keys default gracefully; unknown keys are ignored.
+/// - Empty `""` values (`main_bg=""` = transparent; `end == ""` => flat `start` with `mid` ignored
+///   matching btop's `generateGradients`; `mid == ""` with `end` set => 2-stop `start -> end`)
+/// - Optional/newer keys default gracefully (`graph_text -> main_fg`, `meter_bg -> inactive_fg`,
+///   `process_* -> selected_bg` gradient); unknown keys are ignored.
 pub fn parse_btop_theme(name: impl Into<String>, input: &str) -> CoreResult<ThemeSpec> {
     let mut raw_map: HashMap<String, String> = HashMap::new();
 
@@ -501,7 +740,6 @@ pub fn parse_btop_theme(name: impl Into<String>, input: &str) -> CoreResult<Them
             };
             quoted.trim().to_string()
         } else {
-            // Unquoted value up to optional '#' comment.
             after_eq
                 .split('#')
                 .next()
@@ -584,8 +822,13 @@ pub fn parse_btop_theme(name: impl Into<String>, input: &str) -> CoreResult<Them
             Some(Some(c)) => c,
             _ => return Ok(fallback),
         };
-        let mid = parse_opt(&mid_key)?.flatten();
         let end = parse_opt(&end_key)?.flatten();
+        // §8.4 / §12.6: btop only interpolates when `*_end` is set; otherwise flat `start`.
+        let mid = if end.is_some() {
+            parse_opt(&mid_key)?.flatten()
+        } else {
+            None
+        };
         Ok(ColorGradient { start, mid, end })
     };
 
@@ -597,7 +840,9 @@ pub fn parse_btop_theme(name: impl Into<String>, input: &str) -> CoreResult<Them
     palette.used_gradient = parse_gradient("used", palette.used_gradient)?;
     palette.download_gradient = parse_gradient("download", palette.download_gradient)?;
     palette.upload_gradient = parse_gradient("upload", palette.upload_gradient)?;
-    palette.process_gradient = parse_gradient("process", palette.cpu_gradient)?;
+    palette.process_gradient =
+        parse_gradient("process", ColorGradient::solid(palette.selected_bg))?;
+    palette.ansi16 = None;
 
     Ok(ThemeSpec {
         name: name.into(),
@@ -648,7 +893,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_real_btop_quirks() {
+    fn parse_real_btop_quirks_and_empty_end_rule() {
         let sample = r##"
 # Comment line
 theme[main_bg]=""
@@ -667,6 +912,9 @@ theme[temp_end]="#e01b24"
 theme[free_start]="#22c55e"
 theme[free_mid]=""
 theme[free_end]=""
+theme[used_start]="#112233"
+theme[used_mid]="#445566"
+theme[used_end]=""
 theme[unknown_future_key]="#112233"
 "##;
 
@@ -679,7 +927,7 @@ theme[unknown_future_key]="#112233"
             spec.palette.cpu_gradient.mid,
             Some(RgbColor::new(248, 248, 242))
         );
-        // 2-stop when mid=""
+        // 2-stop when mid="" and end is set
         assert_eq!(spec.palette.temp_gradient.mid, None);
         assert_eq!(
             spec.palette.temp_gradient.end,
@@ -688,8 +936,38 @@ theme[unknown_future_key]="#112233"
         // 1-stop flat when both mid and end are ""
         assert_eq!(spec.palette.free_gradient.mid, None);
         assert_eq!(spec.palette.free_gradient.end, None);
-        // Omitted optional graph_text falls back to main_fg
+        // §12.6: mid set with end="" MUST drop mid and stay flat `start` (btop-faithful)
+        assert_eq!(
+            spec.palette.used_gradient,
+            ColorGradient::solid(RgbColor::new(0x11, 0x22, 0x33))
+        );
+        // Omitted optional keys default per §8.4
         assert_eq!(spec.palette.graph_text, spec.palette.main_fg);
+        assert_eq!(spec.palette.meter_bg, spec.palette.inactive_fg);
+        assert_eq!(
+            spec.palette.process_gradient,
+            ColorGradient::solid(spec.palette.selected_bg)
+        );
+        assert_eq!(spec.palette.ansi16, None);
+    }
+
+    #[test]
+    fn ansi16_palette_explicit_and_derived() {
+        let mut pal = ThemePalette::ansi_bbs_royal();
+        let derived = pal.resolved_ansi16();
+        assert_eq!(derived.selected_fg, 15);
+        assert!(derived.main_bg.is_some());
+
+        let tty = Ansi16Palette::tty_default();
+        assert_eq!(tty.main_bg, Some(0));
+        assert_eq!(tty.main_fg, 7);
+        assert_eq!(tty.hi_fg, 14);
+        assert_eq!(tty.cpu_gradient.sample(0.0), 4);
+        assert_eq!(tty.cpu_gradient.sample(0.5), 6);
+        assert_eq!(tty.cpu_gradient.sample(1.0), 15);
+
+        pal.ansi16 = Some(tty.clone());
+        assert_eq!(pal.resolved_ansi16(), tty);
     }
 
     #[test]
