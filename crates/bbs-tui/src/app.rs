@@ -6,10 +6,13 @@ use bbs_core::{
     BackendEvent, CallRingState, ChannelKind, GifSearchQuery, Message, RgbaFrame, ScrollState,
     Snowflake, StreamQuality, StreamSourceKind, UiAction, VideoSinkKind, ViewportGeometry,
 };
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::layout::Rect;
 
 use crate::charset::Glyphs;
-use crate::composer::{ComposeTarget, Composer};
+use crate::composer::{AutocompleteState, ComposeTarget, Composer};
 use crate::config::{CtrlKMode, TuiConfig};
 use crate::geometry::{Layout, LayoutMemory};
 use crate::micro::MicroState;
@@ -73,10 +76,14 @@ pub enum Focus {
 pub enum SideItem {
     /// DMs pseudo-guild.
     Home,
-    /// A guild.
-    Guild(Snowflake),
-    /// A channel (with indent depth).
+    /// A collapsible guild folder (index into `Store::folders`).
+    Folder(usize),
+    /// A guild `(guild_id, indent_depth)`.
+    Guild(Snowflake, u8),
+    /// A channel `(channel_id, indent_depth)`.
     Channel(Snowflake, u8),
+    /// A voice channel occupant `(channel_id, user_id, indent_depth)`.
+    VoiceMember(Snowflake, Snowflake, u8),
 }
 
 /// Sidebar tree state.
@@ -90,6 +97,8 @@ pub struct Sidebar {
     pub expanded: HashSet<Option<Snowflake>>,
     /// Collapsed categories.
     pub collapsed: HashSet<Snowflake>,
+    /// Collapsed guild folders (index into `Store::folders`).
+    pub collapsed_folders: HashSet<usize>,
 }
 
 /// Decoded image cache entry provided by the media runtime (used for HalfBlock drawing).
@@ -129,6 +138,8 @@ pub struct App {
     pub focus: Focus,
     /// Composer.
     pub composer: Composer,
+    /// Composer autocomplete popup state (`@mention`, `:emoji:`, `#channel`).
+    pub autocomplete: AutocompleteState,
     pub(crate) modals: Vec<Modal>,
     /// Active guild (`None` = DMs home).
     pub active_guild: Option<Snowflake>,
@@ -149,6 +160,7 @@ pub struct App {
     pub(crate) micro: MicroState,
     pub(crate) now_ms: u64,
     pub(crate) gif_req: u64,
+    pub(crate) gif_grid_cols: usize,
     pub(crate) ctrl_x: bool,
     pub(crate) last_ctrl_c: u64,
     pub(crate) size: (u16, u16),
@@ -163,6 +175,21 @@ pub struct App {
     /// Theme search directories (rescanned whenever the picker opens, §8.1).
     pub theme_dirs: theme::ThemeDirs,
     pub(crate) catalog: theme::ThemeCatalog,
+    // Per-frame hit-test caches populated during rendering for mouse handling.
+    pub(crate) sidebar_rows: Vec<(u16, SideItem)>,
+    pub(crate) visible_message_rows: Vec<(u16, Snowflake)>,
+    pub(crate) member_rows: Vec<(u16, Snowflake)>,
+    pub(crate) deck_rows: Vec<(u16, usize)>,
+    pub(crate) modal_rect: Option<Rect>,
+    pub(crate) modal_rows: Vec<(Rect, usize)>,
+    pub(crate) confirm_buttons: Option<(Rect, Rect)>,
+    pub(crate) autocomplete_rect: Option<Rect>,
+    pub(crate) autocomplete_rows: Vec<(Rect, usize)>,
+    pub(crate) last_click: Option<(u64, u16, u16)>,
+    pub(crate) last_acked: HashMap<Snowflake, Snowflake>,
+    pub(crate) last_typing_sent_ms: u64,
+    pub(crate) pending_open_url: Option<String>,
+    pub(crate) pending_copy_text: Option<String>,
 }
 
 impl std::fmt::Debug for App {
@@ -210,8 +237,9 @@ impl App {
             layout: None,
             cache: LayoutCache::default(),
             mode: Mode::Normal,
-            focus: Focus::Messages,
+            focus: Focus::Sidebar,
             composer: Composer::default(),
+            autocomplete: AutocompleteState::default(),
             modals: Vec::new(),
             active_guild: None,
             active_channel: None,
@@ -227,6 +255,7 @@ impl App {
             micro: MicroState::default(),
             now_ms: 0,
             gif_req: 0,
+            gif_grid_cols: 1,
             ctrl_x: false,
             last_ctrl_c: 0,
             size: (0, 0),
@@ -238,8 +267,34 @@ impl App {
             pending: Vec::new(),
             theme_dirs: theme::ThemeDirs::from_env(),
             catalog: theme::ThemeCatalog::builtin_only(),
+            sidebar_rows: Vec::new(),
+            visible_message_rows: Vec::new(),
+            member_rows: Vec::new(),
+            deck_rows: Vec::new(),
+            modal_rect: None,
+            modal_rows: Vec::new(),
+            confirm_buttons: None,
+            autocomplete_rect: None,
+            autocomplete_rows: Vec::new(),
+            last_click: None,
+            last_acked: HashMap::new(),
+            last_typing_sent_ms: 0,
+            pending_open_url: None,
+            pending_copy_text: None,
             cfg,
         }
+    }
+
+    /// Take a pending URL/attachment queued by the user (`o` or double-click) for the host runner
+    /// to open in the system browser / opener.
+    pub fn take_open_url(&mut self) -> Option<String> {
+        self.pending_open_url.take()
+    }
+
+    /// Take pending text queued by the user (`y` copy message / `u` copy URL) for the host runner
+    /// to place on the system clipboard (e.g., OSC 52 or wl-copy/xclip).
+    pub fn take_copy_text(&mut self) -> Option<String> {
+        self.pending_copy_text.take()
     }
 
     /// Current theme.
@@ -271,9 +326,16 @@ impl App {
         &self.image_slots
     }
 
-    /// Advance the clock (unix ms). Drives typing expiry, auto-read and ring timeouts.
+    /// Advance the clock (unix ms). Drives typing expiry, debounced GIF search, auto-read and ring timeouts.
     pub fn tick(&mut self, now_ms: u64) -> Vec<Effect> {
         self.now_ms = now_ms;
+        if let Some(Modal::Gif(g)) = self.modals.last()
+            && g.pending_search_at_ms.is_some_and(|due| now_ms >= due)
+            && let Some(Modal::Gif(mut g)) = self.modals.pop()
+        {
+            modals::dispatch_gif_search(self, &mut g);
+            self.modals.push(Modal::Gif(g));
+        }
         crate::micro::tick(self);
         std::mem::take(&mut self.pending)
     }
@@ -337,8 +399,24 @@ impl App {
             (v.channel_id, epoch)
         });
         let auto_select = matches!(ev, BackendEvent::Ready { .. }) && self.active_channel.is_none();
+        let gif_done_req = match &ev {
+            BackendEvent::GifSearchResults { request_id, .. }
+            | BackendEvent::GifSearchFailed { request_id, .. } => Some(*request_id),
+            _ => None,
+        };
+        let ack_candidate = match &ev {
+            BackendEvent::MessagesLoaded { channel_id, .. } => Some(*channel_id),
+            BackendEvent::MessageCreated(m) => Some(m.channel_id),
+            _ => None,
+        };
         let ring_before = self.store.ring.clone();
         self.store.apply(ev, self.active_channel);
+        if let Some(req_id) = gif_done_req
+            && let Some(Modal::Gif(g)) = self.modals.last_mut()
+            && g.request_id == req_id
+        {
+            g.loading = false;
+        }
         let next_voice = self.store.voice.as_ref().map(|v| {
             let epoch = match v.dave {
                 bbs_core::DaveSessionState::Active { epoch, .. } => Some(epoch),
@@ -354,6 +432,12 @@ impl App {
             if let Some(id) = first_dm {
                 self.select_channel(id);
             }
+        }
+        if let Some(ch) = ack_candidate
+            && self.active_channel == Some(ch)
+            && self.scroll_state() == ScrollState::FollowTail
+        {
+            self.maybe_ack_channel(ch);
         }
         if ring_before != self.store.ring
             && matches!(self.store.ring, CallRingState::IncomingRinging { .. })
@@ -396,23 +480,29 @@ impl App {
         }
     }
 
-    /// Switch to a channel, emitting the select action.
+    /// Switch to a channel, emitting the select action (or toggling voice join/leave).
     pub fn select_channel(&mut self, id: Snowflake) {
         let kind = self.store.channel(id).map(|c| c.kind);
         if kind.is_some_and(|k| k == ChannelKind::GuildCategory) {
             return;
         }
         if kind.is_some_and(ChannelKind::is_voice) {
-            let guild = self.store.channel(id).and_then(|c| c.guild_id);
-            self.pending.push(Effect::Action(UiAction::JoinVoice {
-                guild_id: guild,
-                channel_id: id,
-            }));
+            if self.store.voice.as_ref().is_some_and(|v| v.channel_id == id) {
+                self.pending.push(Effect::Action(UiAction::LeaveVoice));
+            } else {
+                let guild = self.store.channel(id).and_then(|c| c.guild_id);
+                self.pending.push(Effect::Action(UiAction::JoinVoice {
+                    guild_id: guild,
+                    channel_id: id,
+                }));
+            }
             return;
         }
         self.active_channel = Some(id);
         self.active_guild = self.store.channel(id).and_then(|c| c.guild_id);
         self.selected = None;
+        self.autocomplete.clear();
+        self.maybe_ack_channel(id);
         self.store.mark_read(id);
         self.pending
             .push(Effect::Action(UiAction::SelectChannel(id)));
@@ -422,10 +512,269 @@ impl App {
         }
     }
 
+    /// Open a channel interactively (sidebar Enter/click or Quick Switcher): selects it and
+    /// enters composer Insert mode when `cfg.auto_focus` is enabled.
+    pub(crate) fn open_channel(&mut self, id: Snowflake) {
+        let is_voice_or_cat = self
+            .store
+            .channel(id)
+            .is_some_and(|c| c.kind.is_voice() || c.kind == ChannelKind::GuildCategory);
+        self.select_channel(id);
+        if !is_voice_or_cat {
+            self.focus = Focus::Messages;
+            if self.cfg.auto_focus && !self.is_micro() {
+                self.mode = Mode::Insert;
+            }
+        }
+    }
+
+    /// Emit a deduplicated [`UiAction::AckMessage`] if `ch` has unacknowledged messages.
+    pub(crate) fn maybe_ack_channel(&mut self, ch: Snowflake) {
+        let latest = self
+            .store
+            .channel(ch)
+            .and_then(|c| c.last_message_id)
+            .into_iter()
+            .chain(
+                self.store
+                    .messages
+                    .get(&ch)
+                    .and_then(|m| m.messages.back().map(|msg| msg.id)),
+            )
+            .max_by_key(|id| id.as_u64());
+        let Some(message_id) = latest else {
+            return;
+        };
+        let needs_ack = self.store.channel(ch).is_some_and(|c| {
+            c.unread_count > 0
+                || c.mention_count > 0
+                || c.last_ack_message_id
+                    .is_some_and(|ack| message_id.as_u64() > ack.as_u64())
+        });
+        if !needs_ack {
+            return;
+        }
+        if self.last_acked.get(&ch) == Some(&message_id) {
+            return;
+        }
+        self.last_acked.insert(ch, message_id);
+        self.store.mark_read(ch);
+        self.pending.push(Effect::Action(UiAction::AckMessage {
+            channel_id: ch,
+            message_id,
+        }));
+    }
+
     /// Select a guild (expands it and asks for its channels).
     pub fn select_guild(&mut self, id: Option<Snowflake>) {
         self.sidebar.expanded.insert(id);
         self.pending.push(Effect::Action(UiAction::SelectGuild(id)));
+    }
+
+    /// Handle a terminal mouse event (clicks, double-clicks, and wheel scrolling).
+    pub fn handle_mouse(&mut self, ev: MouseEvent) -> Vec<Effect> {
+        let (x, y) = (ev.column, ev.row);
+        let point_in = |r: Rect| x >= r.x && x < r.right() && y >= r.y && y < r.bottom();
+
+        // 1. Modal tier: clicks inside activate rows/buttons; clicks outside dismiss; wheel scrolls.
+        if !self.modals.is_empty() {
+            match ev.kind {
+                MouseEventKind::ScrollUp => {
+                    if let Some(mut m) = self.modals.pop() {
+                        modals::scroll_modal(self, &mut m, -3);
+                        self.modals.push(m);
+                    }
+                }
+                MouseEventKind::ScrollDown => {
+                    if let Some(mut m) = self.modals.pop() {
+                        modals::scroll_modal(self, &mut m, 3);
+                        self.modals.push(m);
+                    }
+                }
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if let Some((no_rect, yes_rect)) = self.confirm_buttons {
+                        if point_in(no_rect) {
+                            self.close_modal();
+                            return std::mem::take(&mut self.pending);
+                        }
+                        if point_in(yes_rect) {
+                            if let Some(Modal::Confirm { kind, .. }) = self.modals.pop() {
+                                let _ = modals::confirm_choice(self, kind, true);
+                            }
+                            return std::mem::take(&mut self.pending);
+                        }
+                    }
+                    if let Some(&(_, idx)) = self.modal_rows.iter().find(|(r, _)| point_in(*r)) {
+                        if let Some(mut m) = self.modals.pop() {
+                            let outcome = modals::activate_row(self, &mut m, idx);
+                            self.apply_modal_outcome(m, outcome);
+                        }
+                        return std::mem::take(&mut self.pending);
+                    }
+                    if self.modal_rect.is_some_and(|mr| !point_in(mr)) {
+                        self.close_modal();
+                    }
+                }
+                _ => {}
+            }
+            return std::mem::take(&mut self.pending);
+        }
+
+        if self.is_micro() {
+            return Vec::new();
+        }
+
+        // 2. Autocomplete popup overlay in Insert mode.
+        if self.mode == Mode::Insert
+            && self.autocomplete.is_open()
+            && let Some(ar) = self.autocomplete_rect
+        {
+            match ev.kind {
+                MouseEventKind::ScrollUp if point_in(ar) => {
+                    self.autocomplete.move_up();
+                    return std::mem::take(&mut self.pending);
+                }
+                MouseEventKind::ScrollDown if point_in(ar) => {
+                    self.autocomplete.move_down();
+                    return std::mem::take(&mut self.pending);
+                }
+                MouseEventKind::Down(MouseButton::Left) if point_in(ar) => {
+                    if let Some(&(_, idx)) =
+                        self.autocomplete_rows.iter().find(|(r, _)| point_in(*r))
+                    {
+                        self.autocomplete.accept_index(idx, &mut self.composer);
+                    }
+                    return std::mem::take(&mut self.pending);
+                }
+                MouseEventKind::Down(MouseButton::Left) => {
+                    self.autocomplete.clear();
+                }
+                _ => {}
+            }
+        }
+
+        let Some(layout) = self.layout.clone() else {
+            return std::mem::take(&mut self.pending);
+        };
+
+        // 3. Wheel scroll over hovered pane.
+        match ev.kind {
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let down = matches!(ev.kind, MouseEventKind::ScrollDown);
+                let delta: isize = if down { 3 } else { -3 };
+                if point_in(layout.messages) {
+                    self.scroll_lines(delta);
+                } else {
+                    for p in &layout.panes {
+                        if !point_in(p.rect) {
+                            continue;
+                        }
+                        match p.kind {
+                            crate::geometry::PaneKind::Sidebar => {
+                                let n = self.sidebar_items().len();
+                                if n > 0 {
+                                    self.sidebar.cursor = (self.sidebar.cursor as isize + delta)
+                                        .clamp(0, n as isize - 1)
+                                        as usize;
+                                }
+                            }
+                            crate::geometry::PaneKind::Members => {
+                                self.members_cursor =
+                                    (self.members_cursor as isize + delta).max(0) as usize;
+                            }
+                            crate::geometry::PaneKind::Deck(_) => {
+                                self.deck_cursor =
+                                    (self.deck_cursor as isize + delta).max(0) as usize;
+                            }
+                            crate::geometry::PaneKind::Chat => {
+                                self.scroll_lines(delta);
+                            }
+                        }
+                        break;
+                    }
+                }
+                return std::mem::take(&mut self.pending);
+            }
+            MouseEventKind::Down(MouseButton::Left) => {}
+            _ => return std::mem::take(&mut self.pending),
+        }
+
+        // 4. Left-click: focus pane and activate hit-tested rows/items.
+        let is_double = self.last_click.is_some_and(|(t, lx, ly)| {
+            lx == x && ly == y && self.now_ms >= t && self.now_ms.saturating_sub(t) <= 500
+        });
+        self.last_click = Some((self.now_ms, x, y));
+
+        if point_in(layout.composer) {
+            self.focus = Focus::Messages;
+            self.mode = Mode::Insert;
+            return std::mem::take(&mut self.pending);
+        }
+
+        if point_in(layout.messages) {
+            self.focus = Focus::Messages;
+            self.mode = Mode::Normal;
+            if let Some(&(_, msg_id)) = self.visible_message_rows.iter().find(|(ry, _)| *ry == y) {
+                self.selected = Some(msg_id);
+                if is_double {
+                    if self
+                        .selected_message()
+                        .is_some_and(Message::is_voice_message)
+                    {
+                        self.play_selected_voice();
+                    } else {
+                        self.open_selected_media();
+                    }
+                }
+            }
+            return std::mem::take(&mut self.pending);
+        }
+
+        for p in &layout.panes {
+            if !point_in(p.rect) {
+                continue;
+            }
+            match p.kind {
+                crate::geometry::PaneKind::Sidebar => {
+                    self.focus = Focus::Sidebar;
+                    self.mode = Mode::Normal;
+                    if let Some((_, item)) =
+                        self.sidebar_rows.iter().find(|(ry, _)| *ry == y).cloned()
+                    {
+                        let items = self.sidebar_items();
+                        if let Some(pos) = items.iter().position(|it| *it == item) {
+                            self.sidebar.cursor = pos;
+                            self.sidebar_activate();
+                        }
+                    }
+                }
+                crate::geometry::PaneKind::Members => {
+                    self.focus = Focus::Members;
+                    self.mode = Mode::Normal;
+                    if let Some((idx, _)) = self
+                        .member_rows
+                        .iter()
+                        .enumerate()
+                        .find(|(_, (ry, _))| *ry == y)
+                    {
+                        self.members_cursor = idx;
+                    }
+                }
+                crate::geometry::PaneKind::Deck(i) => {
+                    self.focus = Focus::Deck(i);
+                    self.mode = Mode::Normal;
+                    if let Some(&(_, idx)) = self.deck_rows.iter().find(|(ry, _)| *ry == y) {
+                        self.deck_cursor = idx;
+                    }
+                }
+                crate::geometry::PaneKind::Chat => {
+                    self.focus = Focus::Messages;
+                    self.mode = Mode::Normal;
+                }
+            }
+            break;
+        }
+        std::mem::take(&mut self.pending)
     }
 
     /// Paste (bracketed paste or heuristic): inserted verbatim, never sent (§9.4).
@@ -439,6 +788,7 @@ impl App {
         } else {
             self.mode = Mode::Insert;
             self.composer.insert_str(&clean);
+            self.autocomplete.clear();
             if self.composer.char_len() > self.cfg.max_message_len() {
                 self.open(Modal::too_long(self.cfg.max_message_len()));
             }
@@ -561,6 +911,10 @@ impl App {
             return;
         };
         let outcome = modals::handle_key(self, &mut m, k);
+        self.apply_modal_outcome(m, outcome);
+    }
+
+    fn apply_modal_outcome(&mut self, m: Modal, outcome: ModalOutcome) {
         match outcome {
             ModalOutcome::Keep => self.modals.push(m),
             ModalOutcome::Close => {
@@ -625,21 +979,23 @@ impl App {
     }
 
     pub(crate) fn toggle_mute(&mut self) {
-        let muted = self.store.voice.as_ref().is_some_and(|v| v.self_mute);
+        let Some(v) = self.store.voice.as_mut() else {
+            return;
+        };
+        v.self_mute = !v.self_mute;
+        let muted = v.self_mute;
         self.pending
-            .push(Effect::Action(UiAction::SetSelfMute(!muted)));
-        if let Some(v) = self.store.voice.as_mut() {
-            v.self_mute = !muted;
-        }
+            .push(Effect::Action(UiAction::SetSelfMute(muted)));
     }
 
     pub(crate) fn toggle_deaf(&mut self) {
-        let deaf = self.store.voice.as_ref().is_some_and(|v| v.self_deaf);
+        let Some(v) = self.store.voice.as_mut() else {
+            return;
+        };
+        v.self_deaf = !v.self_deaf;
+        let deaf = v.self_deaf;
         self.pending
-            .push(Effect::Action(UiAction::SetSelfDeaf(!deaf)));
-        if let Some(v) = self.store.voice.as_mut() {
-            v.self_deaf = !deaf;
-        }
+            .push(Effect::Action(UiAction::SetSelfDeaf(deaf)));
     }
 
     pub(crate) fn answer_or_hangup(&mut self) {
@@ -654,6 +1010,7 @@ impl App {
                 self.pending
                     .push(Effect::Action(UiAction::StopCallRing { channel_id }));
                 self.pending.push(Effect::Action(UiAction::LeaveVoice));
+                self.store.ring = CallRingState::Idle;
             }
             _ => {
                 if self.store.voice.is_some() {
@@ -670,6 +1027,12 @@ impl App {
             CallRingState::IncomingRinging { channel_id, .. } => {
                 self.pending
                     .push(Effect::Action(UiAction::StopCallRing { channel_id }));
+                self.store.ring = CallRingState::Idle;
+            }
+            CallRingState::OutgoingRinging { channel_id, .. } => {
+                self.pending
+                    .push(Effect::Action(UiAction::StopCallRing { channel_id }));
+                self.pending.push(Effect::Action(UiAction::LeaveVoice));
                 self.store.ring = CallRingState::Idle;
             }
             _ => {
@@ -704,29 +1067,43 @@ impl App {
     }
 
     pub(crate) fn join_voice(&mut self) {
-        // Sidebar cursor on a voice channel, else the active channel if it can carry a call.
-        if self.focus == Focus::Sidebar
-            && let Some(SideItem::Channel(id, _)) =
-                self.sidebar_items().get(self.sidebar.cursor).cloned()
-            && let Some(c) = self.store.channel(id)
-            && c.kind.is_voice()
-        {
-            let g = c.guild_id;
-            self.pending.push(Effect::Action(UiAction::JoinVoice {
-                guild_id: g,
-                channel_id: id,
-            }));
-            return;
+        // Sidebar cursor on a voice channel (or nested voice occupant), else active call-capable channel.
+        if self.focus == Focus::Sidebar {
+            let voice_ch = match self.sidebar_items().get(self.sidebar.cursor).cloned() {
+                Some(SideItem::Channel(id, _))
+                    if self.store.channel(id).is_some_and(|c| c.kind.is_voice()) =>
+                {
+                    Some(id)
+                }
+                Some(SideItem::VoiceMember(ch_id, _, _)) => Some(ch_id),
+                _ => None,
+            };
+            if let Some(id) = voice_ch {
+                if self.store.voice.as_ref().is_some_and(|v| v.channel_id == id) {
+                    self.pending.push(Effect::Action(UiAction::LeaveVoice));
+                } else {
+                    let g = self.store.channel(id).and_then(|c| c.guild_id);
+                    self.pending.push(Effect::Action(UiAction::JoinVoice {
+                        guild_id: g,
+                        channel_id: id,
+                    }));
+                }
+                return;
+            }
         }
         if let Some(ch) = self.active_channel
             && let Some(c) = self.store.channel(ch)
             && c.kind.supports_voice_call()
         {
-            let g = c.guild_id;
-            self.pending.push(Effect::Action(UiAction::JoinVoice {
-                guild_id: g,
-                channel_id: ch,
-            }));
+            if self.store.voice.as_ref().is_some_and(|v| v.channel_id == ch) {
+                self.pending.push(Effect::Action(UiAction::LeaveVoice));
+            } else {
+                let g = c.guild_id;
+                self.pending.push(Effect::Action(UiAction::JoinVoice {
+                    guild_id: g,
+                    channel_id: ch,
+                }));
+            }
         }
     }
 
@@ -806,28 +1183,55 @@ impl App {
     }
 
     pub(crate) fn cycle_focus(&mut self, dir: i8) {
-        let mut order = Vec::new();
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum Stop {
+            Pane(Focus),
+            Composer,
+        }
+        let mut order: Vec<Stop> = Vec::new();
         if let Some(l) = &self.layout {
             for p in &l.panes {
-                order.push(match p.kind {
-                    crate::geometry::PaneKind::Sidebar => Focus::Sidebar,
-                    crate::geometry::PaneKind::Chat => Focus::Messages,
-                    crate::geometry::PaneKind::Members => Focus::Members,
-                    crate::geometry::PaneKind::Deck(i) => Focus::Deck(i),
-                });
+                match p.kind {
+                    crate::geometry::PaneKind::Sidebar => order.push(Stop::Pane(Focus::Sidebar)),
+                    crate::geometry::PaneKind::Chat => {
+                        order.push(Stop::Pane(Focus::Messages));
+                        if !l.micro {
+                            order.push(Stop::Composer);
+                        }
+                    }
+                    crate::geometry::PaneKind::Members => order.push(Stop::Pane(Focus::Members)),
+                    crate::geometry::PaneKind::Deck(i) => order.push(Stop::Pane(Focus::Deck(i))),
+                }
             }
         }
         if order.is_empty() {
-            order.push(Focus::Messages);
+            order.push(Stop::Pane(Focus::Sidebar));
+            order.push(Stop::Pane(Focus::Messages));
+            order.push(Stop::Composer);
         }
-        let i = order.iter().position(|f| *f == self.focus).unwrap_or(0);
+        let cur = if self.mode == Mode::Insert {
+            Stop::Composer
+        } else {
+            Stop::Pane(self.focus)
+        };
+        let i = order.iter().position(|s| *s == cur).unwrap_or(0);
         let n = order.len();
         let next = if dir >= 0 {
             (i + 1) % n
         } else {
             (i + n - 1) % n
         };
-        self.focus = order[next];
+        match order[next] {
+            Stop::Composer => {
+                self.focus = Focus::Messages;
+                self.mode = Mode::Insert;
+            }
+            Stop::Pane(f) => {
+                self.autocomplete.clear();
+                self.mode = Mode::Normal;
+                self.focus = f;
+            }
+        }
     }
 
     pub(crate) fn focus_pane(&mut self, n: u8) {
@@ -879,37 +1283,82 @@ impl App {
         }
     }
 
-    /// Flattened sidebar rows.
+    /// Flattened sidebar rows (DMs, folders, guilds, channels, and nested voice-channel occupants).
     #[must_use]
     pub fn sidebar_items(&self) -> Vec<SideItem> {
         let mut out = vec![SideItem::Home];
         if self.sidebar.expanded.contains(&None) {
             for c in self.store.dms_by_recency() {
                 out.push(SideItem::Channel(c.id, 1));
+                for p in self.store.effective_voice_occupants(c.id) {
+                    out.push(SideItem::VoiceMember(c.id, p.user_id, 2));
+                }
             }
         }
-        for g in self.store.ordered_guilds() {
-            out.push(SideItem::Guild(g.id));
-            if self.sidebar.expanded.contains(&Some(g.id)) {
+        let push_guild = |out: &mut Vec<SideItem>, gid: Snowflake, depth: u8| {
+            out.push(SideItem::Guild(gid, depth));
+            if self.sidebar.expanded.contains(&Some(gid)) {
                 let mut hidden_parent: Option<Snowflake> = None;
-                for c in self.store.sidebar_channels(g.id) {
+                for c in self.store.sidebar_channels(gid) {
                     if c.kind == ChannelKind::GuildCategory {
                         hidden_parent = self.sidebar.collapsed.contains(&c.id).then_some(c.id);
-                        out.push(SideItem::Channel(c.id, 1));
+                        out.push(SideItem::Channel(c.id, depth + 1));
                         continue;
                     }
                     if hidden_parent.is_some() && c.parent_id == hidden_parent {
                         continue;
                     }
-                    let depth = if c.kind.is_thread() {
-                        3
-                    } else if c.parent_id.is_some() {
-                        2
-                    } else {
-                        1
-                    };
-                    out.push(SideItem::Channel(c.id, depth));
+                    let cdepth = depth
+                        + if c.kind.is_thread() {
+                            3
+                        } else if c.parent_id.is_some() {
+                            2
+                        } else {
+                            1
+                        };
+                    out.push(SideItem::Channel(c.id, cdepth));
+                    if c.kind.is_voice() {
+                        for p in self.store.effective_voice_occupants(c.id) {
+                            out.push(SideItem::VoiceMember(c.id, p.user_id, cdepth + 1));
+                        }
+                    }
                 }
+            }
+        };
+        let mut placed: HashSet<Snowflake> = HashSet::new();
+        for (idx, f) in self.store.folders.iter().enumerate() {
+            let valid: Vec<Snowflake> = f
+                .guild_ids
+                .iter()
+                .copied()
+                .filter(|gid| self.store.guild(*gid).is_some() && !placed.contains(gid))
+                .collect();
+            if valid.is_empty() {
+                continue;
+            }
+            let is_real_folder = f.id.is_some()
+                || f.name.as_deref().is_some_and(|s| !s.is_empty())
+                || valid.len() > 1;
+            if is_real_folder {
+                out.push(SideItem::Folder(idx));
+                for gid in &valid {
+                    placed.insert(*gid);
+                }
+                if !self.sidebar.collapsed_folders.contains(&idx) {
+                    for gid in valid {
+                        push_guild(&mut out, gid, 1);
+                    }
+                }
+            } else {
+                for gid in valid {
+                    placed.insert(gid);
+                    push_guild(&mut out, gid, 0);
+                }
+            }
+        }
+        for g in &self.store.guilds {
+            if placed.insert(g.id) {
+                push_guild(&mut out, g.id, 0);
             }
         }
         out
@@ -926,7 +1375,12 @@ impl App {
                     self.select_guild(None);
                 }
             }
-            SideItem::Guild(id) => {
+            SideItem::Folder(idx) => {
+                if !self.sidebar.collapsed_folders.remove(&idx) {
+                    self.sidebar.collapsed_folders.insert(idx);
+                }
+            }
+            SideItem::Guild(id, _) => {
                 if !self.sidebar.expanded.remove(&Some(id)) {
                     self.select_guild(Some(id));
                 }
@@ -941,11 +1395,11 @@ impl App {
                         self.sidebar.collapsed.insert(id);
                     }
                 } else {
-                    self.select_channel(id);
-                    if self.store.channel(id).is_some_and(|c| !c.kind.is_voice()) {
-                        self.focus = Focus::Messages;
-                    }
+                    self.open_channel(id);
                 }
+            }
+            SideItem::VoiceMember(ch_id, _, _) => {
+                self.select_channel(ch_id);
             }
         }
     }
@@ -987,7 +1441,11 @@ impl App {
         let Some(msgs) = store.messages.get(&ch) else {
             return;
         };
-        let res = |k, i| crate::render::resolve_mention(store, k, i);
+        let active_guild = store
+            .channel(ch)
+            .and_then(|c| c.guild_id)
+            .or(self.active_guild);
+        let res = crate::render::StoreResolver::new(store, active_guild);
         let ment = |m: &Message| store.mentions_me(m);
         let tl = crate::scroll::Timeline {
             msgs: &msgs.messages,
@@ -1021,7 +1479,11 @@ impl App {
         if msgs.messages.is_empty() {
             return;
         }
-        let res = |k, i| crate::render::resolve_mention(store, k, i);
+        let active_guild = store
+            .channel(ch)
+            .and_then(|c| c.guild_id)
+            .or(self.active_guild);
+        let res = crate::render::StoreResolver::new(store, active_guild);
         let ment = |m: &Message| store.mentions_me(m);
         let tl = crate::scroll::Timeline {
             msgs: &msgs.messages,
@@ -1033,7 +1495,11 @@ impl App {
         };
         let cur = self.scrolls.get(&ch).copied().unwrap_or_default();
         let s = tl.scroll_by(&mut self.cache, &cur, delta, height);
+        let at_tail = s.state == ScrollState::FollowTail;
         self.scrolls.insert(ch, s);
+        if at_tail {
+            self.maybe_ack_channel(ch);
+        }
     }
 
     pub(crate) fn request_older(&mut self) {
@@ -1070,12 +1536,31 @@ impl App {
             .cloned();
         if let Some(m) = msg {
             let snippet = crate::sanitize::sanitize_single_line(&m.content);
+            let author = self.store.author_display_name(&m);
             self.composer.target = ComposeTarget::Reply {
                 message_id: m.id,
-                author: m.author.display_name().to_string(),
+                author,
                 snippet: crate::text::truncate(&snippet, 40, "…"),
+                mention: true,
             };
             self.mode = Mode::Insert;
+        }
+    }
+
+    fn edit_selected_own(&mut self) {
+        let me = self.store.me.as_ref().map(|u| u.id);
+        if let Some(m) = self.selected_message().cloned()
+            && Some(m.author.id) == me
+        {
+            self.selected = Some(m.id);
+            self.reveal_selected();
+            self.composer.set_text(&m.content);
+            self.composer.target = ComposeTarget::Edit { message_id: m.id };
+            self.mode = Mode::Insert;
+            return;
+        }
+        if self.selected.is_none() {
+            self.edit_last_own();
         }
     }
 
@@ -1086,8 +1571,93 @@ impl App {
             .and_then(|ms| ms.iter().rev().find(|m| Some(m.author.id) == me))
             .cloned();
         if let Some(m) = msg {
+            self.selected = Some(m.id);
+            self.reveal_selected();
             self.composer.set_text(&m.content);
             self.composer.target = ComposeTarget::Edit { message_id: m.id };
+            self.mode = Mode::Insert;
+        }
+    }
+
+    fn delete_selected_own(&mut self) {
+        if let Some(m) = self.selected_message()
+            && self
+                .store
+                .me
+                .as_ref()
+                .is_some_and(|me| me.id == m.author.id)
+        {
+            let id = m.id;
+            self.open(Modal::confirm_delete(id));
+        }
+    }
+
+    fn collect_message_urls(m: &Message) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = Vec::new();
+        let mut push_unique = |label: String, url: String| {
+            if !url.is_empty() && !out.iter().any(|(_, u)| u == &url) {
+                out.push((label, url));
+            }
+        };
+        for a in &m.attachments {
+            if !a.is_voice_message() {
+                push_unique(a.filename.clone(), a.url.clone());
+            }
+        }
+        for e in &m.embeds {
+            if let Some(u) = &e.url {
+                let lbl = e.title.clone().unwrap_or_else(|| u.clone());
+                push_unique(lbl, u.clone());
+            }
+            if let Some(img) = &e.image {
+                let lbl = e
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| "embed image".to_string());
+                push_unique(lbl, img.url.clone());
+            }
+        }
+        for token in m.content.split_whitespace() {
+            let trimmed = token.trim_matches(|c: char| matches!(c, '<' | '>' | '(' | ')' | '[' | ']' | ',' | '.' | ';'));
+            if trimmed.starts_with("https://") || trimmed.starts_with("http://") {
+                push_unique(trimmed.to_string(), trimmed.to_string());
+            }
+        }
+        out
+    }
+
+    pub(crate) fn open_selected_media(&mut self) {
+        let Some(m) = self.selected_message().cloned() else {
+            self.play_selected_voice();
+            return;
+        };
+        let urls = Self::collect_message_urls(&m);
+        if urls.is_empty() {
+            self.play_selected_voice();
+        } else if urls.len() == 1 {
+            if let Some((_, url)) = urls.into_iter().next() {
+                self.pending_open_url = Some(url);
+            }
+        } else {
+            self.open(Modal::attachments(urls));
+        }
+    }
+
+    fn copy_selected_text(&mut self) {
+        if let Some(m) = self.selected_message() {
+            if !m.content.is_empty() {
+                self.pending_copy_text = Some(m.content.clone());
+            } else if let Some((_, url)) = Self::collect_message_urls(m).into_iter().next() {
+                self.pending_copy_text = Some(url);
+            }
+        }
+    }
+
+    fn copy_selected_url(&mut self) {
+        if let Some(m) = self.selected_message()
+            && let Some((_, url)) = Self::collect_message_urls(m).into_iter().next()
+        {
+            self.pending_copy_text = Some(url);
         }
     }
 
@@ -1102,9 +1672,11 @@ impl App {
             self.open(Modal::too_long(self.cfg.max_message_len()));
             return;
         }
+        self.autocomplete.clear();
         let target = self.composer.target.clone();
         let attachments = std::mem::take(&mut self.composer.attachments);
-        let content = self.composer.take();
+        let raw = self.composer.take();
+        let content = crate::composer::expand_outgoing_mentions(&raw, &self.store, self.active_guild);
         self.composer.target = ComposeTarget::New;
         match target {
             ComposeTarget::Edit { message_id } => {
@@ -1114,12 +1686,16 @@ impl App {
                     content,
                 }));
             }
-            ComposeTarget::Reply { message_id, .. } => {
+            ComposeTarget::Reply {
+                message_id,
+                mention,
+                ..
+            } => {
                 self.pending.push(Effect::Action(UiAction::SendMessage {
                     channel_id: ch,
                     content,
                     reply_to: Some(message_id),
-                    mention_replied_user: true,
+                    mention_replied_user: mention,
                     attachment_paths: attachments,
                 }));
             }
@@ -1144,11 +1720,17 @@ impl App {
         let Some(ch) = self.active_channel else {
             return;
         };
+        self.autocomplete.clear();
         let limit = self.cfg.max_message_len();
-        let text = self.composer.take();
-        let reply = match &self.composer.target {
-            ComposeTarget::Reply { message_id, .. } => Some(*message_id),
-            _ => None,
+        let raw = self.composer.take();
+        let text = crate::composer::expand_outgoing_mentions(&raw, &self.store, self.active_guild);
+        let (reply, mention) = match &self.composer.target {
+            ComposeTarget::Reply {
+                message_id,
+                mention,
+                ..
+            } => (Some(*message_id), *mention),
+            _ => (None, true),
         };
         self.composer.target = ComposeTarget::New;
         let mut chunk = String::new();
@@ -1159,7 +1741,7 @@ impl App {
                     channel_id: ch,
                     content: std::mem::take(&mut chunk),
                     reply_to: if first { reply } else { None },
-                    mention_replied_user: true,
+                    mention_replied_user: mention,
                     attachment_paths: Vec::new(),
                 }));
                 first = false;
@@ -1171,7 +1753,7 @@ impl App {
                             channel_id: ch,
                             content: std::mem::take(&mut chunk),
                             reply_to: if first { reply } else { None },
-                            mention_replied_user: true,
+                            mention_replied_user: mention,
                             attachment_paths: Vec::new(),
                         }));
                         first = false;
@@ -1187,7 +1769,7 @@ impl App {
                 channel_id: ch,
                 content: chunk,
                 reply_to: if first { reply } else { None },
-                mention_replied_user: true,
+                mention_replied_user: mention,
                 attachment_paths: Vec::new(),
             }));
         }
@@ -1221,34 +1803,145 @@ impl App {
                 return;
             }
         }
-        match k.code {
-            KeyCode::Esc => self.mode = Mode::Normal,
-            KeyCode::Enter if alt || k.modifiers.contains(KeyModifiers::SHIFT) => {
-                self.composer.insert_char('\n')
+        // Autocomplete popup intercepts navigation and acceptance before composer keys.
+        if self.autocomplete.is_open() {
+            match k.code {
+                KeyCode::Esc => {
+                    self.autocomplete.clear();
+                    return;
+                }
+                KeyCode::Up => {
+                    self.autocomplete.move_up();
+                    return;
+                }
+                KeyCode::Down => {
+                    self.autocomplete.move_down();
+                    return;
+                }
+                KeyCode::Tab => {
+                    self.autocomplete.accept(&mut self.composer);
+                    return;
+                }
+                KeyCode::Enter if !alt && !k.modifiers.contains(KeyModifiers::SHIFT) => {
+                    self.autocomplete.accept(&mut self.composer);
+                    return;
+                }
+                _ => {}
             }
-            KeyCode::Enter => self.send(),
-            KeyCode::Char('j') if ctl => self.composer.insert_char('\n'),
-            KeyCode::Tab => self.autocomplete(),
-            KeyCode::Backspace => self.composer.backspace(),
-            KeyCode::Char('h') if ctl => self.composer.backspace(),
-            KeyCode::Delete => self.composer.delete(),
-            KeyCode::Char('d') if ctl => self.composer.delete(),
-            KeyCode::Left => self.composer.left(),
-            KeyCode::Char('b') if ctl => self.composer.left(),
-            KeyCode::Right => self.composer.right(),
-            KeyCode::Char('f') if ctl => self.composer.right(),
-            KeyCode::Home => self.composer.home(),
-            KeyCode::Char('a') if ctl => self.composer.home(),
-            KeyCode::End => self.composer.end(),
-            KeyCode::Char('e') if ctl => self.composer.end(),
-            KeyCode::Char('u') if ctl => self.composer.kill_to_bol(),
-            KeyCode::Char('w') if ctl => self.composer.kill_word_back(),
-            KeyCode::Char('y') if ctl => self.composer.yank(),
-            KeyCode::Char('t') if ctl => self.composer.transpose(),
+        }
+        let mut edited = false;
+        let mut typed_char = false;
+        match k.code {
+            KeyCode::Esc => {
+                if self.composer.target != ComposeTarget::New {
+                    self.composer.target = ComposeTarget::New;
+                } else {
+                    self.mode = Mode::Normal;
+                }
+                return;
+            }
+            KeyCode::Enter if alt || k.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.composer.insert_char('\n');
+                edited = true;
+            }
+            KeyCode::Enter => {
+                self.send();
+                return;
+            }
+            KeyCode::Char('j') if ctl => {
+                self.composer.insert_char('\n');
+                edited = true;
+            }
+            KeyCode::Char('m') if alt => {
+                if let ComposeTarget::Reply { mention, .. } = &mut self.composer.target {
+                    *mention = !*mention;
+                }
+                return;
+            }
+            KeyCode::Tab => {
+                self.refresh_autocomplete();
+                if self.autocomplete.is_open() {
+                    self.autocomplete.accept(&mut self.composer);
+                } else if let ComposeTarget::Reply { mention, .. } = &mut self.composer.target {
+                    *mention = !*mention;
+                } else if self.composer.is_empty() {
+                    self.cycle_focus(1);
+                }
+                return;
+            }
+            KeyCode::BackTab => {
+                self.cycle_focus(-1);
+                return;
+            }
+            KeyCode::Backspace => {
+                self.composer.backspace();
+                edited = true;
+            }
+            KeyCode::Char('h') if ctl => {
+                self.composer.backspace();
+                edited = true;
+            }
+            KeyCode::Delete => {
+                self.composer.delete();
+                edited = true;
+            }
+            KeyCode::Char('d') if ctl => {
+                self.composer.delete();
+                edited = true;
+            }
+            KeyCode::Left => {
+                self.composer.left();
+                edited = true;
+            }
+            KeyCode::Char('b') if ctl => {
+                self.composer.left();
+                edited = true;
+            }
+            KeyCode::Right => {
+                self.composer.right();
+                edited = true;
+            }
+            KeyCode::Char('f') if ctl => {
+                self.composer.right();
+                edited = true;
+            }
+            KeyCode::Home => {
+                self.composer.home();
+                edited = true;
+            }
+            KeyCode::Char('a') if ctl => {
+                self.composer.home();
+                edited = true;
+            }
+            KeyCode::End => {
+                self.composer.end();
+                edited = true;
+            }
+            KeyCode::Char('e') if ctl => {
+                self.composer.end();
+                edited = true;
+            }
+            KeyCode::Char('u') if ctl => {
+                self.composer.kill_to_bol();
+                edited = true;
+            }
+            KeyCode::Char('w') if ctl => {
+                self.composer.kill_word_back();
+                edited = true;
+            }
+            KeyCode::Char('y') if ctl => {
+                self.composer.yank();
+                edited = true;
+            }
+            KeyCode::Char('t') if ctl => {
+                self.composer.transpose();
+                edited = true;
+            }
             KeyCode::Char('x') if ctl => self.ctrl_x = true,
             KeyCode::Char('k') if ctl => match self.cfg.ctrl_k {
                 CtrlKMode::Kill => {
                     self.composer.kill_to_eol();
+                    edited = true;
                 }
                 CtrlKMode::Switcher => self.open(Modal::switcher(self)),
                 CtrlKMode::Dwim => {
@@ -1256,6 +1949,7 @@ impl App {
                         self.open(Modal::switcher(self));
                     } else {
                         self.composer.kill_to_eol();
+                        edited = true;
                     }
                 }
             },
@@ -1264,15 +1958,60 @@ impl App {
             KeyCode::Char('n') if ctl => self.jump_unread(1),
             KeyCode::Char('p') if ctl => self.jump_unread(-1),
             KeyCode::Char('r') if ctl => self.reply_to_selected(),
-            KeyCode::Char('b') if alt => self.composer.word_left(),
-            KeyCode::Char('f') if alt => self.composer.word_right(),
-            KeyCode::Char('d') if alt => self.composer.kill_word_fwd(),
+            KeyCode::Char('b') if alt => {
+                self.composer.word_left();
+                edited = true;
+            }
+            KeyCode::Char('f') if alt => {
+                self.composer.word_right();
+                edited = true;
+            }
+            KeyCode::Char('d') if alt => {
+                self.composer.kill_word_fwd();
+                edited = true;
+            }
             KeyCode::Up if self.composer.is_empty() => self.edit_last_own(),
             KeyCode::PageUp => self.scroll_page(-1),
             KeyCode::PageDown => self.scroll_page(1),
-            KeyCode::Char(c) if !ctl && !alt => self.composer.insert_char(c),
+            KeyCode::Char(c) if !ctl && !alt => {
+                self.composer.insert_char(c);
+                edited = true;
+                typed_char = true;
+            }
             _ => {}
         }
+        if edited {
+            self.refresh_autocomplete();
+        }
+        if typed_char {
+            self.maybe_send_typing();
+        }
+    }
+
+    fn refresh_autocomplete(&mut self) {
+        self.autocomplete.refresh(
+            &self.composer,
+            &self.store,
+            self.active_channel,
+            self.active_guild,
+        );
+    }
+
+    fn maybe_send_typing(&mut self) {
+        let Some(ch) = self.active_channel else {
+            return;
+        };
+        if self.now_ms == 0 {
+            return;
+        }
+        if self.last_typing_sent_ms != 0
+            && self.now_ms.saturating_sub(self.last_typing_sent_ms) < 8_000
+        {
+            return;
+        }
+        self.last_typing_sent_ms = self.now_ms;
+        self.pending
+            .push(Effect::Action(UiAction::SendTyping { channel_id: ch }));
     }
 
     fn scroll_page(&mut self, dir: isize) {
@@ -1283,26 +2022,40 @@ impl App {
         self.scroll_lines(dir * isize::try_from(h.saturating_sub(1).max(1)).unwrap_or(1));
     }
 
-    fn autocomplete(&mut self) {
-        let text = self.composer.text()[..self.composer.cursor()].to_string();
-        let Some(at) = text.rfind('@') else { return };
-        let prefix = &text[at + 1..];
-        if prefix.contains(char::is_whitespace) {
-            return;
-        }
-        let lower = prefix.to_lowercase();
-        let mut names: Vec<String> = self
-            .store
-            .users
-            .values()
-            .map(|u| u.username.clone())
-            .filter(|n| n.to_lowercase().starts_with(&lower))
-            .collect();
-        names.sort();
-        if let Some(n) = names.first() {
-            // Char-based skip: case folding can change byte lengths (e.g. `İ`).
-            let rest: String = n.chars().skip(prefix.chars().count()).collect();
-            self.composer.insert_str(&format!("{rest} "));
+    fn jump_top(&mut self) {
+        match self.focus {
+            Focus::Sidebar => self.sidebar.cursor = 0,
+            Focus::Members => self.members_cursor = 0,
+            Focus::Deck(_) => self.deck_cursor = 0,
+            Focus::Messages => {
+                if let Some(ch) = self.active_channel {
+                    if let Some((params, pkey, height)) = crate::render::messages_view_params(self)
+                    {
+                        let store = &self.store;
+                        if let Some(msgs) = store.messages.get(&ch)
+                            && !msgs.messages.is_empty()
+                        {
+                            let active_guild = store
+                                .channel(ch)
+                                .and_then(|c| c.guild_id)
+                                .or(self.active_guild);
+                            let res = crate::render::StoreResolver::new(store, active_guild);
+                            let ment = |m: &Message| store.mentions_me(m);
+                            let tl = crate::scroll::Timeline {
+                                msgs: &msgs.messages,
+                                params,
+                                pkey,
+                                res: &res,
+                                mentions: &ment,
+                                playback: store.playback.as_ref(),
+                            };
+                            let s = tl.top_scroll(&mut self.cache, height);
+                            self.scrolls.insert(ch, s);
+                        }
+                    }
+                    self.request_older();
+                }
+            }
         }
     }
 
@@ -1311,11 +2064,17 @@ impl App {
             self.open(Modal::switcher(self));
             return;
         }
+        if ctrl(&k, 'f') {
+            self.open(Modal::search());
+            return;
+        }
+        if ctrl(&k, 'd') {
+            self.open(Modal::Dave);
+            return;
+        }
         if ctrl(&k, 't') {
-            {
-                let m = Modal::theme(self);
-                self.open(m)
-            };
+            let m = Modal::theme(self);
+            self.open(m);
             return;
         }
         if ctrl(&k, 'g') {
@@ -1342,6 +2101,10 @@ impl App {
             self.reply_to_selected();
             return;
         }
+        if k.modifiers.contains(KeyModifiers::ALT) && k.code == KeyCode::Char('r') {
+            self.gdm_key('R');
+            return;
+        }
         match k.code {
             KeyCode::Tab => return self.cycle_focus(1),
             KeyCode::BackTab => return self.cycle_focus(-1),
@@ -1350,34 +2113,13 @@ impl App {
             KeyCode::PageUp => return self.scroll_page(-1),
             KeyCode::PageDown => return self.scroll_page(1),
             KeyCode::Home => {
-                if let Some(ch) = self.active_channel {
-                    if let Some((params, pkey, height)) = crate::render::messages_view_params(self)
-                    {
-                        let store = &self.store;
-                        if let Some(msgs) = store.messages.get(&ch)
-                            && !msgs.messages.is_empty()
-                        {
-                            let res = |kk, i| crate::render::resolve_mention(store, kk, i);
-                            let ment = |m: &Message| store.mentions_me(m);
-                            let tl = crate::scroll::Timeline {
-                                msgs: &msgs.messages,
-                                params,
-                                pkey,
-                                res: &res,
-                                mentions: &ment,
-                                playback: store.playback.as_ref(),
-                            };
-                            let s = tl.top_scroll(&mut self.cache, height);
-                            self.scrolls.insert(ch, s);
-                        }
-                    }
-                    self.request_older();
-                }
+                self.jump_top();
                 return;
             }
             KeyCode::End => {
                 if let Some(ch) = self.active_channel {
                     self.scrolls.insert(ch, Scroll::default());
+                    self.maybe_ack_channel(ch);
                 }
                 self.selected = None;
                 return;
@@ -1388,16 +2130,7 @@ impl App {
                 return;
             }
             KeyCode::Delete => {
-                if let Some(m) = self.selected_message()
-                    && self
-                        .store
-                        .me
-                        .as_ref()
-                        .is_some_and(|me| me.id == m.author.id)
-                {
-                    let id = m.id;
-                    self.open(Modal::confirm_delete(id));
-                }
+                self.delete_selected_own();
                 return;
             }
             KeyCode::Left if self.focus == Focus::Sidebar => {
@@ -1413,53 +2146,56 @@ impl App {
         let Some(c) = plain(&k) else { return };
         let in_voice_ctx = matches!(self.focus, Focus::Deck(_)) && self.deck_is_stage();
         match c {
-            'k' => self.open(Modal::switcher(self)),
+            'j' => self.nav(1),
+            'k' => self.nav(-1),
+            'g' => self.jump_top(),
+            '/' => self.open(Modal::switcher(self)),
+            'f' => self.open(Modal::search()),
             'i' => self.mode = Mode::Insert,
             'r' => self.reply_to_selected(),
-            'e' => {
-                let target = self
-                    .selected
-                    .or_else(|| self.active_messages().and_then(|m| m.back()).map(|m| m.id));
-                if let Some(t) = target {
-                    self.open(Modal::react(t));
-                }
-            }
-            'E' => {
-                if let Some(m) = self.selected_message().cloned()
-                    && self
-                        .store
-                        .me
-                        .as_ref()
-                        .is_some_and(|me| me.id == m.author.id)
-                {
-                    self.composer.set_text(&m.content);
-                    self.composer.target = ComposeTarget::Edit { message_id: m.id };
-                    self.mode = Mode::Insert;
+            'e' => self.edit_selected_own(),
+            'E' => self.edit_last_own(),
+            'd' => self.delete_selected_own(),
+            'D' => self.toggle_deaf(),
+            'R' => {
+                if self.focus == Focus::Sidebar && self.gdm_target_channel().is_some() {
+                    self.gdm_key('R');
+                } else {
+                    let target = self
+                        .selected
+                        .or_else(|| self.active_messages().and_then(|m| m.back()).map(|m| m.id));
+                    if let Some(t) = target {
+                        self.open(Modal::react(t));
+                    }
                 }
             }
             't' => self.open(Modal::threads(self)),
             'p' => self.open(Modal::pins(self)),
-            '/' => self.open(Modal::search()),
             'T' => {
                 let m = Modal::theme(self);
-                self.open(m)
+                self.open(m);
             }
             'G' => self.open_gif(),
             ']' => self.jump_unread(1),
             '[' => self.jump_unread(-1),
             'm' => self.toggle_mute(),
-            'd' => self.toggle_deaf(),
             'v' if in_voice_ctx => self.open(Modal::Dave),
             'v' => self.join_voice(),
             'a' => self.call(),
+            'h' if self.focus == Focus::Sidebar
+                && self.store.voice.is_none()
+                && matches!(self.store.ring, CallRingState::Idle) =>
+            {
+                self.sidebar_collapse();
+            }
             'h' => self.decline(),
+            'l' if self.focus == Focus::Sidebar => self.sidebar_activate(),
             's' => self.screenshare(),
             'w' => self.toggle_watch(),
             'W' => self.toggle_video_sink(),
             'M' => self.toggle_members(),
             'V' => self.open(Modal::Voice),
-            'D' => self.open(Modal::Dave),
-            'c' | 'g' => self.focus = Focus::Sidebar,
+            'c' => self.focus = Focus::Sidebar,
             '?' => self.open(Modal::help()),
             'q' => self.open(Modal::confirm_quit()),
             'x' => {
@@ -1474,8 +2210,10 @@ impl App {
             '+' | '=' if in_voice_ctx => self.volume_step(10, false),
             '-' if in_voice_ctx => self.volume_step(-10, false),
             '0' if in_voice_ctx => self.volume_reset(),
-            'n' | '+' | '-' | 'R' | 'L' => self.gdm_key(c),
-            'o' => self.play_selected_voice(),
+            'n' | '+' | '-' | 'L' => self.gdm_key(c),
+            'o' => self.open_selected_media(),
+            'y' => self.copy_selected_text(),
+            'u' => self.copy_selected_url(),
             '1'..='6' => self.focus_pane(u8::try_from(c as u32 - '0' as u32).unwrap_or(1)),
             _ => {}
         }
@@ -1488,12 +2226,43 @@ impl App {
         crate::panes::deck_kind(self, i) == crate::panes::DeckKind::Stage
     }
 
+    fn gdm_target_channel(&self) -> Option<Snowflake> {
+        let candidate = if self.focus == Focus::Sidebar {
+            match self.sidebar_items().get(self.sidebar.cursor) {
+                Some(SideItem::Channel(id, _))
+                    if self
+                        .store
+                        .channel(*id)
+                        .is_some_and(|c| c.kind.is_group_dm()) =>
+                {
+                    Some(*id)
+                }
+                _ => self.active_channel,
+            }
+        } else {
+            self.active_channel
+        };
+        candidate.filter(|id| {
+            self.store
+                .channel(*id)
+                .is_some_and(|c| c.kind.is_group_dm())
+        })
+    }
+
     fn gdm_key(&mut self, c: char) {
         let ch = if self.focus == Focus::Sidebar {
             match self.sidebar_items().get(self.sidebar.cursor) {
+                Some(SideItem::Channel(id, _))
+                    if self
+                        .store
+                        .channel(*id)
+                        .is_some_and(|ch| ch.kind.is_group_dm()) =>
+                {
+                    Some(*id)
+                }
+                Some(SideItem::Home) => self.gdm_target_channel(),
                 Some(SideItem::Channel(id, _)) => Some(*id),
-                Some(SideItem::Home) => None,
-                _ => return,
+                _ => self.active_channel,
             }
         } else {
             self.active_channel
@@ -1614,17 +2383,36 @@ impl App {
             Some(SideItem::Home) => {
                 self.sidebar.expanded.remove(&None);
             }
-            Some(SideItem::Guild(id)) => {
+            Some(SideItem::Folder(idx)) => {
+                self.sidebar.collapsed_folders.insert(*idx);
+            }
+            Some(SideItem::Guild(id, _)) => {
                 self.sidebar.expanded.remove(&Some(*id));
             }
             Some(SideItem::Channel(id, _)) => {
-                // Jump to the owning guild row.
+                // Jump to the owning guild row (or collapse category if on a category).
+                let is_cat = self
+                    .store
+                    .channel(*id)
+                    .is_some_and(|c| c.kind == ChannelKind::GuildCategory);
+                if is_cat && !self.sidebar.collapsed.contains(id) {
+                    self.sidebar.collapsed.insert(*id);
+                    return;
+                }
                 let gid = self.store.channel(*id).and_then(|c| c.guild_id);
                 if let Some(pos) = items.iter().position(|i| match (i, gid) {
-                    (SideItem::Guild(g), Some(x)) => *g == x,
+                    (SideItem::Guild(g, _), Some(x)) => *g == x,
                     (SideItem::Home, None) => true,
                     _ => false,
                 }) {
+                    self.sidebar.cursor = pos;
+                }
+            }
+            Some(SideItem::VoiceMember(ch_id, _, _)) => {
+                if let Some(pos) = items
+                    .iter()
+                    .position(|i| matches!(i, SideItem::Channel(c, _) if c == ch_id))
+                {
                     self.sidebar.cursor = pos;
                 }
             }

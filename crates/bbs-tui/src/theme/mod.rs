@@ -262,6 +262,29 @@ impl Theme {
         }
     }
 
+    /// Semantic presence dot/label colour (Online = green, Idle = yellow, DND = red, Offline = gray).
+    #[must_use]
+    pub fn presence_color(&self, status: bbs_core::PresenceStatus) -> Color {
+        use bbs_core::PresenceStatus;
+        if self.depth == ColorDepth::Monochrome {
+            return Color::Reset;
+        }
+        if self.indexed_only || self.eff_depth() == ColorDepth::Ansi16 {
+            return match status {
+                PresenceStatus::Online => Color::Indexed(10),
+                PresenceStatus::Idle => Color::Indexed(11),
+                PresenceStatus::DoNotDisturb => Color::Indexed(9),
+                PresenceStatus::Invisible | PresenceStatus::Offline => self.color(Role::Inactive),
+            };
+        }
+        match status {
+            PresenceStatus::Online => self.rgb(RgbColor::new(0x3B, 0xA5, 0x5D)),
+            PresenceStatus::Idle => self.rgb(RgbColor::new(0xFA, 0xA6, 0x1A)),
+            PresenceStatus::DoNotDisturb => self.rgb(RgbColor::new(0xED, 0x42, 0x45)),
+            PresenceStatus::Invisible | PresenceStatus::Offline => self.color(Role::Inactive),
+        }
+    }
+
     fn resolve(&mut self) {
         let depth = self.eff_depth();
         let p = &self.spec.palette;

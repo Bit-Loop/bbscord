@@ -39,6 +39,8 @@ pub enum PickAction {
     GdmNewUser(Snowflake),
     /// Run a main-menu command.
     Menu(MenuCmd),
+    /// Open an attachment or URL via the host runner.
+    OpenUrl(String),
 }
 
 /// Main menu commands (reachable from any input device).
@@ -135,12 +137,18 @@ impl Picker {
 /// GIF picker state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GifState {
-    /// Correlation id of the latest request.
+    /// Correlation id of the latest dispatched request.
     pub request_id: u64,
-    /// Query.
+    /// Query text.
     pub query: String,
-    /// Cursor.
+    /// Selected tile/row cursor.
     pub cursor: usize,
+    /// Monotonic tick deadline (ms) for debounced live search (`None` = idle).
+    pub pending_search_at_ms: Option<u64>,
+    /// Columns in the rendered GIF grid (`1` in text-list mode).
+    pub grid_cols: usize,
+    /// Whether an in-flight search request is still waiting for a reply.
+    pub loading: bool,
 }
 
 /// Confirm dialog kinds.
@@ -167,8 +175,13 @@ pub enum Modal {
     Gif(GifState),
     /// Help.
     Help(u16),
-    /// Confirmation.
-    Confirm(ConfirmKind),
+    /// Confirmation (`selected_yes` defaults to `false`, i.e., "No" focused for safety).
+    Confirm {
+        /// Confirmation variant.
+        kind: ConfirmKind,
+        /// Whether the `[ Yes ]` button is currently focused (`false` = `[ No ]`).
+        selected_yes: bool,
+    },
     /// Rename Group DM text input.
     Rename(Snowflake, String),
     /// Message search input.
@@ -203,28 +216,40 @@ fn chan_sigil(app: &App, kind: ChannelKind) -> &'static str {
 }
 
 impl Modal {
-    /// Quit confirmation.
+    /// Quit confirmation ("No" focused by default).
     #[must_use]
     pub fn confirm_quit() -> Self {
-        Self::Confirm(ConfirmKind::Quit)
+        Self::Confirm {
+            kind: ConfirmKind::Quit,
+            selected_yes: false,
+        }
     }
 
-    /// Delete confirmation.
+    /// Delete confirmation ("No" focused by default).
     #[must_use]
     pub fn confirm_delete(id: Snowflake) -> Self {
-        Self::Confirm(ConfirmKind::Delete(id))
+        Self::Confirm {
+            kind: ConfirmKind::Delete(id),
+            selected_yes: false,
+        }
     }
 
-    /// Leave-GDM confirmation.
+    /// Leave-GDM confirmation ("No" focused by default).
     #[must_use]
     pub fn confirm_leave(id: Snowflake) -> Self {
-        Self::Confirm(ConfirmKind::Leave(id))
+        Self::Confirm {
+            kind: ConfirmKind::Leave(id),
+            selected_yes: false,
+        }
     }
 
     /// Oversized message prompt.
     #[must_use]
     pub fn too_long(limit: usize) -> Self {
-        Self::Confirm(ConfirmKind::TooLong(limit))
+        Self::Confirm {
+            kind: ConfirmKind::TooLong(limit),
+            selected_yes: false,
+        }
     }
 
     /// Help.
@@ -246,7 +271,24 @@ impl Modal {
             request_id,
             query: String::new(),
             cursor: 0,
+            pending_search_at_ms: None,
+            grid_cols: 1,
+            loading: true,
         })
+    }
+
+    /// Attachment / URL picker for messages with multiple links or files.
+    #[must_use]
+    pub fn attachments(entries: Vec<(String, String)>) -> Self {
+        let items = entries
+            .into_iter()
+            .map(|(label, url)| PickItem {
+                label: sanitize_single_line(&label).into_owned(),
+                detail: sanitize_single_line(&url).into_owned(),
+                action: PickAction::OpenUrl(url),
+            })
+            .collect();
+        Self::Picker(Picker::new("Open", "Open>", items, "Enter open  Esc close"))
     }
 
     /// Rename input.
@@ -335,35 +377,20 @@ impl Modal {
         Self::Theme(p)
     }
 
-    /// Reaction picker.
+    /// Reaction picker (searchable Unicode emoji catalog).
     #[must_use]
     pub fn react(msg: Snowflake) -> Self {
-        const EMOJI: [(&str, &str); 16] = [
-            ("👍", "thumbsup"),
-            ("❤", "heart"),
-            ("😂", "joy"),
-            ("🎉", "tada"),
-            ("😮", "open_mouth"),
-            ("😢", "cry"),
-            ("🔥", "fire"),
-            ("👀", "eyes"),
-            ("✅", "white_check_mark"),
-            ("❌", "x"),
-            ("🙏", "pray"),
-            ("💯", "100"),
-            ("🚀", "rocket"),
-            ("🤔", "thinking"),
-            ("👋", "wave"),
-            ("💾", "floppy_disk"),
-        ];
-        let items = EMOJI
-            .iter()
-            .map(|(e, n)| PickItem {
-                label: format!("{e} :{n}:"),
-                detail: String::new(),
-                action: PickAction::React(msg, (*e).to_string()),
-            })
-            .collect();
+        let mut seen = HashSet::new();
+        let mut items = Vec::new();
+        for &(name, emoji) in crate::composer::COMMON_EMOJIS {
+            if seen.insert(emoji) {
+                items.push(PickItem {
+                    label: format!("{emoji} :{name}:"),
+                    detail: String::new(),
+                    action: PickAction::React(msg, emoji.to_string()),
+                });
+            }
+        }
         Self::Picker(Picker::new(
             "React",
             "React>",
@@ -527,7 +554,11 @@ impl Modal {
                 p.query.push_str(&one);
                 p.refilter();
             }
-            Self::Gif(g) => g.query.push_str(&one),
+            Self::Gif(g) => {
+                g.query.push_str(&one);
+                g.cursor = 0;
+                g.pending_search_at_ms = Some(0);
+            }
             Self::Rename(_, t) | Self::Search(t) => t.push_str(&one),
             _ => {}
         }
@@ -608,15 +639,14 @@ fn list_nav(cursor: &mut usize, len: usize, k: &KeyEvent) -> bool {
 fn run_pick(app: &mut App, a: PickAction) -> ModalOutcome {
     match a {
         PickAction::Channel(id) => {
-            app.select_channel(id);
-            app.focus = crate::app::Focus::Messages;
+            app.open_channel(id);
         }
         PickAction::Guild(g) => {
             app.select_guild(g);
             app.focus = crate::app::Focus::Sidebar;
             let items = app.sidebar_items();
             if let Some(pos) = items.iter().position(|i| match (i, g) {
-                (crate::app::SideItem::Guild(x), Some(y)) => *x == y,
+                (crate::app::SideItem::Guild(x, _), Some(y)) => *x == y,
                 (crate::app::SideItem::Home, None) => true,
                 _ => false,
             }) {
@@ -665,6 +695,9 @@ fn run_pick(app: &mut App, a: PickAction) -> ModalOutcome {
             }
         }
         PickAction::GdmNewUser(_) => return ModalOutcome::Keep,
+        PickAction::OpenUrl(url) => {
+            app.pending_open_url = Some(url);
+        }
         PickAction::Menu(cmd) => {
             let next = match cmd {
                 MenuCmd::Switcher => Modal::switcher(app),
@@ -723,6 +756,171 @@ fn preview_theme(app: &mut App, p: &Picker) {
     }) = p.current()
     {
         app.apply_catalog(*i);
+    }
+}
+
+/// Execute a confirmation modal choice (`yes = true` confirms, `false` cancels).
+pub fn confirm_choice(app: &mut App, kind: ConfirmKind, yes: bool) -> ModalOutcome {
+    if !yes {
+        return ModalOutcome::Close;
+    }
+    match kind {
+        ConfirmKind::Quit => {
+            app.pending.push(Effect::Action(UiAction::Quit));
+            app.pending.push(Effect::Quit);
+        }
+        ConfirmKind::Delete(id) => {
+            if let Some(ch) = app.active_channel {
+                app.pending.push(Effect::Action(UiAction::DeleteMessage {
+                    channel_id: ch,
+                    message_id: id,
+                }));
+            }
+        }
+        ConfirmKind::Leave(id) => {
+            app.pending
+                .push(Effect::Action(UiAction::LeaveGroupDm { channel_id: id }));
+        }
+        ConfirmKind::TooLong(_) => {}
+    }
+    ModalOutcome::Close
+}
+
+/// Dispatch an immediate GIF search for `g`, clearing any pending debounce timer.
+pub fn dispatch_gif_search(app: &mut App, g: &mut GifState) {
+    g.pending_search_at_ms = None;
+    g.loading = true;
+    app.gif_req = app.gif_req.wrapping_add(1);
+    g.request_id = app.gif_req;
+    g.cursor = 0;
+    let q = GifSearchQuery {
+        query: g.query.clone(),
+        trending: g.query.is_empty(),
+        ..GifSearchQuery::default()
+    };
+    app.pending.push(Effect::Action(UiAction::SearchGifs {
+        request_id: g.request_id,
+        query: q,
+    }));
+}
+
+fn gif_items_for_modal(app: &App) -> Vec<bbs_core::GifItem> {
+    app.store
+        .gif_results
+        .as_ref()
+        .map(|(_, v, _)| v.clone())
+        .unwrap_or_default()
+}
+
+/// Activate a clicked row/tile index inside the currently open modal.
+pub fn activate_row(app: &mut App, m: &mut Modal, index: usize) -> ModalOutcome {
+    match m {
+        Modal::Picker(p) => {
+            if index >= p.filtered.len() {
+                return ModalOutcome::Keep;
+            }
+            p.cursor = index;
+            if let Some(sel) = p.multi.as_mut() {
+                if let Some(i) = p.filtered.get(p.cursor).copied()
+                    && !sel.remove(&i)
+                    && sel.len() < 9
+                {
+                    sel.insert(i);
+                }
+                return ModalOutcome::Keep;
+            }
+            match p.current().map(|c| c.action.clone()) {
+                Some(a) => run_pick(app, a),
+                None => ModalOutcome::Keep,
+            }
+        }
+        Modal::Theme(p) => {
+            if index >= p.filtered.len() {
+                return ModalOutcome::Keep;
+            }
+            p.cursor = index;
+            preview_theme(app, p);
+            ModalOutcome::CloseCommit
+        }
+        Modal::Gif(g) => {
+            let items = gif_items_for_modal(app);
+            if let (Some(item), Some(ch)) = (items.get(index), app.active_channel) {
+                g.cursor = index;
+                let reply = match &app.composer.target {
+                    crate::composer::ComposeTarget::Reply { message_id, .. } => Some(*message_id),
+                    _ => None,
+                };
+                app.pending.push(Effect::Action(UiAction::SendGif {
+                    channel_id: ch,
+                    gif: item.clone(),
+                    reply_to: reply,
+                }));
+                return ModalOutcome::Close;
+            }
+            ModalOutcome::Keep
+        }
+        Modal::Voice | Modal::Dave => {
+            app.deck_cursor = index;
+            ModalOutcome::Keep
+        }
+        Modal::Members => {
+            app.members_cursor = index;
+            ModalOutcome::Keep
+        }
+        _ => ModalOutcome::Keep,
+    }
+}
+
+/// Scroll the currently open modal by `delta` lines (negative = up, positive = down).
+pub fn scroll_modal(app: &mut App, m: &mut Modal, delta: i16) {
+    let steps = usize::from(delta.unsigned_abs());
+    match m {
+        Modal::Picker(p) => {
+            if delta < 0 {
+                p.cursor = p.cursor.saturating_sub(steps);
+            } else if !p.filtered.is_empty() {
+                p.cursor = (p.cursor + steps).min(p.filtered.len() - 1);
+            }
+        }
+        Modal::Theme(p) => {
+            if delta < 0 {
+                p.cursor = p.cursor.saturating_sub(steps);
+            } else if !p.filtered.is_empty() {
+                p.cursor = (p.cursor + steps).min(p.filtered.len() - 1);
+            }
+            preview_theme(app, p);
+        }
+        Modal::Gif(g) => {
+            let items = gif_items_for_modal(app);
+            let stride = g.grid_cols.max(app.gif_grid_cols).max(1);
+            if delta < 0 {
+                g.cursor = g.cursor.saturating_sub(stride);
+            } else if !items.is_empty() {
+                g.cursor = (g.cursor + stride).min(items.len() - 1);
+            }
+        }
+        Modal::Help(scroll) => {
+            if delta < 0 {
+                *scroll = scroll.saturating_sub(delta.unsigned_abs());
+            } else {
+                *scroll = scroll.saturating_add(delta.unsigned_abs());
+            }
+        }
+        Modal::Voice | Modal::Dave => {
+            if delta < 0 {
+                app.deck_cursor = app.deck_cursor.saturating_sub(steps);
+            } else {
+                app.deck_cursor = app.deck_cursor.saturating_add(steps);
+            }
+        }
+        Modal::Members => {
+            if delta < 0 {
+                app.members_cursor = app.members_cursor.saturating_sub(steps);
+            } else {
+                app.members_cursor = app.members_cursor.saturating_add(steps);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -791,36 +989,27 @@ pub fn handle_key(app: &mut App, m: &mut Modal, k: KeyEvent) -> ModalOutcome {
             ModalOutcome::Keep
         }
         Modal::Gif(g) => {
-            let items = app
-                .store
-                .gif_results
-                .as_ref()
-                .filter(|(id, _, _)| *id == g.request_id)
-                .map(|(_, v, _)| v.clone())
-                .unwrap_or_default();
+            let items = gif_items_for_modal(app);
+            let cols = g.grid_cols.max(app.gif_grid_cols).max(1);
             match k.code {
-                KeyCode::Up | KeyCode::Left => g.cursor = g.cursor.saturating_sub(1),
-                KeyCode::Down | KeyCode::Right => {
+                KeyCode::Left => g.cursor = g.cursor.saturating_sub(1),
+                KeyCode::Right => {
                     if !items.is_empty() {
                         g.cursor = (g.cursor + 1).min(items.len() - 1);
                     }
                 }
+                KeyCode::Up => g.cursor = g.cursor.saturating_sub(cols),
+                KeyCode::Down => {
+                    if !items.is_empty() {
+                        g.cursor = (g.cursor + cols).min(items.len() - 1);
+                    }
+                }
                 KeyCode::Enter => {
-                    if !g.query.is_empty()
-                        && (items.is_empty() || k.modifiers.contains(KeyModifiers::ALT))
+                    if g.pending_search_at_ms.is_some()
+                        || (!g.query.is_empty()
+                            && (items.is_empty() || k.modifiers.contains(KeyModifiers::ALT)))
                     {
-                        app.gif_req = app.gif_req.wrapping_add(1);
-                        g.request_id = app.gif_req;
-                        g.cursor = 0;
-                        let q = GifSearchQuery {
-                            query: g.query.clone(),
-                            trending: false,
-                            ..GifSearchQuery::default()
-                        };
-                        app.pending.push(Effect::Action(UiAction::SearchGifs {
-                            request_id: g.request_id,
-                            query: q,
-                        }));
+                        dispatch_gif_search(app, g);
                         return ModalOutcome::Keep;
                     }
                     if let (Some(item), Some(ch)) = (items.get(g.cursor), app.active_channel) {
@@ -839,34 +1028,13 @@ pub fn handle_key(app: &mut App, m: &mut Modal, k: KeyEvent) -> ModalOutcome {
                     }
                 }
                 KeyCode::Tab => {
-                    app.gif_req = app.gif_req.wrapping_add(1);
-                    g.request_id = app.gif_req;
-                    g.cursor = 0;
-                    let q = GifSearchQuery {
-                        query: g.query.clone(),
-                        trending: g.query.is_empty(),
-                        ..GifSearchQuery::default()
-                    };
-                    app.pending.push(Effect::Action(UiAction::SearchGifs {
-                        request_id: g.request_id,
-                        query: q,
-                    }));
+                    dispatch_gif_search(app, g);
                 }
                 _ => {
                     if edit_line(&mut g.query, &k) {
-                        // Live search on every edit (results arrive asynchronously).
-                        app.gif_req = app.gif_req.wrapping_add(1);
-                        g.request_id = app.gif_req;
+                        // Debounce live search by 300ms; Enter fires immediately.
                         g.cursor = 0;
-                        let q = GifSearchQuery {
-                            query: g.query.clone(),
-                            trending: g.query.is_empty(),
-                            ..GifSearchQuery::default()
-                        };
-                        app.pending.push(Effect::Action(UiAction::SearchGifs {
-                            request_id: g.request_id,
-                            query: q,
-                        }));
+                        g.pending_search_at_ms = Some(app.now_ms.saturating_add(300));
                     }
                 }
             }
@@ -874,8 +1042,8 @@ pub fn handle_key(app: &mut App, m: &mut Modal, k: KeyEvent) -> ModalOutcome {
         }
         Modal::Help(scroll) => {
             match k.code {
-                KeyCode::Up => *scroll = scroll.saturating_sub(1),
-                KeyCode::Down => *scroll = scroll.saturating_add(1),
+                KeyCode::Up | KeyCode::Char('k') => *scroll = scroll.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => *scroll = scroll.saturating_add(1),
                 KeyCode::PageUp => *scroll = scroll.saturating_sub(10),
                 KeyCode::PageDown => *scroll = scroll.saturating_add(10),
                 KeyCode::Enter | KeyCode::Char('q' | '?') => return ModalOutcome::Close,
@@ -883,47 +1051,34 @@ pub fn handle_key(app: &mut App, m: &mut Modal, k: KeyEvent) -> ModalOutcome {
             }
             ModalOutcome::Keep
         }
-        Modal::Confirm(kind) => {
-            let yes = matches!(k.code, KeyCode::Char('y' | 'Y') | KeyCode::Enter);
-            match *kind {
-                ConfirmKind::TooLong(_) => match k.code {
-                    KeyCode::Char('f') => {
-                        app.send_as_file();
-                        ModalOutcome::Close
-                    }
-                    KeyCode::Char('s') => {
-                        app.send_split();
-                        ModalOutcome::Close
-                    }
-                    KeyCode::Char('n') | KeyCode::Enter => ModalOutcome::Close,
-                    _ => ModalOutcome::Keep,
-                },
-                _ if yes => {
-                    match *kind {
-                        ConfirmKind::Quit => {
-                            app.pending.push(Effect::Action(UiAction::Quit));
-                            app.pending.push(Effect::Quit);
-                        }
-                        ConfirmKind::Delete(id) => {
-                            if let Some(ch) = app.active_channel {
-                                app.pending.push(Effect::Action(UiAction::DeleteMessage {
-                                    channel_id: ch,
-                                    message_id: id,
-                                }));
-                            }
-                        }
-                        ConfirmKind::Leave(id) => {
-                            app.pending
-                                .push(Effect::Action(UiAction::LeaveGroupDm { channel_id: id }));
-                        }
-                        ConfirmKind::TooLong(_) => {}
-                    }
+        Modal::Confirm { kind, selected_yes } => match *kind {
+            ConfirmKind::TooLong(_) => match k.code {
+                KeyCode::Char('f') => {
+                    app.send_as_file();
                     ModalOutcome::Close
                 }
-                _ if matches!(k.code, KeyCode::Char('n' | 'N' | 'q')) => ModalOutcome::Close,
+                KeyCode::Char('s') => {
+                    app.send_split();
+                    ModalOutcome::Close
+                }
+                KeyCode::Char('n') | KeyCode::Enter => ModalOutcome::Close,
                 _ => ModalOutcome::Keep,
-            }
-        }
+            },
+            other => match k.code {
+                KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Tab
+                | KeyCode::BackTab
+                | KeyCode::Char('h' | 'l') => {
+                    *selected_yes = !*selected_yes;
+                    ModalOutcome::Keep
+                }
+                KeyCode::Char('y' | 'Y') => confirm_choice(app, other, true),
+                KeyCode::Enter => confirm_choice(app, other, *selected_yes),
+                KeyCode::Char('n' | 'N' | 'q') => ModalOutcome::Close,
+                _ => ModalOutcome::Keep,
+            },
+        },
         Modal::Rename(id, t) => {
             if k.code == KeyCode::Enter {
                 let name = t.trim().to_string();
@@ -950,7 +1105,7 @@ pub fn handle_key(app: &mut App, m: &mut Modal, k: KeyEvent) -> ModalOutcome {
                             .map(|m| PickItem {
                                 label: format!(
                                     "{}: {}",
-                                    sanitize_single_line(m.author.display_name()),
+                                    sanitize_single_line(&app.store.author_display_name(m)),
                                     sanitize_single_line(&m.content)
                                 ),
                                 detail: crate::messages::fmt_time(m.id, app.utc_offset_min),
@@ -971,8 +1126,10 @@ pub fn handle_key(app: &mut App, m: &mut Modal, k: KeyEvent) -> ModalOutcome {
         }
         Modal::Voice | Modal::Dave => {
             match k.code {
-                KeyCode::Up => app.deck_cursor = app.deck_cursor.saturating_sub(1),
-                KeyCode::Down => app.deck_cursor += 1,
+                KeyCode::Up | KeyCode::Char('k') => {
+                    app.deck_cursor = app.deck_cursor.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => app.deck_cursor += 1,
                 KeyCode::Char('+' | '=') => app.volume_step(10, false),
                 KeyCode::Char('-') => app.volume_step(-10, false),
                 KeyCode::Char('0') => app.volume_reset(),
@@ -1009,8 +1166,10 @@ pub fn handle_key(app: &mut App, m: &mut Modal, k: KeyEvent) -> ModalOutcome {
         }
         Modal::Members => {
             match k.code {
-                KeyCode::Up => app.members_cursor = app.members_cursor.saturating_sub(1),
-                KeyCode::Down => app.members_cursor += 1,
+                KeyCode::Up | KeyCode::Char('k') => {
+                    app.members_cursor = app.members_cursor.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => app.members_cursor += 1,
                 KeyCode::Enter | KeyCode::Char('q') => return ModalOutcome::Close,
                 _ => {}
             }
@@ -1021,33 +1180,28 @@ pub fn handle_key(app: &mut App, m: &mut Modal, k: KeyEvent) -> ModalOutcome {
 
 /// Keymap rows for help: (action, NORMAL, F-key, Ctrl).
 pub const KEYMAP: &[(&str, &str, &str, &str)] = &[
-    ("Quick switcher", "k", "", "Ctrl+K"),
-    ("Compose", "i / Enter", "", ""),
-    ("Newline in composer", "", "", "Ctrl+J / Alt+Enter"),
-    (
-        "Reply / react / thread / pins",
-        "r / e / t / p",
-        "",
-        "Ctrl+R",
-    ),
-    ("Edit / delete own message", "E / Del", "", ""),
-    ("Search", "/", "", ""),
+    ("Quick switcher", "/", "", "Ctrl+K"),
+    ("Navigate / scroll", "j/k  ↑/↓  g/End", "", "PgUp / PgDn"),
+    ("Compose / send / newline", "i / Enter", "", "Ctrl+J / Alt+Enter"),
+    ("Autocomplete (@user :emoji: #chan)", "Tab / Enter (Insert)", "", ""),
+    ("Reply (Tab/Alt+M toggle ping)", "r", "", "Ctrl+R"),
+    ("Edit selected / last own message", "e / E", "", ""),
+    ("Delete message (safe confirm)", "d / Del", "", ""),
+    ("React / threads / pins", "R / t / p", "", ""),
+    ("Open attachment/URL / play voice", "o", "", ""),
+    ("Copy message / URL", "y / u", "", ""),
+    ("Search messages", "f", "", "Ctrl+F"),
     ("Theme switcher", "T", "F2", "Ctrl+T"),
     ("GIF picker", "G", "F5", "Ctrl+G"),
     ("Next / prev unread", "] / [", "", "Ctrl+N / Ctrl+P"),
-    ("Mute / deafen", "m / d", "F7 / F8", "Ctrl+O"),
-    ("Join voice / call / hang up", "v / a / h", "F9", ""),
+    ("Mute / deafen (in voice)", "m / D", "F7 / F8", "Ctrl+O"),
+    ("Join/leave voice / call / hang up", "v / a / h", "F9", ""),
     ("Screenshare / watch / sink", "s / w / W", "", ""),
-    ("Members / voice deck", "M / V", "F3 / F4", ""),
-    ("DAVE verify", "D (v in Stage)", "", ""),
+    ("Members / voice deck / DAVE", "M / V / Ctrl+D", "F3 / F4", "Ctrl+D"),
     ("Volume -/+ / reset / local mute", "- + 0 x (Stage)", "", ""),
-    ("Group DM new/add/remove/rename/leave", "n + - R L", "", ""),
-    ("Play voice message", "o", "", ""),
-    ("Focus pane", "1-6 / Tab", "F6", ""),
-    ("Scroll", "PgUp PgDn Home End", "", ""),
-    ("Help", "?", "F1", ""),
-    ("Repaint", "", "", "Ctrl+L"),
-    ("Suspend", "", "", "Ctrl+Z"),
+    ("Group DM new/add/remove/rename/leave", "n + - R(side) L", "", ""),
+    ("Focus pane / Mouse click & wheel", "1-6 / Tab / Click", "F6", ""),
+    ("Help / Repaint / Suspend", "?", "F1", "Ctrl+L / Ctrl+Z"),
     ("Quit", "q", "F10", "Ctrl+Q"),
     ("Edit in $EDITOR", "", "", "Ctrl+X Ctrl+E"),
 ];
@@ -1064,7 +1218,7 @@ pub fn render(
         Modal::Picker(p) | Modal::Theme(p) => (60, 20, p.title.clone()),
         Modal::Gif(_) => (86, 24, "GIF".to_string()),
         Modal::Help(_) => (78, 30, "Help".to_string()),
-        Modal::Confirm(_) => (48, 7, "Confirm".to_string()),
+        Modal::Confirm { .. } => (48, 8, "Confirm".to_string()),
         Modal::Rename(..) => (48, 5, "Rename Group DM".to_string()),
         Modal::Search(_) => (56, 5, "Search".to_string()),
         Modal::Voice => (72, 22, "Voice".to_string()),
@@ -1072,6 +1226,7 @@ pub fn render(
         Modal::Dave => (64, 18, "DAVE verification".to_string()),
     };
     let mr = modal_rect(area, want_w, want_h);
+    app.modal_rect = Some(mr.rect);
     // Prevent underlying chat/deck images from painting over the modal.
     app.image_slots
         .retain(|s| s.visible.intersection(mr.rect).is_empty());
@@ -1086,35 +1241,16 @@ pub fn render(
     }
     let hint_row = mr.hint_row && inner.height >= 3;
     match m {
-        Modal::Picker(p) | Modal::Theme(p) => render_picker(p, inner, mr.sheet, hint_row, buf, ctx),
+        Modal::Picker(p) | Modal::Theme(p) => {
+            render_picker(app, p, inner, mr.sheet, hint_row, buf, ctx)
+        }
         Modal::Gif(g) => render_gif(app, g, inner, mr.sheet, hint_row, buf, ctx),
         Modal::Help(scroll) => {
             render_help(*scroll, inner, buf, ctx);
             None
         }
-        Modal::Confirm(kind) => {
-            let msg = match kind {
-                ConfirmKind::Quit => "Quit bbscord? [y]es [n]o".to_string(),
-                ConfirmKind::Delete(_) => "Delete this message? [y]es [n]o".to_string(),
-                ConfirmKind::Leave(_) => "Leave this Group DM? [y]es [n]o".to_string(),
-                ConfirmKind::TooLong(n) => {
-                    format!("Over {n} chars: [s]plit [f]ile message.txt [n] edit")
-                }
-            };
-            let y = inner.y + inner.height.saturating_sub(1) / 2;
-            for (i, l) in text::wrap(&ctx.n(&msg), usize::from(inner.width))
-                .iter()
-                .enumerate()
-            {
-                draw::put(
-                    buf,
-                    inner.x,
-                    y + u16::try_from(i).unwrap_or(0),
-                    &l.text,
-                    inner.width,
-                    ctx.s(Role::Fg),
-                );
-            }
+        Modal::Confirm { kind, selected_yes } => {
+            render_confirm(app, *kind, *selected_yes, inner, buf, ctx);
             None
         }
         Modal::Rename(_, t) | Modal::Search(t) => {
@@ -1142,7 +1278,102 @@ pub fn render(
     }
 }
 
+fn render_confirm(
+    app: &mut App,
+    kind: ConfirmKind,
+    selected_yes: bool,
+    inner: Rect,
+    buf: &mut Buffer,
+    ctx: &Ctx<'_>,
+) {
+    if let ConfirmKind::TooLong(n) = kind {
+        let msg = format!("Over {n} chars: [s]plit [f]ile message.txt [n] edit");
+        let y = inner.y + inner.height.saturating_sub(1) / 2;
+        for (i, l) in text::wrap(&ctx.n(&msg), usize::from(inner.width))
+            .iter()
+            .enumerate()
+        {
+            let ry = y + u16::try_from(i).unwrap_or(0);
+            if ry >= inner.bottom() {
+                break;
+            }
+            draw::put(buf, inner.x, ry, &l.text, inner.width, ctx.s(Role::Fg));
+        }
+        return;
+    }
+
+    let prompt = match kind {
+        ConfirmKind::Quit => "Quit bbscord?",
+        ConfirmKind::Delete(_) => "Delete this message?",
+        ConfirmKind::Leave(_) => "Leave this Group DM?",
+        ConfirmKind::TooLong(_) => "",
+    };
+    let wrapped = text::wrap(&ctx.n(prompt), usize::from(inner.width));
+    let mut y = inner.y;
+    for l in &wrapped {
+        if y >= inner.bottom() {
+            break;
+        }
+        draw::put(
+            buf,
+            inner.x,
+            y,
+            &l.text,
+            inner.width,
+            ctx.s(Role::Fg).add_modifier(Modifier::BOLD),
+        );
+        y += 1;
+    }
+
+    // Draw clickable [ No ] / [ Yes ] buttons.
+    let btn_y = (y + 1).min(inner.bottom().saturating_sub(1));
+    if btn_y >= inner.y && btn_y < inner.bottom() {
+        let no_lbl = "[ No ]";
+        let yes_lbl = "[ Yes ]";
+        let no_w = u16::try_from(no_lbl.len()).unwrap_or(6);
+        let yes_w = u16::try_from(yes_lbl.len()).unwrap_or(7);
+        let no_st = if !selected_yes {
+            ctx.s(Role::Selected).add_modifier(Modifier::BOLD)
+        } else {
+            ctx.s(Role::Inactive)
+        };
+        let yes_st = if selected_yes {
+            ctx.s(Role::Mention)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        } else {
+            ctx.s(Role::Inactive)
+        };
+        let no_x = inner.x;
+        let drawn_no = draw::put(buf, no_x, btn_y, no_lbl, inner.width, no_st);
+        let gap = 2u16;
+        let yes_x = no_x.saturating_add(drawn_no).saturating_add(gap);
+        let yes_avail = inner.right().saturating_sub(yes_x);
+        let drawn_yes = if yes_avail > 0 {
+            draw::put(buf, yes_x, btn_y, yes_lbl, yes_avail, yes_st)
+        } else {
+            0
+        };
+        app.confirm_buttons = Some((
+            Rect::new(no_x, btn_y, drawn_no.min(no_w), 1),
+            Rect::new(yes_x, btn_y, drawn_yes.min(yes_w), 1),
+        ));
+    }
+
+    let hint_y = inner.bottom().saturating_sub(1);
+    if hint_y > btn_y {
+        draw::put(
+            buf,
+            inner.x,
+            hint_y,
+            &ctx.n("←/→/Tab select  Enter confirm  y/n  Esc cancel"),
+            inner.width,
+            ctx.s(Role::Inactive),
+        );
+    }
+}
+
 fn render_picker(
+    app: &mut App,
     p: &Picker,
     inner: Rect,
     sheet: bool,
@@ -1186,6 +1417,8 @@ fn render_picker(
     for (row, fi) in p.filtered.iter().enumerate().skip(start).take(lh) {
         let Some(it) = p.items.get(*fi) else { continue };
         let y = list_top + u16::try_from(row - start).unwrap_or(0);
+        app.modal_rows
+            .push((Rect::new(inner.x, y, inner.width, 1), row));
         let picked = p.multi.as_ref().is_some_and(|s| s.contains(fi));
         let mark = if p.multi.is_some() {
             if picked { "[x] " } else { "[ ] " }
@@ -1245,26 +1478,81 @@ fn render_gif(
         inner.width,
         ctx.s(Role::Hotkey),
     );
-    let cursor = Some((inner.x + w.min(inner.width.saturating_sub(1)), inner.y));
-    let items: Vec<bbs_core::GifItem> = app
+    let results_match = app
         .store
         .gif_results
         .as_ref()
-        .filter(|(id, _, _)| *id == g.request_id)
-        .map(|(_, v, _)| v.clone())
-        .unwrap_or_default();
+        .is_some_and(|(id, _, _)| *id == g.request_id);
+    let err_msg = app
+        .store
+        .gif_error
+        .as_ref()
+        .filter(|(id, _)| *id == g.request_id)
+        .map(|(_, e)| e.clone());
+    let is_loading = (g.loading && !results_match && err_msg.is_none())
+        || g.pending_search_at_ms.is_some();
+    if is_loading {
+        let ind = ctx.n("loading…");
+        let iw = u16::try_from(str_width(&ind)).unwrap_or(0);
+        if inner.width > w + iw + 1 {
+            draw::put_right(
+                buf,
+                inner.x,
+                inner.y,
+                &ind,
+                inner.width,
+                ctx.s(Role::Inactive),
+            );
+        }
+    }
+    let cursor = Some((inner.x + w.min(inner.width.saturating_sub(1)), inner.y));
+    let items = gif_items_for_modal(app);
     let body = Rect::new(
         inner.x,
         inner.y + 1,
         inner.width,
         inner.height.saturating_sub(1 + u16::from(hint_row)),
     );
-    if items.is_empty() {
+    if let Some(err) = err_msg
+        && (items.is_empty() || !results_match)
+    {
+        app.gif_grid_cols = 1;
+        if let Some(Modal::Gif(top)) = app.modals.last_mut() {
+            top.grid_cols = 1;
+        }
+        let msg = format!("GIF error: {err} (Tab to retry)");
+        for (i, l) in text::wrap(&ctx.n(&msg), usize::from(body.width))
+            .iter()
+            .enumerate()
+        {
+            let ry = body.y + u16::try_from(i).unwrap_or(0);
+            if ry >= body.bottom() {
+                break;
+            }
+            draw::put(
+                buf,
+                body.x,
+                ry,
+                &l.text,
+                body.width,
+                ctx.s(Role::Mention).add_modifier(Modifier::BOLD),
+            );
+        }
+    } else if items.is_empty() {
+        app.gif_grid_cols = 1;
+        if let Some(Modal::Gif(top)) = app.modals.last_mut() {
+            top.grid_cols = 1;
+        }
+        let status = if is_loading {
+            "searching…"
+        } else {
+            "No GIFs found. Try another query or press Tab."
+        };
         draw::put(
             buf,
             body.x,
             body.y,
-            &ctx.n("searching…"),
+            &ctx.n(status),
             body.width,
             ctx.s(Role::Inactive),
         );
@@ -1274,10 +1562,16 @@ fn render_gif(
             || body.width < tw
             || ctx.cfg.graphics == bbs_core::GraphicsTier::TextTagOnly;
         if text_list {
+            app.gif_grid_cols = 1;
+            if let Some(Modal::Gif(top)) = app.modals.last_mut() {
+                top.grid_cols = 1;
+            }
             let lh = usize::from(body.height);
             let start = g.cursor.saturating_sub(lh.saturating_sub(1));
             for (i, it) in items.iter().enumerate().skip(start).take(lh) {
                 let y = body.y + u16::try_from(i - start).unwrap_or(0);
+                app.modal_rows
+                    .push((Rect::new(body.x, y, body.width, 1), i));
                 let label = format!(
                     "[{}] {}x{}",
                     ctx.n(&sanitize_single_line(&it.title)),
@@ -1298,6 +1592,10 @@ fn render_gif(
         } else {
             let th = 8u16.min(body.height.saturating_sub(2)).max(1);
             let cols = usize::from(((body.width + 1) / (tw + 1)).max(1));
+            app.gif_grid_cols = cols;
+            if let Some(Modal::Gif(top)) = app.modals.last_mut() {
+                top.grid_cols = cols;
+            }
             let rows_vis = usize::from((body.height / (th + 1)).max(1));
             let cur_row = g.cursor / cols;
             let first_row = cur_row.saturating_sub(rows_vis - 1);
@@ -1310,6 +1608,8 @@ fn render_gif(
                 let x = body.x + u16::try_from(c).unwrap_or(0) * (tw + 1);
                 let y = body.y + u16::try_from(r - first_row).unwrap_or(0) * (th + 1);
                 let tile = Rect::new(x, y, tw, th);
+                app.modal_rows
+                    .push((Rect::new(x, y, tw, th.saturating_add(1)), i));
                 let selected = i == g.cursor;
                 crate::panes::render_image_box(
                     app,
@@ -1350,7 +1650,7 @@ fn render_gif(
             buf,
             inner.x,
             inner.bottom() - 1,
-            &ctx.n("type to search  Enter send  Tab refresh  Esc close"),
+            &ctx.n("type to search (300ms)  Arrows move  Enter search/send  Tab retry  Esc close"),
             inner.width,
             ctx.s(Role::Inactive),
         );
@@ -1396,8 +1696,8 @@ fn render_help(scroll: u16, inner: Rect, buf: &mut Buffer, ctx: &Ctx<'_>) {
     }
 }
 
-fn render_dave(app: &App, inner: Rect, buf: &mut Buffer, ctx: &Ctx<'_>) {
-    let Some(v) = &app.store.voice else {
+fn render_dave(app: &mut App, inner: Rect, buf: &mut Buffer, ctx: &Ctx<'_>) {
+    let Some(v) = app.store.voice.clone() else {
         draw::put(
             buf,
             inner.x,
@@ -1471,6 +1771,8 @@ fn render_dave(app: &App, inner: Rect, buf: &mut Buffer, ctx: &Ctx<'_>) {
         if y >= inner.bottom().saturating_sub(1) {
             break;
         }
+        app.modal_rows
+            .push((Rect::new(inner.x, y, inner.width, 1), i));
         let verified = p.dave_verified || app.dave_verified.contains(&p.user_id);
         let mark = if verified {
             ctx.g.check
