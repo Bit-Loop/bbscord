@@ -1122,8 +1122,8 @@ mod tests {
         );
         // Verify smooth continuity (no boundary click spikes > theoretical max step of 440 Hz @ 48 kHz).
         let max_step = out_48k
-            .chunks_exact(CHANNELS)
-            .collect::<Vec<_>>()
+            .as_chunks::<CHANNELS>()
+            .0
             .windows(2)
             .map(|w| (w[1][0] - w[0][0]).abs())
             .fold(0.0f32, f32::max);
@@ -1152,8 +1152,8 @@ mod tests {
         }
 
         let max_play_step = out_44k
-            .chunks_exact(CHANNELS)
-            .collect::<Vec<_>>()
+            .as_chunks::<CHANNELS>()
+            .0
             .windows(2)
             .map(|w| (w[1][0] - w[0][0]).abs())
             .fold(0.0f32, f32::max);

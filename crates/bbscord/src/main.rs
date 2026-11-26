@@ -21,6 +21,9 @@ use crate::runner::{run_headless_smoke, run_interactive};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Install the `ring` rustls CryptoProvider before any `wss://` Voice/Video Gateway TLS dial.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let cli = Cli::parse();
 
     // Only emit tracing logs when explicitly opted-in via `RUST_LOG` or in headless mode,

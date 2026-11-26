@@ -1,7 +1,8 @@
 //! Unified runtime service wiring for both offline `--mock-demo` and production live Discord mode.
 
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -10,6 +11,7 @@ use bbs_core::{
     MockDiscordBackend, MockGifProvider, MockVideoStreamEngine, MockVoiceEngine, SecretToken,
     Snowflake, StreamDescriptor, UiAction, VideoStreamEngine, VoiceEngine, mock_ids,
 };
+use bbs_protocol::wire::WireGuildMember;
 use bbs_protocol::{
     CompositeGifProvider, DiscordFingerprint, DiscordGateway, DiscordGifProvider,
     DiscordRestClient, FingerprintConfig, GatewayConfig, GatewayHandle, GatewaySignalingEvent,
@@ -21,8 +23,9 @@ use bbs_video::signaling::{
 };
 use bbs_video::{GStreamerVideoStreamEngine, VideoEngineConfig};
 use bbs_voice::{
-    AudioBackendMode, DiscordVoiceEngine, VoiceEngineConfig, VoiceError, VoiceResult,
-    VoiceServerUpdateEvent, VoiceSignalingBridge, VoiceStateUpdateCommand, VoiceStateUpdateEvent,
+    AudioBackendMode, CallUpdateEvent, DiscordVoiceEngine, VoiceEngineConfig, VoiceError,
+    VoiceResult, VoiceServerUpdateEvent, VoiceSignalingBridge, VoiceStateUpdateCommand,
+    VoiceStateUpdateEvent,
 };
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
@@ -59,10 +62,104 @@ impl VoiceSignalingBridge for GatewayVoiceBridge {
     }
 }
 
+/// Shared channel & user name lookup populated from live/mock backend events so voice
+/// status headers and remote participants display real names instead of raw Snowflakes.
+#[derive(Default)]
+struct NameRegistry {
+    channels: RwLock<HashMap<Snowflake, String>>,
+    users: RwLock<HashMap<Snowflake, String>>,
+}
+
+impl NameRegistry {
+    fn observe_event(&self, ev: &BackendEvent) {
+        match ev {
+            BackendEvent::Ready {
+                current_user,
+                dm_channels,
+                ..
+            } => {
+                self.record_user(current_user.id, current_user.display_name());
+                for ch in dm_channels {
+                    self.record_channel(ch.id, &ch.display_label());
+                    for r in &ch.recipients {
+                        self.record_user(r.id, r.display_name());
+                    }
+                }
+            }
+            BackendEvent::ChannelsLoaded { channels, .. } => {
+                for ch in channels {
+                    self.record_channel(ch.id, &ch.display_label());
+                    for r in &ch.recipients {
+                        self.record_user(r.id, r.display_name());
+                    }
+                }
+            }
+            BackendEvent::ChannelUpserted(ch) => {
+                self.record_channel(ch.id, &ch.display_label());
+                for r in &ch.recipients {
+                    self.record_user(r.id, r.display_name());
+                }
+            }
+            BackendEvent::MessagesLoaded { messages, .. } => {
+                for m in messages {
+                    self.record_user(
+                        m.author.id,
+                        m.author_nick
+                            .as_deref()
+                            .unwrap_or_else(|| m.author.display_name()),
+                    );
+                }
+            }
+            BackendEvent::MessageCreated(m) | BackendEvent::MessageUpdated(m) => {
+                self.record_user(
+                    m.author.id,
+                    m.author_nick
+                        .as_deref()
+                        .unwrap_or_else(|| m.author.display_name()),
+                );
+            }
+            BackendEvent::GuildMembersUpdated { members, .. } => {
+                for m in members {
+                    if let Some(nick) = m.nick.as_deref().filter(|s| !s.is_empty()) {
+                        self.record_user(m.user_id, nick);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn record_channel(&self, id: Snowflake, label: &str) {
+        if !label.is_empty()
+            && let Ok(mut map) = self.channels.write()
+        {
+            map.insert(id, label.to_owned());
+        }
+    }
+
+    fn record_user(&self, id: Snowflake, name: &str) {
+        if !name.is_empty()
+            && let Ok(mut map) = self.users.write()
+        {
+            map.insert(id, name.to_owned());
+        }
+    }
+
+    fn channel_name(&self, id: Snowflake) -> Option<String> {
+        self.channels.read().ok().and_then(|m| m.get(&id).cloned())
+    }
+
+    fn user_name(&self, id: Snowflake) -> Option<String> {
+        self.users.read().ok().and_then(|m| m.get(&id).cloned())
+    }
+}
+
 /// Unified container owning all protocol, GIF, voice, and Go Live video services.
 pub struct RuntimeServices {
     /// Core Discord REST/state backend (live or mock).
     pub discord: Arc<dyn DiscordBackend>,
+    /// Concrete mock Discord backend for seeding rich offline member/voice-roster demos.
+    mock_discord: Option<Arc<MockDiscordBackend>>,
     /// Live REST client (present only in live mode for multipart uploads and signed CDN fetches).
     pub rest_client: Option<Arc<DiscordRestClient>>,
     /// Live Gateway handle (present only in live mode).
@@ -83,6 +180,10 @@ pub struct RuntimeServices {
     pub mock_video: Option<Arc<MockVideoStreamEngine>>,
     /// Unified event bus consumed by the TUI loop.
     pub event_tx: mpsc::UnboundedSender<BackendEvent>,
+    /// Sequential FIFO lane for voice/call actions (`JoinVoice -> RingCall`, `LeaveVoice`, etc.).
+    voice_action_tx: mpsc::UnboundedSender<UiAction>,
+    /// Cached channel & user display names for voice headers and remote participants.
+    names: Arc<NameRegistry>,
     /// Background task handles aborted/drained cleanly on shutdown.
     tasks: Vec<JoinHandle<()>>,
 }
@@ -92,30 +193,59 @@ impl RuntimeServices {
     #[must_use]
     pub fn build_mock() -> (Self, mpsc::UnboundedReceiver<BackendEvent>) {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let names = Arc::new(NameRegistry::default());
 
         let mock_discord = Arc::new(MockDiscordBackend::new());
         let mock_gifs = Arc::new(MockGifProvider::new());
         let mock_voice = Arc::new(MockVoiceEngine::new());
         let mock_video = Arc::new(MockVideoStreamEngine::new());
 
+        let discord_trait: Arc<dyn DiscordBackend> = Arc::clone(&mock_discord) as Arc<dyn DiscordBackend>;
+        let voice_trait: Arc<dyn VoiceEngine> = Arc::clone(&mock_voice) as Arc<dyn VoiceEngine>;
+        let video_trait: Arc<dyn VideoStreamEngine> = Arc::clone(&mock_video) as Arc<dyn VideoStreamEngine>;
+
+        let (voice_action_tx, voice_worker) = spawn_voice_action_worker(
+            Arc::clone(&discord_trait),
+            None,
+            None,
+            Arc::clone(&mock_gifs) as Arc<dyn GifProvider>,
+            Arc::clone(&voice_trait),
+            None,
+            Arc::clone(&video_trait),
+            event_tx.clone(),
+            Arc::clone(&names),
+        );
+
         let tasks = vec![
-            forward_broadcast(mock_discord.subscribe_events(), event_tx.clone()),
-            forward_broadcast(mock_voice.subscribe_voice_events(), event_tx.clone()),
+            forward_broadcast(
+                mock_discord.subscribe_events(),
+                event_tx.clone(),
+                Arc::clone(&names),
+            ),
+            forward_broadcast(
+                mock_voice.subscribe_voice_events(),
+                event_tx.clone(),
+                Arc::clone(&names),
+            ),
             forward_video_frames(mock_video.subscribe_frames(), event_tx.clone()),
+            voice_worker,
         ];
 
         let services = Self {
-            discord: mock_discord,
+            discord: discord_trait,
+            mock_discord: Some(mock_discord),
             rest_client: None,
             gateway: None,
             gifs: mock_gifs,
-            voice: Arc::clone(&mock_voice) as Arc<dyn VoiceEngine>,
+            voice: voice_trait,
             live_voice: None,
             mock_voice: Some(mock_voice),
-            video: Arc::clone(&mock_video) as Arc<dyn VideoStreamEngine>,
+            video: video_trait,
             live_video: None,
             mock_video: Some(mock_video),
             event_tx,
+            voice_action_tx,
+            names,
             tasks,
         };
 
@@ -131,6 +261,7 @@ impl RuntimeServices {
     ) -> Result<(Self, mpsc::UnboundedReceiver<BackendEvent>)> {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (shared_bus, _) = broadcast::channel::<BackendEvent>(512);
+        let names = Arc::new(NameRegistry::default());
 
         let rest = Arc::new(
             DiscordRestClient::new(token.clone(), fingerprint.clone())
@@ -142,6 +273,7 @@ impl RuntimeServices {
             .validate_token()
             .await
             .context("Discord token validation via GET /users/@me failed")?;
+        names.record_user(current_user.id, current_user.display_name());
 
         let (gateway_runner, gateway_handle) = DiscordGateway::new(
             token.clone(),
@@ -172,6 +304,7 @@ impl RuntimeServices {
         // Voice engine (Guild + 1:1 / Group DM calls, DAVE MLS E2EE, Opus + cpal/PipeWire).
         let mut voice_cfg = VoiceEngineConfig::new(current_user.id, current_user.display_name());
         voice_cfg.input_mode = app_cfg.voice.resolved_input_mode();
+        voice_cfg.join_muted = app_cfg.voice.join_muted;
         voice_cfg.audio_mode = AudioBackendMode::Auto;
         let voice_bridge: Arc<dyn VoiceSignalingBridge> =
             Arc::new(GatewayVoiceBridge::new(gateway_handle.clone()));
@@ -201,10 +334,30 @@ impl RuntimeServices {
             }
         };
 
+        let discord_trait: Arc<dyn DiscordBackend> = Arc::clone(&rest) as Arc<dyn DiscordBackend>;
+        let voice_trait: Arc<dyn VoiceEngine> = Arc::clone(&live_voice) as Arc<dyn VoiceEngine>;
+
+        let (voice_action_tx, voice_worker) = spawn_voice_action_worker(
+            Arc::clone(&discord_trait),
+            Some(Arc::clone(&rest)),
+            Some(gateway_handle.clone()),
+            Arc::clone(&gifs),
+            Arc::clone(&voice_trait),
+            Some(Arc::clone(&live_voice)),
+            Arc::clone(&video_trait),
+            event_tx.clone(),
+            Arc::clone(&names),
+        );
+
         let mut tasks = vec![
-            forward_broadcast(shared_bus.subscribe(), event_tx.clone()),
-            forward_broadcast(live_voice.subscribe_voice_events(), event_tx.clone()),
+            forward_broadcast(shared_bus.subscribe(), event_tx.clone(), Arc::clone(&names)),
+            forward_broadcast(
+                live_voice.subscribe_voice_events(),
+                event_tx.clone(),
+                Arc::clone(&names),
+            ),
             forward_video_frames(video_trait.subscribe_frames(), event_tx.clone()),
+            voice_worker,
             // Forward Gateway signaling dispatches into bbs-voice and bbs-video.
             spawn_gateway_signaling_bridge(
                 current_user.id,
@@ -212,6 +365,7 @@ impl RuntimeServices {
                 Arc::clone(&live_voice),
                 live_video.clone(),
                 event_tx.clone(),
+                Arc::clone(&names),
             ),
         ];
 
@@ -236,24 +390,28 @@ impl RuntimeServices {
         }));
 
         let services = Self {
-            discord: Arc::clone(&rest) as Arc<dyn DiscordBackend>,
+            discord: discord_trait,
+            mock_discord: None,
             rest_client: Some(rest),
             gateway: Some(gateway_handle),
             gifs,
-            voice: Arc::clone(&live_voice) as Arc<dyn VoiceEngine>,
+            voice: voice_trait,
             live_voice: Some(live_voice),
             mock_voice: None,
             video: video_trait,
             live_video,
             mock_video: None,
             event_tx,
+            voice_action_tx,
+            names,
             tasks,
         };
 
         Ok((services, event_rx))
     }
 
-    /// Seed initial `Ready`, channels, messages, active streams, and mock ring state in mock mode.
+    /// Seed initial `Ready`, channels, guild members, voice rosters, messages, streams, and ring
+    /// state in mock mode so `--mock-demo` showcases roles, folders, muted channels, and voice rosters.
     pub async fn seed_mock_state(&self) -> Result<()> {
         let user = self.discord.current_user().await?;
         let (guilds, folders) = self.discord.list_guilds().await?;
@@ -264,33 +422,65 @@ impl RuntimeServices {
             latency_ms: Some(24),
             detail: Some("MOCK-DEMO OFFLINE".to_string()),
         });
-        let _ = self.event_tx.send(BackendEvent::Ready {
+        let ready_ev = BackendEvent::Ready {
             current_user: user,
             guilds: guilds.clone(),
             guild_folders: folders,
             dm_channels: dms.clone(),
-        });
+        };
+        self.names.observe_event(&ready_ev);
+        let _ = self.event_tx.send(ready_ev);
 
         for guild in &guilds {
             if let Ok(channels) = self.discord.list_channels(guild.id).await {
-                let _ = self.event_tx.send(BackendEvent::ChannelsLoaded {
+                let ev = BackendEvent::ChannelsLoaded {
                     guild_id: Some(guild.id),
                     channels,
+                };
+                self.names.observe_event(&ev);
+                let _ = self.event_tx.send(ev);
+            }
+            if let Some(ref mock) = self.mock_discord
+                && let Ok(members) = mock.guild_members(guild.id)
+                && !members.is_empty()
+            {
+                let ev = BackendEvent::GuildMembersUpdated {
+                    guild_id: guild.id,
+                    members,
+                };
+                self.names.observe_event(&ev);
+                let _ = self.event_tx.send(ev);
+            }
+        }
+
+        if let Some(ref mock) = self.mock_discord
+            && let Ok(rosters) = mock.voice_rosters()
+        {
+            for (guild_id, channel_id, participants) in rosters {
+                let _ = self.event_tx.send(BackendEvent::VoiceRosterUpdated {
+                    guild_id,
+                    channel_id,
+                    participants,
                 });
             }
         }
 
         for ch_id in [
             mock_ids::CH_RETRONET_GENERAL,
+            mock_ids::CH_RETRONET_MUTED_LOGS,
             mock_ids::CH_GROUP_DM_OPS,
             mock_ids::CH_DM_ALICE,
+            mock_ids::CH_DM_BOB,
+            mock_ids::CH_DM_CAROL,
         ] {
             if let Ok(messages) = self.discord.fetch_messages(ch_id, None, 50).await {
-                let _ = self.event_tx.send(BackendEvent::MessagesLoaded {
+                let ev = BackendEvent::MessagesLoaded {
                     channel_id: ch_id,
                     messages,
                     has_more_before: false,
-                });
+                };
+                self.names.observe_event(&ev);
+                let _ = self.event_tx.send(ev);
             }
         }
 
@@ -318,8 +508,27 @@ impl RuntimeServices {
         Ok(())
     }
 
-    /// Spawn an async task to execute a [`UiAction`] without stalling the TUI render loop.
+    /// Update Push-to-Talk microphone transmission state asynchronously (non-blocking for UI loop).
+    pub fn set_ptt_active(&self, active: bool) {
+        if let Some(ref lv) = self.live_voice {
+            let lv = Arc::clone(lv);
+            tokio::spawn(async move {
+                let _ = lv.set_ptt_active(active).await;
+            });
+        }
+    }
+
+    /// Dispatch a [`UiAction`] without stalling the TUI render loop.
+    ///
+    /// Voice & call lifecycle actions (`JoinVoice`, `RingCall`, `StopCallRing`, `LeaveVoice`,
+    /// mute/deaf/volume) are routed through a strictly ordered FIFO worker so DM `JoinVoice` ->
+    /// `RingCall` never race.
     pub fn dispatch_action(&self, action: UiAction) {
+        if is_ordered_voice_action(&action) {
+            let _ = self.voice_action_tx.send(action);
+            return;
+        }
+
         let discord = Arc::clone(&self.discord);
         let rest_client = self.rest_client.clone();
         let gateway = self.gateway.clone();
@@ -328,6 +537,7 @@ impl RuntimeServices {
         let live_voice = self.live_voice.clone();
         let video = Arc::clone(&self.video);
         let event_tx = self.event_tx.clone();
+        let names = Arc::clone(&self.names);
 
         tokio::spawn(async move {
             if let Err(err) = execute_ui_action(
@@ -340,6 +550,7 @@ impl RuntimeServices {
                 live_voice,
                 video,
                 event_tx.clone(),
+                names,
             )
             .await
             {
@@ -417,6 +628,81 @@ pub fn default_fingerprint() -> Result<DiscordFingerprint> {
         .context("failed to initialize Discord Chrome browser fingerprint")
 }
 
+fn is_ordered_voice_action(action: &UiAction) -> bool {
+    matches!(
+        action,
+        UiAction::JoinVoice { .. }
+            | UiAction::LeaveVoice
+            | UiAction::RingCall { .. }
+            | UiAction::StopCallRing { .. }
+            | UiAction::SetSelfMute(_)
+            | UiAction::SetSelfDeaf(_)
+            | UiAction::SetParticipantVolume { .. }
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_voice_action_worker(
+    discord: Arc<dyn DiscordBackend>,
+    rest_client: Option<Arc<DiscordRestClient>>,
+    gateway: Option<GatewayHandle>,
+    gifs: Arc<dyn GifProvider>,
+    voice: Arc<dyn VoiceEngine>,
+    live_voice: Option<Arc<DiscordVoiceEngine>>,
+    video: Arc<dyn VideoStreamEngine>,
+    event_tx: mpsc::UnboundedSender<BackendEvent>,
+    names: Arc<NameRegistry>,
+) -> (mpsc::UnboundedSender<UiAction>, JoinHandle<()>) {
+    let (tx, mut rx) = mpsc::unbounded_channel::<UiAction>();
+    let handle = tokio::spawn(async move {
+        let mut last_failed_join: Option<Snowflake> = None;
+        while let Some(action) = rx.recv().await {
+            // If an outgoing DM JoinVoice just failed, do not fire the paired RingCall behind it.
+            if let UiAction::RingCall { channel_id, .. } = &action
+                && last_failed_join == Some(*channel_id)
+            {
+                last_failed_join = None;
+                continue;
+            }
+            let join_target = match &action {
+                UiAction::JoinVoice { channel_id, .. } => Some(*channel_id),
+                _ => None,
+            };
+            let res = execute_ui_action(
+                action,
+                Arc::clone(&discord),
+                rest_client.clone(),
+                gateway.clone(),
+                Arc::clone(&gifs),
+                Arc::clone(&voice),
+                live_voice.clone(),
+                Arc::clone(&video),
+                event_tx.clone(),
+                Arc::clone(&names),
+            )
+            .await;
+            match res {
+                Ok(()) => {
+                    if join_target.is_some() {
+                        last_failed_join = None;
+                    }
+                }
+                Err(err) => {
+                    if let Some(ch) = join_target {
+                        last_failed_join = Some(ch);
+                    }
+                    let _ = event_tx.send(BackendEvent::ErrorBanner {
+                        scope: "voice".to_string(),
+                        message: err.to_string(),
+                        recoverable: true,
+                    });
+                }
+            }
+        }
+    });
+    (tx, handle)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_ui_action(
     action: UiAction,
@@ -428,6 +714,7 @@ async fn execute_ui_action(
     live_voice: Option<Arc<DiscordVoiceEngine>>,
     video: Arc<dyn VideoStreamEngine>,
     event_tx: mpsc::UnboundedSender<BackendEvent>,
+    names: Arc<NameRegistry>,
 ) -> CoreResult<()> {
     match action {
         UiAction::SelectGuild(Some(guild_id)) => {
@@ -508,7 +795,13 @@ async fn execute_ui_action(
                     });
                 }
                 let _ = rest
-                    .send_message_with_attachments(channel_id, &content, reply_to, &uploads)
+                    .send_message_with_attachments_and_mention(
+                        channel_id,
+                        &content,
+                        reply_to,
+                        mention_replied_user,
+                        &uploads,
+                    )
                     .await?;
             } else {
                 let _ = discord
@@ -525,7 +818,15 @@ async fn execute_ui_action(
         UiAction::SendTyping { channel_id } => {
             discord.send_typing(channel_id).await?;
         }
-        UiAction::RequestGuildMembers { .. } => {}
+        UiAction::RequestGuildMembers {
+            guild_id,
+            query,
+            user_ids,
+        } => {
+            if let Some(ref gw) = gateway {
+                gw.request_guild_members(guild_id, query, user_ids)?;
+            }
+        }
         UiAction::EditMessage {
             channel_id,
             message_id,
@@ -596,18 +897,27 @@ async fn execute_ui_action(
         }
         UiAction::SearchGifs { request_id, query } => {
             let trimmed = query.query.trim();
-            let page = if !trimmed.is_empty() && is_direct_gif_or_webp_url(trimmed) {
-                let item = resolve_direct_gif_url(trimmed)?;
-                bbs_core::GifSearchPage {
+            let result = if !trimmed.is_empty() && is_direct_gif_or_webp_url(trimmed) {
+                resolve_direct_gif_url(trimmed).map(|item| bbs_core::GifSearchPage {
                     items: vec![item],
                     next_cursor: None,
-                }
+                })
             } else if query.trending && trimmed.is_empty() {
-                gifs.trending(query.limit, query.cursor.as_deref()).await?
+                gifs.trending(query.limit, query.cursor.as_deref()).await
             } else {
-                gifs.search(&query).await?
+                gifs.search(&query).await
             };
-            let _ = event_tx.send(BackendEvent::GifSearchResults { request_id, page });
+            match result {
+                Ok(page) => {
+                    let _ = event_tx.send(BackendEvent::GifSearchResults { request_id, page });
+                }
+                Err(err) => {
+                    let _ = event_tx.send(BackendEvent::GifSearchFailed {
+                        request_id,
+                        error: err.to_string(),
+                    });
+                }
+            }
         }
         UiAction::SendGif {
             channel_id,
@@ -622,8 +932,14 @@ async fn execute_ui_action(
             guild_id,
             channel_id,
         } => {
-            let status = voice.join_voice(guild_id, channel_id).await?;
-            let _ = event_tx.send(BackendEvent::VoiceStatusUpdated(status));
+            if let Some(ref lv) = live_voice
+                && let Some(ch_name) = names.channel_name(channel_id)
+            {
+                lv.set_channel_name(channel_id, ch_name);
+            }
+            // Do NOT re-emit `BackendEvent::VoiceStatusUpdated` here: `VoiceEngine` is the sole
+            // authoritative owner and emits snapshots on its event stream.
+            let _ = voice.join_voice(guild_id, channel_id).await?;
             if let Some(ref gw) = gateway
                 && let Some(gid) = guild_id
             {
@@ -718,11 +1034,13 @@ async fn execute_ui_action(
 fn forward_broadcast(
     mut rx: broadcast::Receiver<BackendEvent>,
     tx: mpsc::UnboundedSender<BackendEvent>,
+    names: Arc<NameRegistry>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             match rx.recv().await {
                 Ok(ev) => {
+                    names.observe_event(&ev);
                     if tx.send(ev).is_err() {
                         break;
                     }
@@ -761,6 +1079,7 @@ fn spawn_gateway_signaling_bridge(
     voice: Arc<DiscordVoiceEngine>,
     video: Option<Arc<GStreamerVideoStreamEngine>>,
     event_tx: mpsc::UnboundedSender<BackendEvent>,
+    names: Arc<NameRegistry>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -773,6 +1092,14 @@ fn spawn_gateway_signaling_bridge(
             match sig {
                 GatewaySignalingEvent::InitialVoiceStates { guild_id, states } => {
                     for st in states {
+                        let display_name = st
+                            .member
+                            .as_ref()
+                            .and_then(WireGuildMember::display_name)
+                            .or_else(|| names.user_name(st.user_id));
+                        if let Some(ref name) = display_name {
+                            names.record_user(st.user_id, name);
+                        }
                         let ev = VoiceStateUpdateEvent {
                             guild_id: st.guild_id.or(guild_id),
                             channel_id: st.channel_id,
@@ -783,12 +1110,20 @@ fn spawn_gateway_signaling_bridge(
                             mute: st.mute,
                             deaf: st.deaf,
                             self_stream: st.self_stream.unwrap_or(false),
-                            display_name: None,
+                            display_name,
                         };
                         voice.handle_voice_state_update(ev).await;
                     }
                 }
                 GatewaySignalingEvent::VoiceStateUpdate(st) => {
+                    let display_name = st
+                        .member
+                        .as_ref()
+                        .and_then(WireGuildMember::display_name)
+                        .or_else(|| names.user_name(st.user_id));
+                    if let Some(ref name) = display_name {
+                        names.record_user(st.user_id, name);
+                    }
                     if st.user_id == local_user_id
                         && !st.session_id.is_empty()
                         && let Some(ref vid) = video
@@ -800,12 +1135,15 @@ fn spawn_gateway_signaling_bridge(
                         && let Some(ref vid) = video
                     {
                         let key = StreamKey::from_ids(st.guild_id, ch_id, st.user_id);
+                        let owner_name = display_name
+                            .clone()
+                            .unwrap_or_else(|| format!("user-{}", st.user_id));
                         let desc = StreamDescriptor {
                             stream_key: key.to_canonical_string(),
                             guild_id: st.guild_id,
                             channel_id: ch_id,
                             owner_id: st.user_id,
-                            owner_name: format!("user-{}", st.user_id),
+                            owner_name,
                             title: "Go Live Screenshare".to_string(),
                             resolution: (1280, 720),
                             fps: 30,
@@ -831,7 +1169,7 @@ fn spawn_gateway_signaling_bridge(
                         mute: st.mute,
                         deaf: st.deaf,
                         self_stream: st.self_stream.unwrap_or(false),
-                        display_name: None,
+                        display_name,
                     };
                     voice.handle_voice_state_update(ev).await;
                 }
@@ -849,6 +1187,38 @@ fn spawn_gateway_signaling_bridge(
                             token: Zeroizing::new(token.expose_secret().to_owned()),
                         })
                         .await;
+                }
+                GatewaySignalingEvent::CallCreate {
+                    channel_id,
+                    ringing,
+                    voice_states,
+                    caller_id,
+                    caller_name,
+                    is_group_dm,
+                }
+                | GatewaySignalingEvent::CallUpdate {
+                    channel_id,
+                    ringing,
+                    voice_states,
+                    caller_id,
+                    caller_name,
+                    is_group_dm,
+                } => {
+                    let connected_user_ids: Vec<Snowflake> =
+                        voice_states.iter().map(|vs| vs.user_id).collect();
+                    let resolved_caller_name = caller_name
+                        .or_else(|| caller_id.and_then(|cid| names.user_name(cid)));
+                    voice.handle_call_update(CallUpdateEvent {
+                        channel_id,
+                        ringing,
+                        connected_user_ids,
+                        caller_id,
+                        caller_name: resolved_caller_name,
+                        is_group_dm,
+                    });
+                }
+                GatewaySignalingEvent::CallDelete { channel_id } => {
+                    voice.handle_call_delete(channel_id);
                 }
                 GatewaySignalingEvent::StreamCreate {
                     stream_key,

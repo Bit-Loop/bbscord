@@ -297,6 +297,12 @@ impl App {
         self.pending_copy_text.take()
     }
 
+    /// Returns `true` when any modal overlay (picker, GIF search, help, confirm, etc.) is active.
+    #[must_use]
+    pub fn has_modal(&self) -> bool {
+        !self.modals.is_empty()
+    }
+
     /// Current theme.
     #[must_use]
     pub fn theme(&self) -> &Theme {

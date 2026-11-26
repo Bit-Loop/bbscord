@@ -26,6 +26,8 @@ pub struct VoiceConfig {
     pub high_pass_filter: bool,
     /// Push-to-talk key name (used with Kitty keyboard flag 2 or XDG GlobalShortcuts).
     pub ptt_key: String,
+    /// Join voice channels and DM/Group DM calls with the local microphone muted by default.
+    pub join_muted: bool,
 }
 
 impl Default for VoiceConfig {
@@ -36,6 +38,7 @@ impl Default for VoiceConfig {
             master_volume: 100,
             high_pass_filter: true,
             ptt_key: "v".to_string(),
+            join_muted: true,
         }
     }
 }

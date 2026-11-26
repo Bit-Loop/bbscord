@@ -155,9 +155,60 @@ pub fn run_external_editor(
     Ok((edited, resume))
 }
 
+/// Parse a `±HHMM` UTC offset string (such as `"+0900"` or `"-0530"`) into signed minutes.
+#[must_use]
+pub fn parse_utc_offset_hhmm(raw: &str) -> Option<i32> {
+    let s = raw.trim();
+    if s.len() != 5 || !s.is_ascii() {
+        return None;
+    }
+    let sign = match s.as_bytes()[0] {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+    let hours: i32 = s[1..3].parse().ok()?;
+    let mins: i32 = s[3..5].parse().ok()?;
+    if hours > 14 || mins >= 60 {
+        return None;
+    }
+    Some(sign * (hours * 60 + mins))
+}
+
+/// Detect the system's current local UTC offset in minutes (`+0900` -> `540`, `-0500` -> `-300`)
+/// using `#![forbid(unsafe_code)]`-safe POSIX `date +%z`, falling back to `0` (UTC) if unavailable.
+#[must_use]
+pub fn detect_local_utc_offset_minutes() -> i32 {
+    let Ok(output) = Command::new("date")
+        .arg("+%z")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return 0;
+    };
+    if !output.status.success() {
+        return 0;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    parse_utc_offset_hhmm(&text).unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn utc_offset_parser_handles_valid_and_invalid_inputs() {
+        assert_eq!(parse_utc_offset_hhmm("+0900\n"), Some(540));
+        assert_eq!(parse_utc_offset_hhmm("-0530"), Some(-330));
+        assert_eq!(parse_utc_offset_hhmm("+0000"), Some(0));
+        assert_eq!(parse_utc_offset_hhmm("-0600"), Some(-360));
+        assert_eq!(parse_utc_offset_hhmm("+1400"), Some(840));
+        assert_eq!(parse_utc_offset_hhmm("+2500"), None);
+        assert_eq!(parse_utc_offset_hhmm("+0560"), None);
+        assert_eq!(parse_utc_offset_hhmm("UTC"), None);
+    }
 
     #[test]
     fn safe_http_url_validation() {

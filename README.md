@@ -81,7 +81,8 @@
 - **Ubuntu / Debian:**
   ```bash
   sudo apt install libopus-dev libasound2-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
-    libgstreamer-plugins-bad1.0-dev gstreamer1.0-plugins-good gstreamer1.0-plugins-bad pkg-config cmake libclang-dev
+    libgstreamer-plugins-bad1.0-dev gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-nice \
+    pkg-config cmake libclang-dev
   ```
 *(Optional: install `mpv` for borderless 60 fps screenshare pop-out windows and `wl-clipboard` / `xclip` for clipboard copy.)*
 
@@ -136,16 +137,18 @@ bbscord --import-discordo-keyring
 
 ## ⌨️ Essential Keybinds
 
-Every action works via single-letter **NORMAL** keys (100% safe inside `tmux`, `zellij`, SSH, and legacy terminals without `CSI u`) as well as classic `F`-keys:
+Every action works via single-letter **NORMAL** keys (100% safe inside `tmux`, `zellij`, SSH, and legacy terminals without `CSI u`), classic `F`-keys, and full SGR mouse click/wheel navigation:
 
 | Action | Keys | Action | Keys |
 | :--- | :--- | :--- | :--- |
-| **Quick Switcher** | `k` or `Ctrl+K` | **Live Theme Picker** | `F2`, `T`, or `Ctrl+T` |
-| **Compose / Newline** | `i` / `Enter` · `Alt+Enter` | **Animated GIF Picker** | `G`, `F5`, or `Ctrl+G` |
-| **Reply / React / Thread** | `r` / `e` / `t` | **Next / Prev Unread** | `]` / `[` |
-| **Voice Join / Answer / Hang Up** | `v` / `a` / `h` · `F9` | **Mute / Deafen / Stream** | `m` / `d` / `s` · `F7` / `F8` |
-| **Group DM (`new/+/-/rename/leave`)** | `n` / `+` / `-` / `R` / `L` | **Voice Volume (`0–200%`)** | `-` / `+` / `0` (in Stage) |
-| **Focus Pane / Members / Stage** | `1`–`6`, `Tab` · `M` · `V` | **Help / Redraw / Quit** | `?` (`F1`) · `Ctrl+L` · `q` (`F10`) |
+| **Navigate / Scroll** | `j`/`k` · `↑`/`↓` · `g`/`End` · Wheel | **Quick Switcher** | `/` or `Ctrl+K` |
+| **Compose / Autocomplete** | `i` / `Enter` · `Tab` (`@` `:` `#`) | **Live Theme Picker** | `F2`, `T`, or `Ctrl+T` |
+| **Reply (`@` ping toggle)** | `r` (`Tab` / `Alt+M` toggle) | **Animated GIF Picker** | `G`, `F5`, or `Ctrl+G` |
+| **Edit / Delete (confirm)** | `e` / `E` (last own) · `d` / `Del` | **React / Threads / Pins** | `R` / `t` / `p` |
+| **Open Link / Copy Msg / URL** | `o` (or dbl-click) · `y` / `u` | **Search / Next / Prev Unread** | `f` (`Ctrl+F`) · `]` / `[` |
+| **Voice Join / Answer / Hang Up** | `v` / `a` / `h` · `F9` | **Mute / Deafen / Stream** | `m` / `D` / `s` · `F7` / `F8` |
+| **Group DM (`new/+/-/rename/leave`)** | `n` / `+` / `-` / `R`(side) / `L` | **Voice Volume (`0–200%`)** | `-` / `+` / `0` / `x` (in Stage) |
+| **Focus Pane / Members / Stage** | `1`–`6`, `Tab`, Click · `M` · `V` | **Help / Redraw / Quit** | `?` (`F1`) · `Ctrl+L` · `q` (`F10`) |
 
 > **On `16×2` LCDs:** Just 6 keys (`↑` `↓` `←` `→` `Enter` `Esc`) reach reading, composing, switching channels, voice mute/volume, GIF search, themes, and quitting via `MAIN MENU` / `MSG MENU`.
 
@@ -184,7 +187,7 @@ Full cell math and invariants (`I1`–`I9`) live in [docs/TUI_SPEC.md](docs/TUI_
 | **Kitty** | `KittyPlaceholder` (`U+10EEEE`) | Native animation, `a=d,d=I` VRAM eviction (`64 MiB` LRU). |
 | **Ghostty / Rio** | `KittyPlaceholder` | Client-side paced GIFs, DEC Mode 2026 sync output. |
 | **WezTerm / Konsole** | `KittyDirect` | Half-block proxy while scrolling; crisp re-draw after `150 ms` settle. |
-| **foot / Windows Terminal / xterm** | `Sixel` | PTY bandwidth governor (`256 KiB/s` local, `48 KiB/s` SSH). |
+| **foot / Windows Terminal / xterm** | `Sixel` | Off-thread encode + PTY governor (`2 MiB/s` local, `128 KiB/s` SSH). |
 | **iTerm2** | `ITerm2` (`OSC 1337`) | Base64 inline PNG with cell aspect correction. |
 | **Alacritty / GNOME Terminal / `tmux` / `zellij`** | `HalfBlock` | Universal 24-bit `▀`/`▄` blocks (`--tmux-passthrough` optional). |
 | **Linux VT (`TERM=linux`) / Serial LCD (`TERM=dumb`)** | `TextTagOnly` | `VtSafe` / strict 7-bit `Ascii7Bit` tags; `150 ms` hard probe deadline. |

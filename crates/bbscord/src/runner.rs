@@ -12,14 +12,16 @@ use bbs_core::{
     VideoSinkKind, ViewportGeometry, mock_ids,
 };
 use bbs_runtime_term::{
-    DecodedMedia, FramePacer, GifAnimationPlayer, MediaDecoderPool, MediaFitMode, MediaRenderer,
-    MediaWidget, ProbeOptions, ProbeReport, PtyBandwidthGovernor, RenderedMedia, ResizeDebouncer,
+    DecodedMedia, FramePacer, GifAnimationPlayer, MediaDecoderPool, MediaEncodeRequest,
+    MediaEncoderPool, MediaFitMode, MediaRenderer, MediaWidget, ProbeOptions, ProbeReport,
+    PtyBandwidthGovernor, RenderedMedia, RenderedMediaFrame, ResizeDebouncer,
     ScrollProxyDebouncer, TerminalEnv, TerminalSignal, TtyGuard, TtyGuardConfig,
     install_panic_hook, negotiate_capabilities, normalize_key_event, probe_terminal_async,
     query_stdout_winsize,
 };
 use bbs_tui::theme::{ThemeCatalog, ThemeDirs};
-use bbs_tui::{App, Effect, ImageSlot, TuiConfig};
+use bbs_tui::{App, Effect, ImageSlot, Mode, TuiConfig};
+use bbs_voice::InputMode;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
 use futures::StreamExt as _;
 use ratatui::Terminal;
@@ -32,30 +34,57 @@ use crate::bridge::{RuntimeServices, default_fingerprint};
 use crate::cli::Cli;
 use crate::config::{AppConfig, OptionalApiSecrets, save_config};
 use crate::login::{ensure_interactive_tty, run_interactive_login, try_resolve_stored_token};
-use crate::platform::{copy_to_clipboard, open_external_url, run_external_editor};
+use crate::platform::{
+    copy_to_clipboard, detect_local_utc_offset_minutes, open_external_url, run_external_editor,
+};
+
+/// Negative-cache cooldown preventing failed/404/unsupported media URLs from triggering 10 Hz
+/// re-fetch storms.
+const FAILED_URL_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// Upper bound on cached encoded frames kept in memory by [`MediaCoordinator`].
+const MAX_ENCODED_FRAMES: usize = 256;
+
+type EncodedCacheKey = (String, usize, u16, u16, GraphicsTier);
+type DecodedOutcome = (String, Option<Arc<DecodedMedia>>, Vec<String>);
+
+struct CachedEncodedFrame {
+    media: RenderedMedia,
+    is_animated: bool,
+    emitted: bool,
+}
 
 /// Media pipeline state pairing `bbs-tui`'s [`ImageSlot`]s with `bbs-runtime-term`'s
-/// `MediaRenderer`, `MediaDecoderPool`, `GifAnimationPlayer`, `ResizeDebouncer`, and `PtyBandwidthGovernor`.
+/// `MediaRenderer`, `MediaDecoderPool`, off-thread `MediaEncoderPool`, `GifAnimationPlayer`,
+/// `ScrollProxyDebouncer`, and `PtyBandwidthGovernor`.
 struct MediaCoordinator {
     renderer: MediaRenderer,
+    encoder: MediaEncoderPool,
+    encoded_rx: mpsc::UnboundedReceiver<RenderedMediaFrame>,
     pool: Arc<MediaDecoderPool>,
     pacer: FramePacer,
     governor: PtyBandwidthGovernor,
     scroll_proxy: ScrollProxyDebouncer,
     players: HashMap<String, GifAnimationPlayer>,
-    encoded: HashMap<(String, usize, u16, u16, bool), RenderedMedia>,
+    encoded: HashMap<EncodedCacheKey, CachedEncodedFrame>,
     in_flight: HashSet<String>,
-    decoded_tx: mpsc::UnboundedSender<(String, Option<Arc<DecodedMedia>>)>,
-    decoded_rx: mpsc::UnboundedReceiver<(String, Option<Arc<DecodedMedia>>)>,
-    last_slots: Vec<ImageSlot>,
-    dirty: bool,
+    failed_urls: HashMap<String, Instant>,
+    decoded_tx: mpsc::UnboundedSender<DecodedOutcome>,
+    decoded_rx: mpsc::UnboundedReceiver<DecodedOutcome>,
+    last_slot_geom: Vec<(String, Rect, Rect)>,
+    cell_px: (u16, u16),
+    charset: ResolvedCharset,
+    tmux_passthrough: bool,
 }
 
 impl MediaCoordinator {
     fn new(report: &ProbeReport) -> Self {
         let (decoded_tx, decoded_rx) = mpsc::unbounded_channel();
+        let (encoder, encoded_rx) = MediaEncoderPool::from_probe(report);
         Self {
             renderer: MediaRenderer::from_probe(report),
+            encoder,
+            encoded_rx,
             pool: Arc::new(MediaDecoderPool::with_defaults()),
             pacer: FramePacer::from_capabilities(&report.capabilities),
             governor: PtyBandwidthGovernor::for_session(report.capabilities.over_ssh),
@@ -63,17 +92,45 @@ impl MediaCoordinator {
             players: HashMap::new(),
             encoded: HashMap::new(),
             in_flight: HashSet::new(),
+            failed_urls: HashMap::new(),
             decoded_tx,
             decoded_rx,
-            last_slots: Vec::new(),
-            dirty: false,
+            last_slot_geom: Vec::new(),
+            cell_px: (report.cell_pixels.0.max(1), report.cell_pixels.1.max(1)),
+            charset: report.resolved_charset,
+            tmux_passthrough: report.tmux_passthrough_active,
         }
+    }
+
+    fn uses_halfblock_images(&self) -> bool {
+        self.renderer.tier() == GraphicsTier::HalfBlock
+    }
+
+    fn set_cell_pixels(&mut self, cell_px: (u16, u16)) {
+        self.cell_px = (cell_px.0.max(1), cell_px.1.max(1));
+        self.renderer.set_cell_pixels(self.cell_px);
     }
 
     fn clear_encoded(&mut self) {
         self.encoded.clear();
+        self.encoder.clear_in_flight();
         self.in_flight.clear();
-        self.dirty = true;
+    }
+
+    fn scroll_settle_deadline(&self, now: Instant) -> Option<Instant> {
+        if self.scroll_proxy.should_use_proxy(self.renderer.tier(), now) {
+            self.scroll_proxy.settle_deadline()
+        } else {
+            None
+        }
+    }
+
+    fn evict_keys(&mut self, evicted: &[String], app: &mut App) {
+        for key in evicted {
+            app.images.remove(key);
+            self.players.remove(key);
+            self.encoded.retain(|(k, _, _, _, _), _| k != key);
+        }
     }
 
     fn ingest_video_frame(&mut self, frame: &bbs_core::VideoFrame, app: &mut App) {
@@ -85,7 +142,9 @@ impl MediaCoordinator {
         };
         // Key MUST match raw `frame.stream_key` emitted by `bbs-tui/src/panes.rs` Stage `ImageSlot`.
         let key = frame.stream_key.clone();
-        app.images.insert(key.clone(), rgba.clone());
+        if self.uses_halfblock_images() {
+            app.images.insert(key.clone(), rgba.clone());
+        }
         let decoded = DecodedMedia::from_rgba_frames(
             key.clone(),
             Some(format!("{}.rgba", frame.stream_key)),
@@ -93,29 +152,82 @@ impl MediaCoordinator {
             frame.height,
             vec![rgba],
         );
-        let _ = self.pool.insert_cached(Arc::new(decoded));
+        let outcome = self.pool.insert_cached(Arc::new(decoded));
+        self.evict_keys(&outcome.evicted_keys, app);
         self.encoded.retain(|(k, _, _, _, _), _| k != &key);
-        self.dirty = true;
+    }
+
+    fn apply_decoded_outcome(&mut self, outcome: DecodedOutcome, app: &mut App) -> bool {
+        let (key, maybe_media, evicted) = outcome;
+        self.in_flight.remove(&key);
+        self.evict_keys(&evicted, app);
+
+        let Some(media) = maybe_media else {
+            self.failed_urls.insert(key, Instant::now());
+            return false;
+        };
+        self.failed_urls.remove(&key);
+        if self.uses_halfblock_images()
+            && let Some(first) = media.frame(0)
+        {
+            app.images.insert(key.clone(), first.clone());
+        }
+        if media.is_animated {
+            self.players.insert(
+                key.clone(),
+                GifAnimationPlayer::new(Arc::clone(&media), false),
+            );
+        } else {
+            self.players.remove(&key);
+        }
+        let insert_outcome = self.pool.insert_cached(media);
+        self.evict_keys(&insert_outcome.evicted_keys, app);
+        self.encoded.retain(|(k, _, _, _, _), _| k != &key);
+        true
     }
 
     fn ingest_decoded(&mut self, app: &mut App) -> bool {
         let mut changed = false;
-        while let Ok((key, maybe_media)) = self.decoded_rx.try_recv() {
-            self.in_flight.remove(&key);
-            let Some(media) = maybe_media else {
-                continue;
-            };
-            if let Some(first) = media.frame(0) {
-                app.images.insert(key.clone(), first.clone());
+        while let Ok(outcome) = self.decoded_rx.try_recv() {
+            if self.apply_decoded_outcome(outcome, app) {
+                changed = true;
             }
-            if media.is_animated {
-                self.players.insert(
-                    key.clone(),
-                    GifAnimationPlayer::new(Arc::clone(&media), false),
-                );
-            }
-            let _ = self.pool.insert_cached(media);
-            self.encoded.retain(|(k, _, _, _, _), _| k != &key);
+        }
+        changed
+    }
+
+    fn apply_encoded_frame(&mut self, frame: RenderedMediaFrame) {
+        let Some((url, idx_str)) = frame.key.rsplit_once('\0') else {
+            return;
+        };
+        let Ok(frame_idx) = idx_str.parse::<usize>() else {
+            return;
+        };
+        if self.encoded.len() >= MAX_ENCODED_FRAMES {
+            self.encoded.clear();
+        }
+        let cache_key = (
+            url.to_string(),
+            frame_idx,
+            frame.width_cells,
+            frame.height_cells,
+            frame.tier,
+        );
+        // Cache BEFORE checking `PtyBandwidthGovernor` so throttled frames are never re-encoded at 10 Hz.
+        self.encoded.insert(
+            cache_key,
+            CachedEncodedFrame {
+                media: frame.media,
+                is_animated: frame.is_animated,
+                emitted: false,
+            },
+        );
+    }
+
+    fn ingest_encoded(&mut self) -> bool {
+        let mut changed = false;
+        while let Ok(frame) = self.encoded_rx.try_recv() {
+            self.apply_encoded_frame(frame);
             changed = true;
         }
         changed
@@ -126,7 +238,9 @@ impl MediaCoordinator {
             if let Some(ref frames) = item.preview_rgba_frames
                 && !frames.is_empty()
             {
-                app.images.insert(item.preview_url.clone(), frames[0].clone());
+                if self.uses_halfblock_images() {
+                    app.images.insert(item.preview_url.clone(), frames[0].clone());
+                }
                 let decoded = DecodedMedia::from_rgba_frames(
                     item.preview_url.clone(),
                     Some(format!("{}.gif", item.id)),
@@ -135,7 +249,8 @@ impl MediaCoordinator {
                     frames.clone(),
                 );
                 let arc = Arc::new(decoded);
-                let _ = self.pool.insert_cached(Arc::clone(&arc));
+                let outcome = self.pool.insert_cached(Arc::clone(&arc));
+                self.evict_keys(&outcome.evicted_keys, app);
                 if arc.is_animated {
                     self.players.insert(
                         item.preview_url.clone(),
@@ -152,13 +267,20 @@ impl MediaCoordinator {
         services: &RuntimeServices,
         app: &mut App,
     ) {
+        let now = Instant::now();
+        self.failed_urls
+            .retain(|_, failed_at| now.saturating_duration_since(*failed_at) < FAILED_URL_COOLDOWN);
+
         for slot in slots {
             // Inline video stream keys (e.g. `guild:...` / `call:...`) are populated directly by
             // `ingest_video_frame` and must never be HTTP-fetched or replaced with mock previews.
             if !slot.url.starts_with("http://") && !slot.url.starts_with("https://") {
                 continue;
             }
-            if self.pool.get_cached(&slot.url).is_some() || self.in_flight.contains(&slot.url) {
+            if self.pool.get_cached(&slot.url).is_some()
+                || self.in_flight.contains(&slot.url)
+                || self.failed_urls.contains_key(&slot.url)
+            {
                 continue;
             }
             self.in_flight.insert(slot.url.clone());
@@ -170,6 +292,7 @@ impl MediaCoordinator {
                 let url = slot.url.clone();
                 tokio::spawn(async move {
                     let mut result: Option<Arc<DecodedMedia>> = None;
+                    let mut evicted: Vec<String> = Vec::new();
                     if let Ok((bytes, _)) = rest.fetch_attachment_bytes(&url).await {
                         let name = url
                             .rsplit('/')
@@ -179,19 +302,22 @@ impl MediaCoordinator {
                             .next()
                             .unwrap_or("image.bin")
                             .to_string();
-                        if let Ok((decoded, _evicted)) =
+                        if let Ok((decoded, ev)) =
                             pool.decode_and_cache(url.clone(), bytes, Some(name)).await
                         {
                             result = Some(decoded);
+                            evicted = ev;
                         }
                     }
-                    // Always notify completion so failed fetches release `in_flight` cleanly.
-                    let _ = tx.send((url, result));
+                    // Always notify completion so failed fetches release `in_flight` and enter cooldown.
+                    let _ = tx.send((url, result, evicted));
                 });
             } else {
                 // Offline mock mode: synthesize a crisp deterministic preview frame so pixel tiers render offline.
                 let frame = synthesize_mock_preview_frame(&slot.url, 32, 24);
-                app.images.insert(slot.url.clone(), frame.clone());
+                if self.uses_halfblock_images() {
+                    app.images.insert(slot.url.clone(), frame.clone());
+                }
                 let decoded = DecodedMedia::from_rgba_frames(
                     slot.url.clone(),
                     Some("mock-preview.png".to_string()),
@@ -199,7 +325,8 @@ impl MediaCoordinator {
                     frame.height,
                     vec![frame],
                 );
-                let _ = self.pool.insert_cached(Arc::new(decoded));
+                let outcome = self.pool.insert_cached(Arc::new(decoded));
+                self.evict_keys(&outcome.evicted_keys, app);
                 self.in_flight.remove(&slot.url);
             }
         }
@@ -207,14 +334,14 @@ impl MediaCoordinator {
 
     fn tick_animations(&mut self, slots: &[ImageSlot], app: &mut App, now: Instant) -> bool {
         let mut any_changed = false;
+        let halfblock = self.uses_halfblock_images();
         for slot in slots {
-            if !slot.animated {
-                continue;
-            }
+            // Tick ANY visible slot that decoded with animation frames (GIF or animated WebP),
+            // even if the slot's URL lacked a `.gif` suffix.
             if let Some(player) = self.players.get_mut(&slot.url) {
                 player.set_focused(slot.focused);
                 if player.tick(now, &self.pacer).is_some() {
-                    if let Some(frame) = player.current_frame() {
+                    if halfblock && let Some(frame) = player.current_frame() {
                         app.images.insert(slot.url.clone(), frame.clone());
                     }
                     any_changed = true;
@@ -238,14 +365,25 @@ impl MediaCoordinator {
             return;
         }
 
-        if slots != self.last_slots.as_slice() {
+        // Compare ONLY geometry `(url, rect, visible)` — NOT `focused` — so moving selection
+        // never triggers a spurious 150 ms HalfBlock scroll-proxy flash.
+        let current_geom: Vec<(String, Rect, Rect)> = slots
+            .iter()
+            .map(|s| (s.url.clone(), s.rect, s.visible))
+            .collect();
+        if current_geom != self.last_slot_geom {
             self.scroll_proxy.on_scroll(now);
-            self.last_slots = slots.to_vec();
+            self.last_slot_geom = current_geom;
         }
         let use_proxy = is_resizing
             || self
                 .scroll_proxy
                 .should_use_proxy(self.renderer.tier(), now);
+        let target_tier = if use_proxy {
+            GraphicsTier::HalfBlock
+        } else {
+            self.renderer.tier()
+        };
 
         for slot in slots {
             if slot.visible.width == 0 || slot.visible.height == 0 {
@@ -258,43 +396,55 @@ impl MediaCoordinator {
                 .players
                 .get(&slot.url)
                 .map_or(0, GifAnimationPlayer::frame_index);
-            let key = (
+            let key: EncodedCacheKey = (
                 slot.url.clone(),
                 frame_idx,
                 slot.visible.width,
                 slot.visible.height,
-                use_proxy,
+                target_tier,
             );
 
-            if !self.encoded.contains_key(&key) {
-                let rendered = if use_proxy {
-                    self.renderer.render_halfblock_proxy(
-                        &media,
-                        frame_idx,
-                        slot.visible.width,
-                        slot.visible.height,
-                        MediaFitMode::Contain,
-                    )
-                } else {
-                    self.renderer.render_frame(
-                        &media,
-                        frame_idx,
-                        slot.visible.width,
-                        slot.visible.height,
-                        MediaFitMode::Contain,
-                    )
-                };
-                if let Ok(item) = rendered {
-                    let est = item.estimated_pty_bytes();
-                    if self.governor.can_emit(est, now) {
+            if let Some(entry) = self.encoded.get_mut(&key) {
+                if !entry.emitted {
+                    let est = entry.media.estimated_pty_bytes();
+                    if self.governor.can_emit_for(est, entry.is_animated, now) {
                         self.governor.record_emitted(est, now);
-                        self.encoded.insert(key.clone(), item);
+                        entry.emitted = true;
                     }
                 }
+                if entry.emitted {
+                    let widget = MediaWidget::new(&entry.media);
+                    ratatui::widgets::Widget::render(widget, slot.visible, buf);
+                    continue;
+                }
+            } else if let Some(rgba) = media.frame(frame_idx) {
+                // Enqueue off-main-thread encoding via `MediaEncoderPool` (deduplicated per
+                // `(job_key, width, height, tier)` so `terminal.draw` never stalls).
+                let stable_job_key = format!("{}\0{frame_idx}", slot.url);
+                let mut req = MediaEncodeRequest::new(
+                    stable_job_key,
+                    Arc::new(rgba.clone()),
+                    slot.visible.width,
+                    slot.visible.height,
+                    target_tier,
+                    self.cell_px,
+                );
+                req.fit = MediaFitMode::Contain;
+                req.charset = self.charset;
+                req.tmux_passthrough = self.tmux_passthrough;
+                req.title = media.title.clone();
+                req.is_animated = media.is_animated;
+
+                let _ = self.encoder.enqueue_request(req);
             }
 
-            if let Some(rendered) = self.encoded.get(&key) {
-                let widget = MediaWidget::new(rendered);
+            // While the requested frame is encoding off-thread or waiting for the animation
+            // bandwidth budget, keep drawing the latest already-emitted frame for this slot size
+            // to avoid flicker.
+            if let Some((_, fallback)) = self.encoded.iter().find(|((u, _, w, h, _), v)| {
+                u == &slot.url && *w == slot.visible.width && *h == slot.visible.height && v.emitted
+            }) {
+                let widget = MediaWidget::new(&fallback.media);
                 ratatui::widgets::Widget::render(widget, slot.visible, buf);
             }
         }
@@ -441,7 +591,11 @@ pub async fn run_interactive(
     let tui_cfg = build_tui_config(&probe_report, &env, &app_cfg, cli);
 
     // 3. Enter RAII TtyGuard and subscribe to POSIX signals (`SIGWINCH`, `SIGCONT`, `SIGTERM`, `SIGHUP`).
-    let guard_cfg = TtyGuardConfig::from_probe(&probe_report);
+    let mut guard_cfg = TtyGuardConfig::from_probe(&probe_report);
+    guard_cfg.enable_mouse = guard_cfg.enable_mouse
+        && tui_cfg.charset != ResolvedCharset::Ascii7Bit
+        && probe_report.capabilities.geometry.cols >= 24
+        && probe_report.capabilities.geometry.rows > 4;
     let mut tty_guard =
         TtyGuard::enter(guard_cfg).context("failed to initialize raw terminal guard")?;
     #[cfg(unix)]
@@ -485,6 +639,7 @@ pub async fn run_interactive(
     let theme_dirs = ThemeDirs::from_env();
     let catalog = ThemeCatalog::discover(&theme_dirs);
     let mut app = App::new(tui_cfg.clone());
+    app.utc_offset_min = detect_local_utc_offset_minutes();
     app.show_sidebar = app_cfg.show_sidebar;
     app.show_members = app_cfg.show_members;
     app.theme_dirs = theme_dirs;
@@ -498,11 +653,13 @@ pub async fn run_interactive(
     let mut term_events = EventStream::new();
     let mut tick_interval = tokio::time::interval(Duration::from_millis(100));
     let mut tick_count = 0u64;
+    let mut ptt_held = false;
     let mut should_quit = false;
 
     while !should_quit {
         let now = Instant::now();
         media.ingest_decoded(&mut app);
+        media.ingest_encoded();
 
         // Emit frame wrapped in DEC Mode 2026 synchronized output when supported.
         if sync_output {
@@ -539,9 +696,21 @@ pub async fn run_interactive(
         }
 
         let mut effects: Vec<Effect> = Vec::new();
-        let debounce_sleep = async {
-            match debouncer.next_deadline() {
-                Some(deadline) => tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await,
+        let debounce_deadline = debouncer.next_deadline();
+        let debounce_sleep = async move {
+            match debounce_deadline {
+                Some(deadline) => {
+                    tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        };
+        let scroll_settle_deadline = media.scroll_settle_deadline(Instant::now());
+        let scroll_settle_sleep = async move {
+            match scroll_settle_deadline {
+                Some(deadline) => {
+                    tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+                }
                 None => std::future::pending::<()>().await,
             }
         };
@@ -552,6 +721,10 @@ pub async fn run_interactive(
             maybe_sig = signal_rx.recv() => {
                 match maybe_sig {
                     Some(TerminalSignal::Resize(geom)) => {
+                        if let Some(px) = geom.cell_pixels() {
+                            app.cfg.cell_px = px;
+                            media.set_cell_pixels(px);
+                        }
                         debouncer.on_resize_now(geom);
                         effects.extend(app.handle_resize(geom.cols, geom.rows));
                     }
@@ -575,33 +748,34 @@ pub async fn run_interactive(
             maybe_term = term_events.next() => {
                 match maybe_term {
                     Some(Ok(Event::Key(raw_key))) => {
-                        let key = normalize_key_event(raw_key);
-                        // Optional Shift-free clipboard / URL convenience chords in NORMAL mode:
-                        if key.kind != KeyEventKind::Release
-                            && key.modifiers.contains(KeyModifiers::ALT)
-                            && key.code == KeyCode::Char('y')
-                            && let Some(msg_text) = selected_message_text(&app)
-                        {
-                            let _ = copy_to_clipboard(&msg_text, osc52);
-                        } else if key.kind != KeyEventKind::Release
-                            && key.modifiers.contains(KeyModifiers::ALT)
-                            && key.code == KeyCode::Char('o')
-                            && let Some(url) = selected_message_url(&app)
-                        {
-                            let _ = open_external_url(&url);
-                        } else {
-                            effects.extend(app.handle_key(key));
-                        }
+                        handle_interactive_key(
+                            raw_key,
+                            &mut app,
+                            &app_cfg,
+                            &services,
+                            &mut ptt_held,
+                            osc52,
+                            &mut effects,
+                        );
+                    }
+                    Some(Ok(Event::Mouse(mouse_ev))) => {
+                        effects.extend(app.handle_mouse(mouse_ev));
                     }
                     Some(Ok(Event::Paste(text))) => {
                         effects.extend(app.handle_paste(&text));
+                    }
+                    Some(Ok(Event::FocusLost)) => {
+                        if ptt_held {
+                            ptt_held = false;
+                            services.set_ptt_active(false);
+                        }
                     }
                     Some(Ok(Event::Resize(cols, rows))) => {
                         let geom = query_stdout_winsize()
                             .unwrap_or_else(|| ViewportGeometry::new(cols, rows));
                         if let Some(px) = geom.cell_pixels() {
                             app.cfg.cell_px = px;
-                            media.renderer.set_cell_pixels(px);
+                            media.set_cell_pixels(px);
                         }
                         debouncer.on_resize_now(geom);
                         effects.extend(app.handle_resize(cols, rows));
@@ -626,14 +800,26 @@ pub async fn run_interactive(
                     effects.extend(app.handle_event(ev));
                 }
             }
+            maybe_decoded = media.decoded_rx.recv() => {
+                if let Some(outcome) = maybe_decoded {
+                    let _ = media.apply_decoded_outcome(outcome, &mut app);
+                }
+            }
+            maybe_encoded = media.encoded_rx.recv() => {
+                if let Some(frame) = maybe_encoded {
+                    media.apply_encoded_frame(frame);
+                }
+            }
             () = debounce_sleep => {
                 if let Some(settled) = debouncer.poll_settled_now() {
                     if let Some(px) = settled.geometry.cell_pixels() {
-                        media.renderer.set_cell_pixels(px);
+                        app.cfg.cell_px = px;
+                        media.set_cell_pixels(px);
                     }
                     media.clear_encoded();
                 }
             }
+            () = scroll_settle_sleep => {}
             _ = tick_interval.tick() => {
                 tick_count = tick_count.saturating_add(1);
                 let now_tick = Instant::now();
@@ -663,10 +849,27 @@ pub async fn run_interactive(
             maybe_term = term_events.next() => {
                 match maybe_term {
                     Some(Ok(Event::Key(raw_key))) => {
-                        effects.extend(app.handle_key(normalize_key_event(raw_key)));
+                        handle_interactive_key(
+                            raw_key,
+                            &mut app,
+                            &app_cfg,
+                            &services,
+                            &mut ptt_held,
+                            osc52,
+                            &mut effects,
+                        );
+                    }
+                    Some(Ok(Event::Mouse(mouse_ev))) => {
+                        effects.extend(app.handle_mouse(mouse_ev));
                     }
                     Some(Ok(Event::Paste(text))) => {
                         effects.extend(app.handle_paste(&text));
+                    }
+                    Some(Ok(Event::FocusLost)) => {
+                        if ptt_held {
+                            ptt_held = false;
+                            services.set_ptt_active(false);
+                        }
                     }
                     Some(Ok(Event::Resize(cols, rows))) => {
                         let geom = ViewportGeometry::new(cols, rows);
@@ -681,10 +884,26 @@ pub async fn run_interactive(
             }
             maybe_ev = backend_rx.recv() => {
                 if let Some(ev) = maybe_ev {
-                    if let BackendEvent::VideoFrameReceived(ref frame) = ev {
-                        media.ingest_video_frame(frame, &mut app);
+                    match &ev {
+                        BackendEvent::VideoFrameReceived(frame) => {
+                            media.ingest_video_frame(frame, &mut app);
+                        }
+                        BackendEvent::GifSearchResults { page, .. } => {
+                            media.sync_mock_gif_frames(page, &mut app);
+                        }
+                        _ => {}
                     }
                     effects.extend(app.handle_event(ev));
+                }
+            }
+            maybe_decoded = media.decoded_rx.recv() => {
+                if let Some(outcome) = maybe_decoded {
+                    let _ = media.apply_decoded_outcome(outcome, &mut app);
+                }
+            }
+            maybe_encoded = media.encoded_rx.recv() => {
+                if let Some(frame) = maybe_encoded {
+                    media.apply_encoded_frame(frame);
                 }
             }
             () = debounce_sleep => {
@@ -692,11 +911,21 @@ pub async fn run_interactive(
                     media.clear_encoded();
                 }
             }
+            () = scroll_settle_sleep => {}
             _ = tick_interval.tick() => {
                 tick_count = tick_count.saturating_add(1);
+                let now_tick = Instant::now();
                 effects.extend(app.tick(current_unix_ms()));
+                let slots = app.image_slots().to_vec();
+                let _ = media.tick_animations(&slots, &mut app, now_tick);
             }
         }
+
+        if ptt_held && app.store.voice.is_none() {
+            ptt_held = false;
+            services.set_ptt_active(false);
+        }
+        drain_platform_requests(&mut app, osc52);
 
         // Execute returned TUI Effects.
         for effect in effects {
@@ -763,6 +992,94 @@ pub async fn run_interactive(
     drop(terminal);
     let _ = tty_guard.restore();
     Ok(())
+}
+
+fn handle_interactive_key(
+    raw_key: crossterm::event::KeyEvent,
+    app: &mut App,
+    app_cfg: &AppConfig,
+    services: &RuntimeServices,
+    ptt_held: &mut bool,
+    osc52: bool,
+    effects: &mut Vec<Effect>,
+) {
+    let key = normalize_key_event(raw_key);
+    let ptt_enabled = app_cfg.voice.resolved_input_mode() == InputMode::PushToTalk;
+
+    if ptt_enabled
+        && matches_ptt_key(key.code, &app_cfg.voice.ptt_key)
+        && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
+    {
+        if key.kind == KeyEventKind::Release {
+            if *ptt_held {
+                *ptt_held = false;
+                services.set_ptt_active(false);
+            }
+            return;
+        }
+        let allow_intercept = matches!(key.code, KeyCode::F(_))
+            || (app.mode == Mode::Normal && !app.has_modal());
+        if allow_intercept && app.store.voice.is_some() {
+            if !*ptt_held {
+                *ptt_held = true;
+                services.set_ptt_active(true);
+            }
+            return;
+        }
+    }
+
+    // Optional Shift-free clipboard / URL convenience chords in NORMAL mode:
+    if key.kind != KeyEventKind::Release
+        && key.modifiers.contains(KeyModifiers::ALT)
+        && key.code == KeyCode::Char('y')
+        && let Some(msg_text) = selected_message_text(app)
+    {
+        let _ = copy_to_clipboard(&msg_text, osc52);
+    } else if key.kind != KeyEventKind::Release
+        && key.modifiers.contains(KeyModifiers::ALT)
+        && key.code == KeyCode::Char('o')
+        && let Some(url) = selected_message_url(app)
+    {
+        let _ = open_external_url(&url);
+    } else {
+        effects.extend(app.handle_key(key));
+    }
+}
+
+fn drain_platform_requests(app: &mut App, osc52: bool) {
+    while let Some(url) = app.take_open_url() {
+        let _ = open_external_url(&url);
+    }
+    while let Some(text) = app.take_copy_text() {
+        let _ = copy_to_clipboard(&text, osc52);
+    }
+}
+
+fn matches_ptt_key(code: KeyCode, ptt_key: &str) -> bool {
+    let spec = ptt_key.trim();
+    if spec.is_empty() {
+        return false;
+    }
+    if spec.eq_ignore_ascii_case("space") {
+        return code == KeyCode::Char(' ');
+    }
+    if spec.eq_ignore_ascii_case("tab") {
+        return code == KeyCode::Tab;
+    }
+    if spec.eq_ignore_ascii_case("enter") {
+        return code == KeyCode::Enter;
+    }
+    if let Some(rest) = spec.strip_prefix('f').or_else(|| spec.strip_prefix('F'))
+        && let Ok(n) = rest.parse::<u8>()
+        && (1..=24).contains(&n)
+    {
+        return code == KeyCode::F(n);
+    }
+    let mut chars = spec.chars();
+    if let (Some(ch), None) = (chars.next(), chars.next()) {
+        return matches!(code, KeyCode::Char(c) if c.eq_ignore_ascii_case(&ch));
+    }
+    false
 }
 
 fn selected_message_text(app: &App) -> Option<String> {
@@ -941,6 +1258,7 @@ pub async fn run_headless_smoke(cli: &Cli, app_cfg: &AppConfig) -> Result<SmokeS
         drain_events(&mut app, &mut media, &mut backend_rx);
         let _ = app.tick(1_700_000_000_000 + (idx as u64) * 150);
         media.ingest_decoded(&mut app);
+        media.ingest_encoded();
 
         let mut terminal = Terminal::new(TestBackend::new(cols, rows))
             .context("failed to construct TestBackend for headless smoke")?;
@@ -999,7 +1317,11 @@ mod tests {
     #[tokio::test]
     async fn video_frame_key_matches_stream_slot_and_skips_http_fetch() {
         let env = TerminalEnv::default();
-        let opts = ProbeOptions::default();
+        let opts = ProbeOptions {
+            charset_override: CharsetMode::Utf8,
+            graphics_override: Some(GraphicsTier::HalfBlock),
+            ..ProbeOptions::default()
+        };
         let report = negotiate_capabilities(
             &env,
             ViewportGeometry::new(80, 24),
@@ -1010,6 +1332,7 @@ mod tests {
             true,
         );
         let mut media = MediaCoordinator::new(&report);
+        assert_eq!(media.renderer.tier(), GraphicsTier::HalfBlock);
         let mut app = App::new(TuiConfig::default());
         let (mut services, _rx) = RuntimeServices::build_mock();
 
@@ -1033,14 +1356,91 @@ mod tests {
         assert!(media.pool.get_cached(mock_ids::STREAM_GROUP_DM).is_some());
         assert!(app.images.contains_key(mock_ids::STREAM_GROUP_DM));
 
-        // Failed async decode notifies `(url, None)` and clears `in_flight`.
+        // Failed async decode notifies `(url, None, evicted)`, clears `in_flight`, and enters 60s cooldown.
         let failed_url = "https://example.invalid/broken.png".to_string();
         media.in_flight.insert(failed_url.clone());
-        media.decoded_tx.send((failed_url.clone(), None)).unwrap();
+        media
+            .decoded_tx
+            .send((failed_url.clone(), None, Vec::new()))
+            .unwrap();
         assert!(!media.ingest_decoded(&mut app));
+        assert!(!media.in_flight.contains(&failed_url));
+        assert!(media.failed_urls.contains_key(&failed_url));
+
+        // Subsequent slot request during cooldown MUST NOT re-enter `in_flight`.
+        let failed_slot = ImageSlot {
+            url: failed_url.clone(),
+            rect: Rect::new(0, 0, 10, 5),
+            visible: Rect::new(0, 0, 10, 5),
+            clip_top: 0,
+            animated: false,
+            focused: false,
+        };
+        media.request_missing_slots(&[failed_slot], &services, &mut app);
         assert!(!media.in_flight.contains(&failed_url));
 
         services.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn kitty_tier_skips_halfblock_app_images_and_ignores_focus_changes_for_scroll_proxy() {
+        let env = TerminalEnv::default();
+        let opts = ProbeOptions {
+            charset_override: CharsetMode::Utf8,
+            graphics_override: Some(GraphicsTier::KittyPlaceholder),
+            ..ProbeOptions::default()
+        };
+        let report = negotiate_capabilities(
+            &env,
+            ViewportGeometry::new(80, 24),
+            bbs_runtime_term::GeometrySource::CliOverride,
+            &bbs_runtime_term::ProbeResponse::default(),
+            &opts,
+            false,
+            true,
+        );
+        let mut media = MediaCoordinator::new(&report);
+        assert_eq!(media.renderer.tier(), GraphicsTier::KittyPlaceholder);
+        let mut app = App::new(TuiConfig::default());
+
+        let frame: VideoFrame =
+            MockVideoStreamEngine::generate_test_card_frame(mock_ids::STREAM_GROUP_DM, 1, 32, 18);
+        media.ingest_video_frame(&frame, &mut app);
+        // Pixel tiers rely on MediaDecoderPool + MediaEncoderPool, not duplicated HalfBlock app.images.
+        assert!(media.pool.get_cached(mock_ids::STREAM_GROUP_DM).is_some());
+        assert!(!app.images.contains_key(mock_ids::STREAM_GROUP_DM));
+
+        // First render establishes slot geometry; after settle, toggling `focused` must NOT re-trigger scroll proxy.
+        let mut buf = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 80, 24));
+        let t0 = Instant::now();
+        let slot_unfocused = ImageSlot {
+            url: mock_ids::STREAM_GROUP_DM.to_string(),
+            rect: Rect::new(2, 2, 20, 10),
+            visible: Rect::new(2, 2, 20, 10),
+            clip_top: 0,
+            animated: true,
+            focused: false,
+        };
+        media.overlay_pixel_slots(std::slice::from_ref(&slot_unfocused), &mut buf, false, t0);
+        let t_settled = t0 + Duration::from_millis(500);
+        assert!(media.scroll_settle_deadline(t_settled).is_none());
+
+        let mut slot_focused = slot_unfocused;
+        slot_focused.focused = true;
+        media.overlay_pixel_slots(&[slot_focused], &mut buf, false, t_settled);
+        assert!(media.scroll_settle_deadline(t_settled).is_none());
+    }
+
+    #[test]
+    fn matches_ptt_key_handles_chars_fkeys_and_specials() {
+        assert!(matches_ptt_key(KeyCode::Char('v'), "v"));
+        assert!(matches_ptt_key(KeyCode::Char('V'), "v"));
+        assert!(matches_ptt_key(KeyCode::Char(' '), "space"));
+        assert!(matches_ptt_key(KeyCode::Tab, "TAB"));
+        assert!(matches_ptt_key(KeyCode::F(12), "f12"));
+        assert!(matches_ptt_key(KeyCode::F(4), "F4"));
+        assert!(!matches_ptt_key(KeyCode::Char('x'), "v"));
+        assert!(!matches_ptt_key(KeyCode::F(4), ""));
     }
 
     #[test]
