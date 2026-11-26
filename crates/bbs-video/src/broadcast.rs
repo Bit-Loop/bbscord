@@ -364,6 +364,7 @@ impl BroadcastPipeline {
             .map_err(|err| CoreError::Video(format!("failed to create videoscale: {err}")))?;
         let videorate = gst::ElementFactory::make("videorate")
             .name("broadcast_videorate")
+            .property("skip-to-first", true)
             .build()
             .map_err(|err| CoreError::Video(format!("failed to create videorate: {err}")))?;
         let raw_capsfilter = gst::ElementFactory::make("capsfilter")

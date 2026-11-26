@@ -791,6 +791,8 @@ fn build_sink_branch(
         VideoSinkKind::InlineTerminal => {
             let videorate = gst::ElementFactory::make("videorate")
                 .name("watch_inline_videorate")
+                .property("drop-only", true)
+                .property("skip-to-first", true)
                 .build()
                 .map_err(|err| CoreError::Video(format!("failed to create videorate: {err}")))?;
 
