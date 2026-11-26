@@ -9,9 +9,9 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use bbs_core::{
     Activity, ActivityKind, Attachment, Channel, ChannelKind, Embed, EmbedAuthor, EmbedField,
-    EmbedFooter, EmbedKind, EmbedMedia, EmbedProvider, Guild, GuildFolder, Message,
-    MessageReference, PollAnswerSummary, PollSummary, Presence, PresenceStatus, Reaction,
-    RefreshedAttachmentUrl, Snowflake, User, VoiceMessageMeta,
+    EmbedFooter, EmbedKind, EmbedMedia, EmbedProvider, Guild, GuildFolder, GuildMemberSummary,
+    Message, MessagePatch, MessageReference, PollAnswerSummary, PollSummary, Presence,
+    PresenceStatus, Reaction, RefreshedAttachmentUrl, Role, Snowflake, User, VoiceMessageMeta,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use url::Url;
@@ -116,6 +116,37 @@ impl From<WireUser> for User {
     }
 }
 
+/// Wire representation of a Discord guild role (`READY.guilds[].roles` or `GUILD_ROLE_*`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct WireRole {
+    /// Role Snowflake.
+    pub id: Snowflake,
+    /// Human-readable role name.
+    #[serde(default)]
+    pub name: String,
+    /// 24-bit RGB role color (`0` means uncolored / inherit default).
+    #[serde(default)]
+    pub color: u32,
+    /// Hierarchy position (higher values take precedence for member color resolution).
+    #[serde(default)]
+    pub position: i32,
+    /// Whether members with this role are hoisted into their own member-list section.
+    #[serde(default)]
+    pub hoist: bool,
+}
+
+impl From<WireRole> for Role {
+    fn from(wire: WireRole) -> Self {
+        Self {
+            id: wire.id,
+            name: wire.name,
+            color: wire.color,
+            position: wire.position,
+            hoist: wire.hoist,
+        }
+    }
+}
+
 /// Nested guild properties sent in modern Gateway v10 `READY` payloads.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct WireGuildProperties {
@@ -153,6 +184,12 @@ pub struct WireGuild {
     /// Nested properties object present in Gateway `READY` user payloads.
     #[serde(default)]
     pub properties: Option<WireGuildProperties>,
+    /// Guild roles embedded in Gateway `READY` / `GUILD_CREATE`.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub roles: Vec<WireRole>,
+    /// Initial guild members embedded in Gateway `READY` / `GUILD_CREATE` (when present).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub members: Vec<WireGuildMember>,
     /// Channels embedded in Gateway `READY` / `GUILD_CREATE`.
     #[serde(default, deserialize_with = "deserialize_null_default")]
     pub channels: Vec<WireChannel>,
@@ -180,6 +217,7 @@ impl WireGuild {
             .filter(|s| !s.is_empty());
         let owner_id = self.owner_id.or_else(|| props.and_then(|p| p.owner_id));
         let member_count = self.member_count.or(self.approximate_member_count);
+        let roles: Vec<Role> = self.roles.iter().cloned().map(Role::from).collect();
 
         Guild {
             id: self.id,
@@ -189,7 +227,7 @@ impl WireGuild {
             member_count,
             unread: false,
             mention_count: 0,
-            roles: Vec::new(),
+            roles,
             muted: false,
             suppress_everyone: false,
             suppress_roles: false,
@@ -784,6 +822,12 @@ pub struct WireMessage {
     /// Mentioned user objects.
     #[serde(default, deserialize_with = "deserialize_null_default")]
     pub mentions: Vec<WireUser>,
+    /// Mentioned role Snowflakes (`<@&role_id>`).
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub mention_roles: Vec<Snowflake>,
+    /// Optional guild member metadata for the message author (`nick`, `roles`).
+    #[serde(default)]
+    pub member: Option<WireGuildMember>,
     /// Optional reply reference.
     #[serde(default)]
     pub message_reference: Option<WireMessageReference>,
@@ -855,6 +899,14 @@ impl From<WireMessage> for Message {
             }
         });
 
+        let (author_nick, author_role_ids) = match wire.member {
+            Some(member) => (
+                member.nick.filter(|s| !s.is_empty()),
+                member.roles,
+            ),
+            None => (None, Vec::new()),
+        };
+
         Self {
             id: wire.id,
             channel_id: wire.channel_id,
@@ -873,9 +925,58 @@ impl From<WireMessage> for Message {
             poll: wire.poll.map(PollSummary::from),
             flags: wire.flags,
             nonce: wire.nonce,
-            author_nick: None,
-            author_role_ids: Vec::new(),
-            mention_roles: Vec::new(),
+            author_nick,
+            author_role_ids,
+            mention_roles: wire.mention_roles,
+        }
+    }
+}
+
+/// Wire representation of a partial `MESSAGE_UPDATE` payload (e.g. embed/GIFV unfurls where
+/// Discord omits `author`, `content`, or `attachments`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct WireMessagePatch {
+    /// Target message Snowflake.
+    pub id: Snowflake,
+    /// Target channel Snowflake.
+    pub channel_id: Snowflake,
+    /// Replacement message content when present.
+    #[serde(default)]
+    pub content: Option<String>,
+    /// Updated ISO-8601 edited timestamp when present.
+    #[serde(default)]
+    pub edited_timestamp: Option<String>,
+    /// Replacement embeds when present.
+    #[serde(default)]
+    pub embeds: Option<Vec<WireEmbed>>,
+    /// Replacement attachments when present.
+    #[serde(default)]
+    pub attachments: Option<Vec<WireAttachment>>,
+    /// Updated pinned flag when present.
+    #[serde(default)]
+    pub pinned: Option<bool>,
+    /// Replacement reactions when present.
+    #[serde(default)]
+    pub reactions: Option<Vec<WireReaction>>,
+}
+
+impl From<WireMessagePatch> for MessagePatch {
+    fn from(wire: WireMessagePatch) -> Self {
+        Self {
+            id: wire.id,
+            channel_id: wire.channel_id,
+            content: wire.content,
+            edited_timestamp: wire.edited_timestamp,
+            embeds: wire
+                .embeds
+                .map(|v| v.into_iter().map(Embed::from).collect()),
+            attachments: wire
+                .attachments
+                .map(|v| v.into_iter().map(Attachment::from).collect()),
+            pinned: wire.pinned,
+            reactions: wire
+                .reactions
+                .map(|v| v.into_iter().map(Reaction::from).collect()),
         }
     }
 }
@@ -1006,12 +1107,15 @@ pub struct WireVoiceState {
     pub member: Option<WireGuildMember>,
 }
 
-/// Partial guild member object nested inside voice states or typing events.
+/// Partial guild member object nested inside messages, voice states, typing, or member chunks.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct WireGuildMember {
     /// Optional guild nickname.
     #[serde(default)]
     pub nick: Option<String>,
+    /// Assigned guild role Snowflakes.
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    pub roles: Vec<Snowflake>,
     /// Optional user profile.
     #[serde(default)]
     pub user: Option<WireUser>,
@@ -1030,6 +1134,17 @@ impl WireGuildMember {
                 .filter(|s| !s.is_empty())
                 .unwrap_or(&u.username)
                 .to_owned()
+        })
+    }
+
+    /// Convert into a core [`GuildMemberSummary`] using `self.user.id` or `fallback_user_id`.
+    #[must_use]
+    pub fn to_member_summary(&self, fallback_user_id: Option<Snowflake>) -> Option<GuildMemberSummary> {
+        let user_id = self.user.as_ref().map(|u| u.id).or(fallback_user_id)?;
+        Some(GuildMemberSummary {
+            user_id,
+            nick: self.nick.clone().filter(|s| !s.is_empty()),
+            role_ids: self.roles.clone(),
         })
     }
 }

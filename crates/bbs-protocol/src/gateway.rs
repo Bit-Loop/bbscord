@@ -10,14 +10,14 @@
 //! - Outbound signaling commands: Op `4` (`UpdateVoiceState` for guild & DM/Group DM calls),
 //!   Op `14`/`37` (lazy guild subscriptions), and Op `18`/`19`/`20`/`22` (Go Live streams).
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::time::{Duration, Instant};
 
 use bbs_core::{
     BackendEvent, CallRingState, Channel, ChannelKind, ConnectionState, CoreError, CoreResult,
-    DaveSessionState, GuildFolder, Message, Reaction, SecretToken, Snowflake, StreamDescriptor,
-    User, VoiceChannelStatus, VoiceConnectionState, VoiceParticipant,
+    GuildFolder, GuildMemberSummary, Message, MessagePatch, Reaction, Role, SecretToken, Snowflake,
+    StreamDescriptor, User, VoiceParticipant,
 };
 use flate2::{Decompress, FlushDecompress, Status as FlateStatus};
 use futures::{SinkExt, StreamExt};
@@ -30,8 +30,8 @@ use zeroize::Zeroizing;
 
 use crate::fingerprint::{DISCORD_ORIGIN, DiscordFingerprint, IdentifyProperties};
 use crate::wire::{
-    WireChannel, WireEmoji, WireGuild, WireGuildFolder, WireGuildMember, WireMessage, WirePresence,
-    WireUser, WireVoiceState, deserialize_null_default,
+    WireChannel, WireEmoji, WireGuild, WireGuildFolder, WireGuildMember, WireMessage,
+    WireMessagePatch, WirePresence, WireRole, WireUser, WireVoiceState, deserialize_null_default,
 };
 
 /// Production Discord Gateway v10 WebSocket URL with streaming zlib compression.
@@ -60,6 +60,8 @@ pub mod opcodes {
     pub const RESUME: u8 = 6;
     /// Server -> Client reconnect request.
     pub const RECONNECT: u8 = 7;
+    /// Client -> Server request guild members (`GUILD_MEMBERS_CHUNK` response).
+    pub const REQUEST_GUILD_MEMBERS: u8 = 8;
     /// Server -> Client invalid session notice.
     pub const INVALID_SESSION: u8 = 9;
     /// Server -> Client hello with heartbeat interval.
@@ -279,6 +281,41 @@ pub enum GatewaySignalingEvent {
         /// Optional server reason.
         reason: Option<String>,
     },
+    /// Channel-scoped `CALL_CREATE` dispatch for a 1:1 DM or Group DM call.
+    CallCreate {
+        /// DM or Group DM channel Snowflake.
+        channel_id: Snowflake,
+        /// User IDs currently being rung.
+        ringing: Vec<Snowflake>,
+        /// Voice states already active in the call.
+        voice_states: Vec<WireVoiceState>,
+        /// Resolved caller user Snowflake when known.
+        caller_id: Option<Snowflake>,
+        /// Resolved caller display name when known.
+        caller_name: Option<String>,
+        /// Whether `channel_id` is a multi-user Group DM (`ChannelKind::GroupDm`).
+        is_group_dm: bool,
+    },
+    /// Channel-scoped `CALL_UPDATE` dispatch for a 1:1 DM or Group DM call.
+    CallUpdate {
+        /// DM or Group DM channel Snowflake.
+        channel_id: Snowflake,
+        /// User IDs currently being rung.
+        ringing: Vec<Snowflake>,
+        /// Voice states currently active in the call.
+        voice_states: Vec<WireVoiceState>,
+        /// Resolved caller user Snowflake when known.
+        caller_id: Option<Snowflake>,
+        /// Resolved caller display name when known.
+        caller_name: Option<String>,
+        /// Whether `channel_id` is a multi-user Group DM (`ChannelKind::GroupDm`).
+        is_group_dm: bool,
+    },
+    /// Channel-scoped `CALL_DELETE` dispatch indicating a DM/Group DM call ended.
+    CallDelete {
+        /// DM or Group DM channel Snowflake whose call ended.
+        channel_id: Snowflake,
+    },
 }
 
 /// Relationship summary captured from `READY.relationships`.
@@ -338,6 +375,17 @@ pub enum GatewayCommand {
         self_deaf: bool,
         /// Camera video enabled.
         self_video: bool,
+    },
+    /// Op `8`: Request guild member metadata (`GUILD_MEMBERS_CHUNK`) by query prefix or user IDs.
+    RequestGuildMembers {
+        /// Target guild Snowflake.
+        guild_id: Snowflake,
+        /// Optional username/nickname prefix query (used when `user_ids` is empty).
+        query: Option<String>,
+        /// Optional explicit list of user Snowflakes to fetch.
+        user_ids: Vec<Snowflake>,
+        /// Maximum members to return when querying by prefix (`0` = all / server cap).
+        limit: u32,
     },
     /// Op `14`: Single-guild lazy channel / member-list subscription.
     LazyRequest {
@@ -440,6 +488,21 @@ impl GatewayHandle {
             self_mute,
             self_deaf,
             self_video,
+        })
+    }
+
+    /// Send Op `8` (`REQUEST_GUILD_MEMBERS`) to resolve guild member nicknames and roles.
+    pub fn request_guild_members(
+        &self,
+        guild_id: Snowflake,
+        query: Option<String>,
+        user_ids: Vec<Snowflake>,
+    ) -> CoreResult<()> {
+        self.send(GatewayCommand::RequestGuildMembers {
+            guild_id,
+            query,
+            user_ids,
+            limit: 25,
         })
     }
 
@@ -574,6 +637,31 @@ pub fn serialize_gateway_command(cmd: &GatewayCommand) -> CoreResult<Option<Stri
                 "flags": 2
             }
         }),
+        GatewayCommand::RequestGuildMembers {
+            guild_id,
+            query,
+            user_ids,
+            limit,
+        } => {
+            let d = if !user_ids.is_empty() {
+                serde_json::json!({
+                    "guild_id": guild_id,
+                    "user_ids": user_ids,
+                    "presences": false
+                })
+            } else {
+                serde_json::json!({
+                    "guild_id": guild_id,
+                    "query": query.as_deref().unwrap_or(""),
+                    "limit": limit,
+                    "presences": false
+                })
+            };
+            serde_json::json!({
+                "op": opcodes::REQUEST_GUILD_MEMBERS,
+                "d": d
+            })
+        }
         GatewayCommand::LazyRequest { guild_id, payload } => {
             let mut d = serde_json::to_value(payload)
                 .map_err(|err| CoreError::Protocol(format!("serialize Op 14 payload: {err}")))?;
@@ -751,6 +839,14 @@ pub struct GatewaySessionState {
     pub voice_states: HashMap<Snowflake, HashMap<Snowflake, WireVoiceState>>,
     /// Active Go Live streams keyed by `stream_key`.
     pub active_streams: HashMap<String, StreamDescriptor>,
+    /// Cached guild roles keyed by guild Snowflake.
+    pub guild_roles: HashMap<Snowflake, Vec<Role>>,
+    /// Per-channel mute overrides tracked from `READY.user_guild_settings` and `USER_GUILD_SETTINGS_UPDATE`.
+    pub muted_channels: HashMap<Snowflake, bool>,
+    /// Active/ringing DM & Group DM calls tracked by `channel_id` so `CALL_DELETE` is channel-scoped.
+    pub active_calls: HashMap<Snowflake, CallRingState>,
+    /// Currently surfaced DM/Group DM call channel ID (for channel-scoped `CALL_DELETE` clearing).
+    pub active_call_channel: Option<Snowflake>,
 }
 
 impl GatewaySessionState {
@@ -877,9 +973,147 @@ impl GatewaySessionState {
                 }
             }
             "MESSAGE_UPDATE" => {
-                if let Ok(wire) = serde_json::from_value::<WireMessage>(data) {
-                    let msg = Message::from(wire);
-                    outcome.events.push(BackendEvent::MessageUpdated(msg));
+                // Discord sends partial `MESSAGE_UPDATE` dispatches (e.g., link/GIFV embed unfurls
+                // or pin toggles) omitting `author` and/or `content`. Route those to
+                // `MessagePatched` so cached author/content/attachments are never clobbered.
+                let is_full_message = data.get("author").is_some_and(|v| !v.is_null())
+                    && data.get("content").is_some_and(|v| !v.is_null());
+                if is_full_message {
+                    if let Ok(wire) = serde_json::from_value::<WireMessage>(data) {
+                        let msg = Message::from(wire);
+                        self.users_by_id.insert(msg.author.id, msg.author.clone());
+                        outcome.events.push(BackendEvent::MessageUpdated(msg));
+                    }
+                } else if let Ok(wire) = serde_json::from_value::<WireMessagePatch>(data) {
+                    outcome
+                        .events
+                        .push(BackendEvent::MessagePatched(MessagePatch::from(wire)));
+                }
+            }
+            "MESSAGE_ACK" => {
+                if let Ok(wire) = serde_json::from_value::<WireMessageAck>(data)
+                    && let Some(last_message_id) = wire.message_id
+                {
+                    let entry = ReadStateEntry {
+                        channel_id: wire.channel_id,
+                        last_message_id: Some(last_message_id),
+                        mention_count: wire.mention_count,
+                    };
+                    self.read_states.insert(wire.channel_id, entry);
+                    if let Some(ch) = self.channels_by_id.get_mut(&wire.channel_id) {
+                        ch.last_ack_message_id = Some(last_message_id);
+                        ch.mention_count = wire.mention_count;
+                        if ch
+                            .last_message_id
+                            .is_none_or(|last| last <= last_message_id)
+                        {
+                            ch.unread_count = 0;
+                        }
+                    }
+                    outcome.events.push(BackendEvent::MessageAcked {
+                        channel_id: wire.channel_id,
+                        last_message_id,
+                        mention_count: wire.mention_count,
+                    });
+                }
+            }
+            "USER_GUILD_SETTINGS_UPDATE" => {
+                if let Ok(wire) = serde_json::from_value::<WireUserGuildSettingsEntry>(data) {
+                    self.apply_guild_settings_entry(wire, outcome);
+                }
+            }
+            "GUILD_ROLE_CREATE" | "GUILD_ROLE_UPDATE" => {
+                if let Ok(wire) = serde_json::from_value::<WireGuildRoleUpsert>(data) {
+                    let role = Role::from(wire.role);
+                    let roles = self.guild_roles.entry(wire.guild_id).or_default();
+                    if let Some(existing) = roles.iter_mut().find(|r| r.id == role.id) {
+                        *existing = role;
+                    } else {
+                        roles.push(role);
+                    }
+                    roles.sort_by_key(|r| (r.position, r.id));
+                    outcome.events.push(BackendEvent::GuildRolesUpdated {
+                        guild_id: wire.guild_id,
+                        roles: roles.clone(),
+                    });
+                }
+            }
+            "GUILD_ROLE_DELETE" => {
+                if let Ok(wire) = serde_json::from_value::<WireGuildRoleDelete>(data) {
+                    let roles = self.guild_roles.entry(wire.guild_id).or_default();
+                    roles.retain(|r| r.id != wire.role_id);
+                    outcome.events.push(BackendEvent::GuildRolesUpdated {
+                        guild_id: wire.guild_id,
+                        roles: roles.clone(),
+                    });
+                }
+            }
+            "GUILD_MEMBER_UPDATE" => {
+                if let Ok(wire) = serde_json::from_value::<WireGuildMemberUpdate>(data) {
+                    let user = User::from(wire.user);
+                    let user_id = user.id;
+                    self.users_by_id.insert(user_id, user);
+                    outcome.events.push(BackendEvent::GuildMembersUpdated {
+                        guild_id: wire.guild_id,
+                        members: vec![GuildMemberSummary {
+                            user_id,
+                            nick: wire.nick.filter(|s| !s.is_empty()),
+                            role_ids: wire.roles,
+                        }],
+                    });
+                }
+            }
+            "GUILD_MEMBERS_CHUNK" => {
+                if let Ok(wire) = serde_json::from_value::<WireGuildMembersChunk>(data) {
+                    let mut members = Vec::with_capacity(wire.members.len());
+                    for m in wire.members {
+                        if let Some(ref wu) = m.user {
+                            let u = User::from(wu.clone());
+                            self.users_by_id.insert(u.id, u);
+                        }
+                        if let Some(summary) = m.to_member_summary(None) {
+                            members.push(summary);
+                        }
+                    }
+                    if !members.is_empty() {
+                        outcome.events.push(BackendEvent::GuildMembersUpdated {
+                            guild_id: wire.guild_id,
+                            members,
+                        });
+                    }
+                }
+            }
+            "GUILD_MEMBER_LIST_UPDATE" => {
+                if let Ok(wire) = serde_json::from_value::<WireGuildMemberListUpdate>(data) {
+                    let mut members = Vec::new();
+                    for op in wire.ops {
+                        let all_items = op.items.into_iter().chain(op.item);
+                        for item in all_items {
+                            if let Some(entry) = item.member {
+                                if let Some(ref wu) = entry.member.user {
+                                    let u = User::from(wu.clone());
+                                    self.users_by_id.insert(u.id, u);
+                                }
+                                if let Some(summary) = entry.member.to_member_summary(None) {
+                                    members.push(summary);
+                                }
+                                if let Some(wp) = entry.presence
+                                    && let Some(presence) = wp.into_core()
+                                {
+                                    if let Some(u) = self.users_by_id.get_mut(&presence.user_id) {
+                                        u.presence = presence.status;
+                                    }
+                                    outcome.events.push(BackendEvent::PresenceUpdated(presence));
+                                }
+                            }
+                        }
+                    }
+                    if !members.is_empty() {
+                        outcome.events.push(BackendEvent::GuildMembersUpdated {
+                            guild_id: wire.guild_id,
+                            members,
+                        });
+                    }
                 }
             }
             "MESSAGE_DELETE" => {
@@ -1013,19 +1247,19 @@ impl GatewaySessionState {
                     });
                 }
             }
-            "CALL_CREATE" | "CALL_UPDATE" => {
+            "CALL_CREATE" => {
                 if let Ok(wire) = serde_json::from_value::<WireCallEvent>(data) {
-                    let ring_state = self.map_call_event(wire);
-                    outcome
-                        .events
-                        .push(BackendEvent::CallRingUpdated(ring_state));
+                    self.handle_call_event(wire, true, outcome);
+                }
+            }
+            "CALL_UPDATE" => {
+                if let Ok(wire) = serde_json::from_value::<WireCallEvent>(data) {
+                    self.handle_call_event(wire, false, outcome);
                 }
             }
             "CALL_DELETE" => {
-                if serde_json::from_value::<WireCallDelete>(data).is_ok() {
-                    outcome
-                        .events
-                        .push(BackendEvent::CallRingUpdated(CallRingState::Idle));
+                if let Ok(wire) = serde_json::from_value::<WireCallDelete>(data) {
+                    self.handle_call_delete(wire.channel_id, outcome);
                 }
             }
             "STREAM_CREATE" => {
@@ -1115,15 +1349,33 @@ impl GatewaySessionState {
             }
         }
 
+        // Parse user_guild_settings (supports both versioned { entries: Vec } and flat Vec).
+        let raw_guild_settings: Vec<WireUserGuildSettingsEntry> = ready
+            .user_guild_settings
+            .map(parse_user_guild_settings_value)
+            .unwrap_or_default();
+        let mut settings_by_guild: HashMap<Option<Snowflake>, &WireUserGuildSettingsEntry> =
+            HashMap::new();
+        for entry in &raw_guild_settings {
+            for co in &entry.channel_overrides {
+                self.muted_channels.insert(co.channel_id, co.muted);
+            }
+            settings_by_guild.insert(entry.guild_id, entry);
+        }
+
         // Parse private channels (1:1 DMs and Group DMs = type 3).
         let mut dm_channels: Vec<Channel> = ready
             .private_channels
             .into_iter()
             .map(|wc| {
                 let mut ch = wc.into_core_channel(None, &self.users_by_id);
+                if let Some(&muted) = self.muted_channels.get(&ch.id) {
+                    ch.muted = muted;
+                }
                 if let Some(rs) = self.read_states.get(&ch.id) {
+                    ch.last_ack_message_id = rs.last_message_id;
                     ch.mention_count = rs.mention_count;
-                    if ch.last_message_id.is_some() && ch.last_message_id != rs.last_message_id {
+                    if is_channel_unread(ch.kind, ch.last_message_id, rs.last_message_id) {
                         ch.unread_count = ch.unread_count.max(1);
                     }
                 }
@@ -1133,23 +1385,59 @@ impl GatewaySessionState {
             .collect();
         dm_channels.sort_by(|a, b| b.last_message_id.cmp(&a.last_message_id).then(b.id.cmp(&a.id)));
 
-        // Parse guilds, channels, and initial voice states.
+        // Parse guilds, roles, channels, initial members, and initial voice rosters.
         let mut guilds = Vec::with_capacity(ready.guilds.len());
         let mut per_guild_channels: Vec<(Snowflake, Vec<Channel>)> = Vec::new();
+        let mut per_guild_members: Vec<(Snowflake, Vec<GuildMemberSummary>)> = Vec::new();
+        let mut initial_voice_rosters: Vec<(Option<Snowflake>, Snowflake)> = Vec::new();
+
         for wire_guild in ready.guilds {
             let guild_id = wire_guild.id;
             let mut guild = wire_guild.to_core_guild();
+            if let Some(settings) = settings_by_guild.get(&Some(guild_id)) {
+                guild.muted = settings.muted;
+                guild.suppress_everyone = settings.suppress_everyone;
+                guild.suppress_roles = settings.suppress_roles;
+            }
+            self.guild_roles.insert(guild_id, guild.roles.clone());
+
+            // Remember any initial guild members shipped in READY.
+            if !wire_guild.members.is_empty() {
+                let mut summaries = Vec::with_capacity(wire_guild.members.len());
+                for m in &wire_guild.members {
+                    if let Some(ref wu) = m.user {
+                        let u = User::from(wu.clone());
+                        self.users_by_id.insert(u.id, u);
+                    }
+                    if let Some(summary) = m.to_member_summary(None) {
+                        summaries.push(summary);
+                    }
+                }
+                if !summaries.is_empty() {
+                    per_guild_members.push((guild_id, summaries));
+                }
+            }
 
             let mut channels: Vec<Channel> = wire_guild
                 .channels
                 .into_iter()
                 .map(|wc| {
                     let mut ch = wc.into_core_channel(Some(guild_id), &self.users_by_id);
+                    if let Some(&muted) = self.muted_channels.get(&ch.id) {
+                        ch.muted = muted;
+                    } else if let Some(parent) = ch.parent_id
+                        && self.muted_channels.get(&parent).copied().unwrap_or(false)
+                    {
+                        ch.muted = true;
+                    }
                     if let Some(rs) = self.read_states.get(&ch.id) {
+                        ch.last_ack_message_id = rs.last_message_id;
                         ch.mention_count = rs.mention_count;
-                        if ch.last_message_id.is_some() && ch.last_message_id != rs.last_message_id {
+                        if is_channel_unread(ch.kind, ch.last_message_id, rs.last_message_id) {
                             ch.unread_count = 1;
-                            guild.unread = true;
+                            if !guild.muted && !ch.muted {
+                                guild.unread = true;
+                            }
                         }
                         guild.mention_count = guild.mention_count.saturating_add(rs.mention_count);
                     }
@@ -1160,13 +1448,23 @@ impl GatewaySessionState {
             channels.sort_by_key(|c| (c.position, c.id));
 
             if !wire_guild.voice_states.is_empty() {
+                let mut touched_channels = BTreeSet::new();
                 for vs in &wire_guild.voice_states {
+                    if let Some(member) = &vs.member
+                        && let Some(wu) = &member.user
+                    {
+                        self.users_by_id.insert(wu.id, User::from(wu.clone()));
+                    }
                     if let Some(ch_id) = vs.channel_id {
                         self.voice_states
                             .entry(ch_id)
                             .or_default()
                             .insert(vs.user_id, vs.clone());
+                        touched_channels.insert(ch_id);
                     }
+                }
+                for ch_id in touched_channels {
+                    initial_voice_rosters.push((Some(guild_id), ch_id));
                 }
                 outcome
                     .signaling
@@ -1199,10 +1497,56 @@ impl GatewaySessionState {
                 channels,
             });
         }
+        for entry in raw_guild_settings {
+            outcome.events.push(BackendEvent::GuildSettingsUpdated {
+                guild_id: entry.guild_id,
+                muted: entry.muted,
+                suppress_everyone: entry.suppress_everyone,
+                suppress_roles: entry.suppress_roles,
+                muted_channels: entry
+                    .channel_overrides
+                    .into_iter()
+                    .map(|co| (co.channel_id, co.muted))
+                    .collect(),
+            });
+        }
+        for (guild_id, members) in per_guild_members {
+            outcome.events.push(BackendEvent::GuildMembersUpdated { guild_id, members });
+        }
+        for (guild_id, channel_id) in initial_voice_rosters {
+            let participants = self.build_voice_roster(channel_id);
+            outcome.events.push(BackendEvent::VoiceRosterUpdated {
+                guild_id,
+                channel_id,
+                participants,
+            });
+        }
         outcome.events.push(BackendEvent::ConnectionChanged {
             state: ConnectionState::Ready,
             latency_ms: None,
             detail: None,
+        });
+    }
+
+    fn apply_guild_settings_entry(
+        &mut self,
+        entry: WireUserGuildSettingsEntry,
+        outcome: &mut GatewayFrameOutcome,
+    ) {
+        let mut muted_channels = Vec::with_capacity(entry.channel_overrides.len());
+        for co in entry.channel_overrides {
+            self.muted_channels.insert(co.channel_id, co.muted);
+            if let Some(ch) = self.channels_by_id.get_mut(&co.channel_id) {
+                ch.muted = co.muted;
+            }
+            muted_channels.push((co.channel_id, co.muted));
+        }
+        outcome.events.push(BackendEvent::GuildSettingsUpdated {
+            guild_id: entry.guild_id,
+            muted: entry.muted,
+            suppress_everyone: entry.suppress_everyone,
+            suppress_roles: entry.suppress_roles,
+            muted_channels,
         });
     }
 
@@ -1218,13 +1562,28 @@ impl GatewaySessionState {
 
         for g in supp.guilds {
             if !g.voice_states.is_empty() {
+                let mut touched_channels = BTreeSet::new();
                 for vs in &g.voice_states {
+                    if let Some(member) = &vs.member
+                        && let Some(wu) = &member.user
+                    {
+                        self.users_by_id.insert(wu.id, User::from(wu.clone()));
+                    }
                     if let Some(ch_id) = vs.channel_id {
                         self.voice_states
                             .entry(ch_id)
                             .or_default()
                             .insert(vs.user_id, vs.clone());
+                        touched_channels.insert(ch_id);
                     }
+                }
+                for ch_id in touched_channels {
+                    let participants = self.build_voice_roster(ch_id);
+                    outcome.events.push(BackendEvent::VoiceRosterUpdated {
+                        guild_id: Some(g.id),
+                        channel_id: ch_id,
+                        participants,
+                    });
                 }
                 outcome
                     .signaling
@@ -1257,7 +1616,10 @@ impl GatewaySessionState {
         }
 
         for wc in supp.lazy_private_channels {
-            let ch = wc.into_core_channel(None, &self.users_by_id);
+            let mut ch = wc.into_core_channel(None, &self.users_by_id);
+            if let Some(&muted) = self.muted_channels.get(&ch.id) {
+                ch.muted = muted;
+            }
             self.channels_by_id.insert(ch.id, ch.clone());
             outcome.events.push(BackendEvent::ChannelUpserted(ch));
         }
@@ -1291,38 +1653,41 @@ impl GatewaySessionState {
             .signaling
             .push(GatewaySignalingEvent::VoiceStateUpdate(vs.clone()));
 
-        if let Some(ch_id) = target_channel.or(previous_channel) {
-            let status = self.build_voice_channel_status(vs.guild_id, ch_id);
-            outcome
-                .events
-                .push(BackendEvent::VoiceStatusUpdated(status));
+        // Emit channel-scoped sidebar voice rosters (NEVER `BackendEvent::VoiceStatusUpdated`,
+        // which is exclusively owned by `DiscordVoiceEngine`).
+        if let Some(prev_ch) = previous_channel
+            && Some(prev_ch) != target_channel
+        {
+            let prev_guild = self
+                .channels_by_id
+                .get(&prev_ch)
+                .and_then(|c| c.guild_id)
+                .or(vs.guild_id);
+            let participants = self.build_voice_roster(prev_ch);
+            outcome.events.push(BackendEvent::VoiceRosterUpdated {
+                guild_id: prev_guild,
+                channel_id: prev_ch,
+                participants,
+            });
+        }
+
+        if let Some(ch_id) = target_channel {
+            let guild_id = vs
+                .guild_id
+                .or_else(|| self.channels_by_id.get(&ch_id).and_then(|c| c.guild_id));
+            let participants = self.build_voice_roster(ch_id);
+            outcome.events.push(BackendEvent::VoiceRosterUpdated {
+                guild_id,
+                channel_id: ch_id,
+                participants,
+            });
         }
     }
 
-    fn build_voice_channel_status(
-        &self,
-        guild_id: Option<Snowflake>,
-        channel_id: Snowflake,
-    ) -> VoiceChannelStatus {
-        let channel_name = self
-            .channels_by_id
-            .get(&channel_id)
-            .map(Channel::display_label)
-            .unwrap_or_else(|| format!("voice-{channel_id}"));
-
-        let my_id = self.current_user.as_ref().map(|u| u.id);
-        let mut self_mute = false;
-        let mut self_deaf = false;
-        let mut me_connected = false;
-
+    fn build_voice_roster(&self, channel_id: Snowflake) -> Vec<VoiceParticipant> {
         let mut participants = Vec::new();
         if let Some(states) = self.voice_states.get(&channel_id) {
             for vs in states.values() {
-                if my_id == Some(vs.user_id) {
-                    self_mute = vs.self_mute;
-                    self_deaf = vs.self_deaf;
-                    me_connected = true;
-                }
                 let display_name = vs
                     .member
                     .as_ref()
@@ -1350,51 +1715,135 @@ impl GatewaySessionState {
             }
         }
         participants.sort_by_key(|p| p.user_id);
-
-        VoiceChannelStatus {
-            guild_id,
-            channel_id,
-            channel_name,
-            connection_state: if me_connected {
-                VoiceConnectionState::Connected
-            } else {
-                VoiceConnectionState::Disconnected
-            },
-            self_mute,
-            self_deaf,
-            push_to_talk: false,
-            ping_ms: None,
-            packet_loss_pct: 0.0,
-            dave: DaveSessionState::Disabled,
-            call_ring: CallRingState::Idle,
-            participants,
-        }
+        participants
     }
 
-    fn map_call_event(&self, call: WireCallEvent) -> CallRingState {
-        let my_id = self.current_user.as_ref().map(|u| u.id);
+    fn handle_call_event(
+        &mut self,
+        call: WireCallEvent,
+        is_create: bool,
+        outcome: &mut GatewayFrameOutcome,
+    ) {
         let is_group_dm = self
             .channels_by_id
             .get(&call.channel_id)
             .is_some_and(|ch| ch.kind == ChannelKind::GroupDm);
+        let caller_id = call.voice_states.first().map(|vs| vs.user_id);
+        let caller_name = caller_id.map(|cid| {
+            self.users_by_id
+                .get(&cid)
+                .map(|u| u.display_name().to_owned())
+                .unwrap_or_else(|| format!("user-{cid}"))
+        });
+
+        // Update sidebar voice roster for this DM/Group DM call channel.
+        if !call.voice_states.is_empty() {
+            let entry = self.voice_states.entry(call.channel_id).or_default();
+            entry.clear();
+            for vs in &call.voice_states {
+                if let Some(member) = &vs.member
+                    && let Some(wu) = &member.user
+                {
+                    self.users_by_id.insert(wu.id, User::from(wu.clone()));
+                }
+                entry.insert(vs.user_id, vs.clone());
+            }
+            let participants = self.build_voice_roster(call.channel_id);
+            outcome.events.push(BackendEvent::VoiceRosterUpdated {
+                guild_id: None,
+                channel_id: call.channel_id,
+                participants,
+            });
+        }
+
+        let ring_state = self.map_call_event(&call, caller_id, caller_name.as_deref(), is_group_dm);
+        let sig = if is_create {
+            GatewaySignalingEvent::CallCreate {
+                channel_id: call.channel_id,
+                ringing: call.ringing,
+                voice_states: call.voice_states,
+                caller_id,
+                caller_name,
+                is_group_dm,
+            }
+        } else {
+            GatewaySignalingEvent::CallUpdate {
+                channel_id: call.channel_id,
+                ringing: call.ringing,
+                voice_states: call.voice_states,
+                caller_id,
+                caller_name,
+                is_group_dm,
+            }
+        };
+        outcome.signaling.push(sig);
+
+        if ring_state == CallRingState::Idle {
+            self.active_calls.remove(&call.channel_id);
+            if self.active_call_channel == Some(call.channel_id) {
+                self.active_call_channel = self.active_calls.keys().next().copied();
+                let next_state = self
+                    .active_call_channel
+                    .and_then(|cid| self.active_calls.get(&cid).cloned())
+                    .unwrap_or(CallRingState::Idle);
+                outcome.events.push(BackendEvent::CallRingUpdated(next_state));
+            }
+        } else {
+            self.active_calls.insert(call.channel_id, ring_state.clone());
+            self.active_call_channel = Some(call.channel_id);
+            outcome.events.push(BackendEvent::CallRingUpdated(ring_state));
+        }
+    }
+
+    fn handle_call_delete(&mut self, channel_id: Snowflake, outcome: &mut GatewayFrameOutcome) {
+        outcome
+            .signaling
+            .push(GatewaySignalingEvent::CallDelete { channel_id });
+
+        if self.voice_states.remove(&channel_id).is_some() {
+            outcome.events.push(BackendEvent::VoiceRosterUpdated {
+                guild_id: None,
+                channel_id,
+                participants: Vec::new(),
+            });
+        }
+
+        let removed = self.active_calls.remove(&channel_id).is_some();
+        if self.active_call_channel == Some(channel_id) {
+            self.active_call_channel = self.active_calls.keys().next().copied();
+            let next_state = self
+                .active_call_channel
+                .and_then(|cid| self.active_calls.get(&cid).cloned())
+                .unwrap_or(CallRingState::Idle);
+            outcome
+                .events
+                .push(BackendEvent::CallRingUpdated(next_state));
+        } else if !removed && self.active_call_channel.is_none() {
+            // No tracked active call; ignore unrelated CALL_DELETE without clobbering anything.
+            debug!(%channel_id, "ignoring CALL_DELETE for non-active channel");
+        }
+    }
+
+    fn map_call_event(
+        &self,
+        call: &WireCallEvent,
+        caller_id: Option<Snowflake>,
+        caller_name: Option<&str>,
+        is_group_dm: bool,
+    ) -> CallRingState {
+        let my_id = self.current_user.as_ref().map(|u| u.id);
 
         if let Some(me) = my_id
             && call.ringing.contains(&me)
         {
-            let caller_id = call
-                .voice_states
-                .first()
-                .map(|vs| vs.user_id)
-                .unwrap_or(Snowflake(0));
-            let caller_name = self
-                .users_by_id
-                .get(&caller_id)
-                .map(|u| u.display_name().to_owned())
-                .unwrap_or_else(|| format!("user-{caller_id}"));
+            let cid = caller_id.unwrap_or(Snowflake(0));
+            let cname = caller_name
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("user-{cid}"));
             return CallRingState::IncomingRinging {
                 channel_id: call.channel_id,
-                caller_id,
-                caller_name,
+                caller_id: cid,
+                caller_name: cname,
                 is_group_dm,
             };
         }
@@ -1402,12 +1851,12 @@ impl GatewaySessionState {
         if !call.ringing.is_empty() {
             return CallRingState::OutgoingRinging {
                 channel_id: call.channel_id,
-                target_user_ids: call.ringing,
+                target_user_ids: call.ringing.clone(),
             };
         }
 
         let connected_user_ids: Vec<Snowflake> =
-            call.voice_states.into_iter().map(|vs| vs.user_id).collect();
+            call.voice_states.iter().map(|vs| vs.user_id).collect();
         if !connected_user_ids.is_empty() {
             CallRingState::Active {
                 channel_id: call.channel_id,
@@ -2017,6 +2466,21 @@ struct WireHello {
     heartbeat_interval: u64,
 }
 
+fn is_channel_unread(
+    kind: ChannelKind,
+    last_message_id: Option<Snowflake>,
+    ack_message_id: Option<Snowflake>,
+) -> bool {
+    if kind.is_voice() || kind == ChannelKind::GuildCategory {
+        return false;
+    }
+    match (last_message_id, ack_message_id) {
+        (Some(last), Some(ack)) => last > ack,
+        (Some(_), None) => true,
+        (None, _) => false,
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct WireReady {
     session_id: String,
@@ -2032,9 +2496,115 @@ struct WireReady {
     #[serde(default)]
     user_settings: Option<WireReadyUserSettings>,
     #[serde(default)]
+    user_guild_settings: Option<serde_json::Value>,
+    #[serde(default)]
     read_state: Option<serde_json::Value>,
     #[serde(default, deserialize_with = "deserialize_null_default")]
     relationships: Vec<WireRelationship>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireChannelOverride {
+    channel_id: Snowflake,
+    #[serde(default)]
+    muted: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireUserGuildSettingsEntry {
+    #[serde(default)]
+    guild_id: Option<Snowflake>,
+    #[serde(default)]
+    muted: bool,
+    #[serde(default)]
+    suppress_everyone: bool,
+    #[serde(default)]
+    suppress_roles: bool,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    channel_overrides: Vec<WireChannelOverride>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireVersionedUserGuildSettings {
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    entries: Vec<WireUserGuildSettingsEntry>,
+}
+
+fn parse_user_guild_settings_value(val: serde_json::Value) -> Vec<WireUserGuildSettingsEntry> {
+    if let Ok(entries) = serde_json::from_value::<Vec<WireUserGuildSettingsEntry>>(val.clone()) {
+        return entries;
+    }
+    if let Ok(versioned) = serde_json::from_value::<WireVersionedUserGuildSettings>(val) {
+        return versioned.entries;
+    }
+    Vec::new()
+}
+
+#[derive(Debug, Deserialize)]
+struct WireMessageAck {
+    channel_id: Snowflake,
+    #[serde(default)]
+    message_id: Option<Snowflake>,
+    #[serde(default)]
+    mention_count: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireGuildRoleUpsert {
+    guild_id: Snowflake,
+    role: WireRole,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireGuildRoleDelete {
+    guild_id: Snowflake,
+    role_id: Snowflake,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireGuildMemberUpdate {
+    guild_id: Snowflake,
+    user: WireUser,
+    #[serde(default)]
+    nick: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    roles: Vec<Snowflake>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireGuildMembersChunk {
+    guild_id: Snowflake,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    members: Vec<WireGuildMember>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireGuildMemberListUpdate {
+    guild_id: Snowflake,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    ops: Vec<WireMemberListOp>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireMemberListOp {
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    items: Vec<WireMemberListItem>,
+    #[serde(default)]
+    item: Option<WireMemberListItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireMemberListItem {
+    #[serde(default)]
+    member: Option<WireMemberListMember>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireMemberListMember {
+    #[serde(flatten)]
+    member: WireGuildMember,
+    #[serde(default)]
+    presence: Option<WirePresence>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2216,7 +2786,6 @@ struct WireCallEvent {
 
 #[derive(Debug, Deserialize)]
 struct WireCallDelete {
-    #[allow(dead_code)]
     channel_id: Snowflake,
 }
 

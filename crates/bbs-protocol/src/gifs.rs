@@ -7,6 +7,7 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bbs_core::{
@@ -15,11 +16,12 @@ use bbs_core::{
 };
 use http::{HeaderValue, StatusCode, header};
 use serde::Deserialize;
+use tracing::warn;
 use url::Url;
 
 use crate::fingerprint::DiscordFingerprint;
 use crate::rest::DISCORD_API_BASE_URL;
-use crate::wire::{deserialize_null_default, deserialize_opt_string_or_number};
+use crate::wire::{WireApiError, deserialize_null_default, deserialize_opt_string_or_number};
 
 /// Production Klipy API base URL.
 pub const KLIPY_API_BASE_URL: &str = "https://api.klipy.com/api/v1";
@@ -149,14 +151,16 @@ pub async fn probe_direct_gif_url(client: &wreq::Client, raw: &str) -> CoreResul
 // Primary Provider: Authenticated Discord GIF Proxy
 // ============================================================================
 
-/// Primary authenticated Discord GIF search proxy (`/api/v10/gifs/search` & `/api/v10/gifs/trending`).
+/// Primary authenticated Discord GIF search proxy (`/api/v10/gifs/search` & `/api/v10/gifs/trending-gifs`).
 #[derive(Clone)]
 pub struct DiscordGifProvider {
     client: wreq::Client,
     token: SecretToken,
     api_base_url: String,
     media_format: String,
-    upstream_provider: String,
+    upstream_provider: Option<String>,
+    max_retries: usize,
+    max_retry_wait: Duration,
 }
 
 impl fmt::Debug for DiscordGifProvider {
@@ -171,6 +175,11 @@ impl fmt::Debug for DiscordGifProvider {
 }
 
 impl DiscordGifProvider {
+    /// Minimum page size enforced by Discord's `/api/v10/gifs/*` endpoints (`NUMBER_TYPE_MIN = 20`).
+    pub const MIN_DISCORD_LIMIT: u8 = 20;
+    /// Maximum page size accepted by Discord's `/api/v10/gifs/*` endpoints.
+    pub const MAX_DISCORD_LIMIT: u8 = 50;
+
     /// Create a Discord GIF provider backed by a Chrome-fingerprinted `wreq::Client`.
     pub fn new(token: SecretToken, fingerprint: &DiscordFingerprint) -> CoreResult<Self> {
         let client = fingerprint.build_rest_client()?;
@@ -178,8 +187,10 @@ impl DiscordGifProvider {
             client,
             token,
             api_base_url: DISCORD_API_BASE_URL.to_owned(),
-            media_format: "webm".to_owned(),
-            upstream_provider: "tenor".to_owned(),
+            media_format: "webp".to_owned(),
+            upstream_provider: None,
+            max_retries: 1,
+            max_retry_wait: Duration::from_millis(2_500),
         })
     }
 
@@ -195,6 +206,77 @@ impl DiscordGifProvider {
             .map_err(|_| CoreError::AuthRequired)?;
         val.set_sensitive(true);
         Ok(val)
+    }
+
+    async fn fetch_discord_gif_page(
+        &self,
+        url: &Url,
+        op_name: &str,
+    ) -> CoreResult<GifSearchPage> {
+        for attempt in 0..=self.max_retries {
+            let resp = self
+                .client
+                .get(url.as_str())
+                .header(header::AUTHORIZATION, self.auth_header()?)
+                .send()
+                .await
+                .map_err(|err| CoreError::Network(format!("Discord GIF {op_name} failed: {err}")))?;
+
+            let status = resp.status();
+            let header_retry = resp
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|raw| raw.trim().parse::<f64>().ok())
+                .filter(|s| s.is_finite() && *s >= 0.0)
+                .map(Duration::from_secs_f64);
+
+            let bytes = resp.bytes().await.map_err(|err| {
+                CoreError::Network(format!("read Discord GIF {op_name} response: {err}"))
+            })?;
+
+            if status == StatusCode::UNAUTHORIZED {
+                return Err(CoreError::AuthRequired);
+            }
+
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                let body_retry = serde_json::from_slice::<WireApiError>(&bytes)
+                    .ok()
+                    .and_then(|e| e.retry_after)
+                    .filter(|s| s.is_finite() && *s >= 0.0)
+                    .map(Duration::from_secs_f64);
+                let retry_after = body_retry
+                    .or(header_retry)
+                    .unwrap_or_else(|| Duration::from_secs(1));
+                let retry_after_ms =
+                    u64::try_from(retry_after.as_millis()).unwrap_or(u64::MAX).max(1);
+
+                if attempt < self.max_retries && retry_after <= self.max_retry_wait {
+                    warn!(
+                        op = op_name,
+                        attempt = attempt + 1,
+                        retry_after_ms,
+                        "Discord GIF proxy 429 rate-limited; backing off before retry"
+                    );
+                    tokio::time::sleep(retry_after).await;
+                    continue;
+                }
+                return Err(CoreError::RateLimited { retry_after_ms });
+            }
+
+            if !status.is_success() {
+                return Err(CoreError::Protocol(format!(
+                    "Discord GIF {op_name} failed with HTTP {}",
+                    status.as_u16()
+                )));
+            }
+
+            return parse_discord_gifs_response(&bytes);
+        }
+
+        Err(CoreError::RateLimited {
+            retry_after_ms: 1_000,
+        })
     }
 }
 
@@ -258,17 +340,37 @@ pub fn parse_discord_gifs_response(body: &[u8]) -> CoreResult<GifSearchPage> {
     })
 }
 
+fn is_video_asset_url(raw: &str) -> bool {
+    let path = raw.split(['?', '#']).next().unwrap_or(raw);
+    let lower = path.to_ascii_lowercase();
+    lower.ends_with(".webm") || lower.ends_with(".mp4")
+}
+
 fn map_discord_gif_item(raw: WireDiscordGifItem) -> Option<GifItem> {
-    let gif_url = raw
-        .gif_src
-        .filter(|s| !s.is_empty())
-        .or_else(|| raw.url.clone().filter(|s| !s.is_empty()))
-        .or_else(|| raw.src.clone().filter(|s| !s.is_empty()))?;
-    let preview_url = raw
-        .preview
-        .filter(|s| !s.is_empty())
-        .or_else(|| raw.src.filter(|s| !s.is_empty()))
+    let url = raw.url.filter(|s| !s.trim().is_empty());
+    let gif_src = raw.gif_src.filter(|s| !s.trim().is_empty());
+    let src = raw.src.filter(|s| !s.trim().is_empty());
+    let preview = raw.preview.filter(|s| !s.trim().is_empty());
+
+    // Prefer canonical unfurlable `url` (`https://klipy.com/...` / `https://tenor.com/...`) when
+    // sending into chat, falling back to `gif_src` then `src`.
+    let gif_url = url
+        .clone()
+        .or_else(|| gif_src.clone())
+        .or_else(|| src.clone())?;
+
+    // Prefer directly decodable image URLs (`preview` -> `gif_src` -> `src`), skipping `.webm`/`.mp4`.
+    let preferred_image = [&preview, &gif_src, &src]
+        .into_iter()
+        .flatten()
+        .find(|u| !is_video_asset_url(u))
+        .cloned();
+    let preview_url = preferred_image
+        .or(preview)
+        .or(gif_src)
+        .or(src)
         .unwrap_or_else(|| gif_url.clone());
+
     let id = raw
         .id
         .filter(|s| !s.is_empty())
@@ -310,92 +412,51 @@ impl GifProvider for DiscordGifProvider {
             return self.trending(query.limit, query.cursor.as_deref()).await;
         }
 
+        let api_limit = query
+            .limit
+            .clamp(Self::MIN_DISCORD_LIMIT, Self::MAX_DISCORD_LIMIT);
         let mut url = Url::parse(&format!("{}/gifs/search", self.api_base_url))
             .map_err(|err| CoreError::Protocol(format!("build Discord GIF search URL: {err}")))?;
         {
             let mut qp = url.query_pairs_mut();
             qp.append_pair("q", query.query.trim());
             qp.append_pair("media_format", &self.media_format);
-            qp.append_pair("provider", &self.upstream_provider);
-            qp.append_pair(
-                "locale",
-                query.locale.as_deref().unwrap_or("en-US"),
-            );
-            qp.append_pair("limit", &query.limit.clamp(1, 50).to_string());
+            if let Some(provider) = self.upstream_provider.as_deref().filter(|s| !s.is_empty()) {
+                qp.append_pair("provider", provider);
+            }
+            qp.append_pair("locale", query.locale.as_deref().unwrap_or("en-US"));
+            qp.append_pair("limit", &api_limit.to_string());
             if let Some(cursor) = query.cursor.as_deref().filter(|s| !s.is_empty()) {
                 qp.append_pair("pos", cursor);
             }
         }
 
-        let resp = self
-            .client
-            .get(url.as_str())
-            .header(header::AUTHORIZATION, self.auth_header()?)
-            .send()
-            .await
-            .map_err(|err| CoreError::Network(format!("Discord GIF search failed: {err}")))?;
-
-        let status = resp.status();
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|err| CoreError::Network(format!("read Discord GIF response: {err}")))?;
-
-        if status == StatusCode::UNAUTHORIZED {
-            return Err(CoreError::AuthRequired);
-        }
-        if !status.is_success() {
-            return Err(CoreError::Protocol(format!(
-                "Discord GIF search failed with HTTP {}",
-                status.as_u16()
-            )));
-        }
-
-        let mut page = parse_discord_gifs_response(&bytes)?;
-        page.items.truncate(usize::from(query.limit.max(1)));
+        let mut page = self.fetch_discord_gif_page(&url, "search").await?;
+        page.items
+            .truncate(usize::from(query.limit.clamp(1, Self::MAX_DISCORD_LIMIT)));
         Ok(page)
     }
 
     async fn trending(&self, limit: u8, cursor: Option<&str>) -> CoreResult<GifSearchPage> {
-        let mut url = Url::parse(&format!("{}/gifs/trending", self.api_base_url))
+        let api_limit = limit.clamp(Self::MIN_DISCORD_LIMIT, Self::MAX_DISCORD_LIMIT);
+        let mut url = Url::parse(&format!("{}/gifs/trending-gifs", self.api_base_url))
             .map_err(|err| CoreError::Protocol(format!("build Discord GIF trending URL: {err}")))?;
         {
             let mut qp = url.query_pairs_mut();
             qp.append_pair("media_format", &self.media_format);
-            qp.append_pair("provider", &self.upstream_provider);
+            if let Some(provider) = self.upstream_provider.as_deref().filter(|s| !s.is_empty()) {
+                qp.append_pair("provider", provider);
+            }
             qp.append_pair("locale", "en-US");
-            qp.append_pair("limit", &limit.clamp(1, 50).to_string());
+            qp.append_pair("limit", &api_limit.to_string());
             if let Some(pos) = cursor.filter(|s| !s.is_empty()) {
                 qp.append_pair("pos", pos);
             }
         }
 
-        let resp = self
-            .client
-            .get(url.as_str())
-            .header(header::AUTHORIZATION, self.auth_header()?)
-            .send()
-            .await
-            .map_err(|err| CoreError::Network(format!("Discord GIF trending failed: {err}")))?;
-
-        let status = resp.status();
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|err| CoreError::Network(format!("read Discord GIF trending body: {err}")))?;
-
-        if status == StatusCode::UNAUTHORIZED {
-            return Err(CoreError::AuthRequired);
-        }
-        if !status.is_success() {
-            return Err(CoreError::Protocol(format!(
-                "Discord GIF trending failed with HTTP {}",
-                status.as_u16()
-            )));
-        }
-
-        let mut page = parse_discord_gifs_response(&bytes)?;
-        page.items.truncate(usize::from(limit.max(1)));
+        let mut page = self.fetch_discord_gif_page(&url, "trending").await?;
+        page.items
+            .truncate(usize::from(limit.clamp(1, Self::MAX_DISCORD_LIMIT)));
         Ok(page)
     }
 }

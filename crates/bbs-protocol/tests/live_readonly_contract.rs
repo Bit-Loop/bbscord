@@ -11,8 +11,13 @@
 
 use std::time::Duration;
 
-use bbs_core::{BackendEvent, ConnectionState, KeyringStore, OsKeyringStore, SecretToken};
-use bbs_protocol::{DiscordFingerprint, DiscordGateway, DiscordRestClient, GatewayConfig};
+use bbs_core::{
+    BackendEvent, ConnectionState, GifProvider, GifSearchQuery, KeyringStore, OsKeyringStore,
+    SecretToken,
+};
+use bbs_protocol::{
+    DiscordFingerprint, DiscordGateway, DiscordGifProvider, DiscordRestClient, GatewayConfig,
+};
 use tokio::sync::broadcast;
 
 fn load_ram_token_readonly() -> Option<SecretToken> {
@@ -149,5 +154,69 @@ async fn live_readonly_gateway_ready_contract() {
     assert!(
         saw_ready,
         "Gateway failed to reach READY within timeout (last_error={saw_error:?})"
+    );
+}
+
+#[tokio::test]
+#[ignore = "opt-in live read-only Discord GIF proxy contract test; requires BBSCORD_LIVE_TDD=1 and --ignored"]
+async fn live_readonly_gifs_contract() {
+    if std::env::var("BBSCORD_LIVE_TDD").as_deref() != Ok("1") {
+        eprintln!("[live_readonly_gifs] SKIP: BBSCORD_LIVE_TDD!=1");
+        return;
+    }
+
+    let Some(token) = load_ram_token_readonly() else {
+        eprintln!("[live_readonly_gifs] SKIP: no unlocked keyring token available");
+        return;
+    };
+
+    let fingerprint = DiscordFingerprint::default_chrome()
+        .expect("failed to construct Chrome TLS/HTTP2 fingerprint");
+    let provider = DiscordGifProvider::new(token, &fingerprint)
+        .expect("failed to construct DiscordGifProvider");
+
+    let trending = provider
+        .trending(20, None)
+        .await
+        .expect("GET /api/v10/gifs/trending-gifs failed");
+    // Polite spacing between consecutive calls to stay clear of Discord GIF 429 limits.
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    let search = provider
+        .search(&GifSearchQuery {
+            query: "retro".to_owned(),
+            limit: 20,
+            cursor: None,
+            trending: false,
+            locale: Some("en-US".to_owned()),
+        })
+        .await
+        .expect("GET /api/v10/gifs/search failed");
+    drop(provider);
+
+    assert!(
+        !trending.items.is_empty(),
+        "trending-gifs returned zero items"
+    );
+    assert!(!search.items.is_empty(), "gifs/search returned zero items");
+
+    for item in trending.items.iter().chain(search.items.iter()) {
+        assert!(!item.gif_url.is_empty(), "item missing gif_url");
+        assert!(!item.preview_url.is_empty(), "item missing preview_url");
+        let preview_path = item
+            .preview_url
+            .split(['?', '#'])
+            .next()
+            .unwrap_or(&item.preview_url)
+            .to_ascii_lowercase();
+        assert!(
+            !preview_path.ends_with(".webm") && !preview_path.ends_with(".mp4"),
+            "preview_url must be a decodable image, not video"
+        );
+    }
+
+    eprintln!(
+        "[live_readonly_gifs] PASS: trending_count={} search_count={}",
+        trending.items.len(),
+        search.items.len()
     );
 }
