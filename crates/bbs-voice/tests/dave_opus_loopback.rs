@@ -862,6 +862,7 @@ async fn full_voice_gateway_v8_group_dm_call_loopback() {
             VoiceEngineConfig {
                 audio_mode: AudioBackendMode::Headless,
                 jitter_cushion_frames: 2,
+                join_muted: false,
                 input_mode: InputMode::VoiceActivity {
                     threshold_db: -45.0,
                 },

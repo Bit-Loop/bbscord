@@ -3,7 +3,8 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -18,13 +19,15 @@ use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::net::UdpSocket;
-use tokio::sync::{Notify, broadcast, mpsc, watch};
+use tokio::sync::{Notify, broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing::{debug, info, warn};
 use zeroize::Zeroizing;
 
-use crate::audio_io::{AudioBackendMode, AudioIoHandle, CaptureQueue, PlaybackQueue};
+use crate::audio_io::{
+    AudioBackendKind, AudioBackendMode, AudioIoHandle, CaptureQueue, PlaybackQueue,
+};
 use crate::dave::{
     DaveController, DaveOutboundMessage, DaveWireFrame, MAX_DAVE_PROTOCOL_VERSION,
     parse_binary_dave_frame, parse_json_dave_frame,
@@ -74,6 +77,16 @@ pub const SPEAKING_FLAG_PRIORITY: u32 = 1 << 2;
 
 /// Default signaling timeout waiting for main Gateway `VOICE_STATE_UPDATE` + `VOICE_SERVER_UPDATE`.
 pub const DEFAULT_SIGNALING_TIMEOUT: Duration = Duration::from_secs(15);
+
+static RUSTLS_PROVIDER_INIT: Once = Once::new();
+
+/// Install `rustls`'s `ring` [`rustls::crypto::CryptoProvider`] as the process-wide default
+/// (idempotently, once per process) so `tokio-tungstenite` WSS connections never panic.
+pub fn ensure_rustls_ring_provider() {
+    RUSTLS_PROVIDER_INIT.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
 
 /// Main Gateway Op 4 (`UPDATE_VOICE_STATE`) command sent when joining/leaving/muting/deafening.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -241,6 +254,9 @@ pub struct VoiceEngineConfig {
     pub jitter_cushion_frames: usize,
     /// Timeout waiting for main Gateway voice server signaling during `join_voice`.
     pub signaling_timeout: Duration,
+    /// Whether joining a voice channel starts with the local microphone muted (defaults to `true`
+    /// to prevent accidental hot-mic transmissions).
+    pub join_muted: bool,
 }
 
 impl VoiceEngineConfig {
@@ -254,6 +270,7 @@ impl VoiceEngineConfig {
             audio_mode: AudioBackendMode::Auto,
             jitter_cushion_frames: DEFAULT_JITTER_CUSHION_FRAMES,
             signaling_timeout: DEFAULT_SIGNALING_TIMEOUT,
+            join_muted: true,
         }
     }
 }
@@ -347,14 +364,38 @@ struct PendingSignaling {
     session_id: Option<Zeroizing<String>>,
     endpoint: Option<String>,
     token: Option<Zeroizing<String>>,
+    self_mute: Option<bool>,
+    self_deaf: Option<bool>,
+    server_mute: bool,
+    server_deaf: bool,
+}
+
+struct ResolvedSignaling {
+    creds: VoiceGatewayCredentials,
+    self_mute: bool,
+    self_deaf: bool,
+    server_mute: bool,
+    server_deaf: bool,
+}
+
+struct MidCallServerAction {
+    guild_id: Option<Snowflake>,
+    channel_id: Option<Snowflake>,
+    endpoint: Option<String>,
+    token: Zeroizing<String>,
 }
 
 struct SharedSessionState {
     local_user_id: Snowflake,
     local_display_name: String,
+    session_gen: u64,
     active_session_id: Option<String>,
+    last_signaled_target: Option<(Option<Snowflake>, Snowflake)>,
     status: Option<VoiceChannelStatus>,
     call_rings: HashMap<Snowflake, CallRingState>,
+    active_ring_channel: Option<Snowflake>,
+    cached_voice_states: HashMap<Snowflake, HashMap<Snowflake, VoiceStateUpdateEvent>>,
+    channel_names: HashMap<Snowflake, String>,
     user_volumes: HashMap<Snowflake, u8>,
     master_volume: u8,
     input_mode: InputMode,
@@ -372,9 +413,14 @@ impl SharedSessionState {
         Self {
             local_user_id: config.local_user_id,
             local_display_name: config.local_display_name.clone(),
+            session_gen: 0,
             active_session_id: None,
+            last_signaled_target: None,
             status: None,
             call_rings: HashMap::new(),
+            active_ring_channel: None,
+            cached_voice_states: HashMap::new(),
+            channel_names: HashMap::new(),
             user_volumes: HashMap::new(),
             master_volume: 100,
             input_mode: config.input_mode,
@@ -386,36 +432,110 @@ impl SharedSessionState {
         }
     }
 
+    fn resolve_channel_name(
+        &self,
+        guild_id: Option<Snowflake>,
+        channel_id: Snowflake,
+        explicit: Option<String>,
+    ) -> String {
+        explicit
+            .filter(|n| !n.is_empty())
+            .or_else(|| self.channel_names.get(&channel_id).cloned())
+            .unwrap_or_else(|| {
+                if guild_id.is_none() {
+                    format!("DM Call {channel_id}")
+                } else {
+                    format!("Voice {channel_id}")
+                }
+            })
+    }
+
+    fn upsert_cached_voice_state(&mut self, event: &VoiceStateUpdateEvent) {
+        let mut empty_channels = Vec::new();
+        for (&ch_id, users) in &mut self.cached_voice_states {
+            if Some(ch_id) != event.channel_id {
+                users.remove(&event.user_id);
+                if users.is_empty() {
+                    empty_channels.push(ch_id);
+                }
+            }
+        }
+        for ch_id in empty_channels {
+            self.cached_voice_states.remove(&ch_id);
+        }
+
+        if let Some(ch_id) = event.channel_id {
+            self.cached_voice_states
+                .entry(ch_id)
+                .or_default()
+                .insert(event.user_id, event.clone());
+        }
+    }
+
+    fn cached_display_name(&self, channel_id: Snowflake, user_id: Snowflake) -> Option<String> {
+        self.cached_voice_states
+            .get(&channel_id)
+            .and_then(|users| users.get(&user_id))
+            .and_then(|ev| ev.display_name.clone())
+            .filter(|n| !n.is_empty())
+    }
+
+    fn hydrate_cached_participants(&mut self, channel_id: Snowflake) {
+        let cached: Vec<VoiceStateUpdateEvent> = self
+            .cached_voice_states
+            .get(&channel_id)
+            .map(|users| users.values().cloned().collect())
+            .unwrap_or_default();
+
+        for ev in cached {
+            if ev.user_id == self.local_user_id {
+                continue;
+            }
+            self.ensure_participant(ev.user_id, ev.display_name.clone());
+            if let Some(dave) = self.dave.as_mut() {
+                dave.add_recognized_user(ev.user_id);
+            }
+            if let Some(status) = self.status.as_mut()
+                && let Some(p) = status.participants.iter_mut().find(|p| p.user_id == ev.user_id)
+            {
+                p.self_mute = ev.self_mute;
+                p.self_deaf = ev.self_deaf;
+                p.server_mute = ev.mute;
+                p.server_deaf = ev.deaf;
+                p.streaming = ev.self_stream;
+            }
+        }
+    }
+
     fn ensure_participant(&mut self, user_id: Snowflake, display_name: Option<String>) {
         let volume = self.user_volumes.get(&user_id).copied().unwrap_or(100);
         let dave_verified = self
             .dave
             .as_ref()
             .is_some_and(|d| d.is_user_in_verified_group(user_id));
+        let active_ch = self.status.as_ref().map(|s| s.channel_id);
+        let cached_name = active_ch.and_then(|ch| self.cached_display_name(ch, user_id));
+        let effective_name = display_name.filter(|n| !n.is_empty()).or(cached_name);
 
         let Some(status) = self.status.as_mut() else {
             return;
         };
 
         if let Some(existing) = status.participants.iter_mut().find(|p| p.user_id == user_id) {
-            if let Some(name) = display_name
-                && !name.is_empty()
-            {
+            if let Some(name) = effective_name {
                 existing.display_name = name;
             }
             existing.dave_verified = dave_verified;
             return;
         }
 
-        let name = display_name
-            .filter(|n| !n.is_empty())
-            .unwrap_or_else(|| {
-                if user_id == self.local_user_id {
-                    self.local_display_name.clone()
-                } else {
-                    format!("user-{user_id}")
-                }
-            });
+        let name = effective_name.unwrap_or_else(|| {
+            if user_id == self.local_user_id {
+                self.local_display_name.clone()
+            } else {
+                format!("user-{user_id}")
+            }
+        });
 
         status.participants.push(VoiceParticipant {
             user_id,
@@ -438,6 +558,23 @@ impl SharedSessionState {
             dave_verified,
             streaming: false,
         });
+    }
+
+    fn next_active_ring(&self) -> (Option<Snowflake>, CallRingState) {
+        if let Some(ch_id) = self.status.as_ref().map(|s| s.channel_id)
+            && let Some(ring) = self.call_rings.get(&ch_id)
+            && !matches!(ring, CallRingState::Idle)
+        {
+            return (Some(ch_id), ring.clone());
+        }
+        if let Some((&ch_id, ring)) = self
+            .call_rings
+            .iter()
+            .find(|(_, state)| !matches!(state, CallRingState::Idle))
+        {
+            return (Some(ch_id), ring.clone());
+        }
+        (None, CallRingState::Idle)
     }
 
     fn sync_dave_into_status(&mut self) {
@@ -492,10 +629,12 @@ pub struct DiscordVoiceEngine {
     state: Arc<Mutex<SharedSessionState>>,
     signaling: Option<Arc<dyn VoiceSignalingBridge>>,
     signaling_notify: Arc<Notify>,
+    signaling_abort: Arc<AtomicU64>,
     audio_io: Arc<AudioIoHandle>,
     playback_queue: Arc<PlaybackQueue>,
     player: VoiceMessagePlayer,
     events: broadcast::Sender<BackendEvent>,
+    op_lock: tokio::sync::Mutex<()>,
     running: tokio::sync::Mutex<Option<RunningSession>>,
 }
 
@@ -524,12 +663,47 @@ impl DiscordVoiceEngine {
             state,
             signaling,
             signaling_notify: Arc::new(Notify::new()),
+            signaling_abort: Arc::new(AtomicU64::new(0)),
             audio_io,
             playback_queue: Arc::new(PlaybackQueue::new()),
             player,
             events,
+            op_lock: tokio::sync::Mutex::new(()),
             running: tokio::sync::Mutex::new(None),
         })
+    }
+
+    /// Register or update a human-readable channel name used in [`VoiceChannelStatus`].
+    pub fn set_channel_name(&self, channel_id: Snowflake, name: impl Into<String>) {
+        let name = name.into();
+        if name.is_empty() {
+            return;
+        }
+        if let Ok(mut guard) = self.state.lock() {
+            guard.channel_names.insert(channel_id, name.clone());
+            if let Some(status) = guard.status.as_mut()
+                && status.channel_id == channel_id
+            {
+                status.channel_name = name;
+            }
+        }
+    }
+
+    /// Toggle voice connection for `(guild_id, channel_id)`: leaves if already connected/connecting
+    /// to that exact channel, otherwise joins it (serialized against concurrent join/leave calls).
+    pub async fn toggle_voice(
+        &self,
+        guild_id: Option<Snowflake>,
+        channel_id: Snowflake,
+    ) -> CoreResult<Option<VoiceChannelStatus>> {
+        self.abort_pending_if_different(guild_id, Some(channel_id));
+        let _op = self.op_lock.lock().await;
+        if self.is_live_in_channel(guild_id, channel_id).await {
+            self.leave_voice_locked().await?;
+            Ok(None)
+        } else {
+            self.join_voice_locked(guild_id, channel_id).await.map(Some)
+        }
     }
 
     /// Borrow the inline Ogg/Opus [`VoiceMessagePlayer`] for pause/resume/seek and waveform buckets.
@@ -633,11 +807,14 @@ impl DiscordVoiceEngine {
     /// Feed an inbound main Gateway `VOICE_STATE_UPDATE` dispatch event into the engine.
     ///
     /// Supports both Guild voice (`guild_id: Some(...)`) and 1:1 / Group DM calls (`guild_id: None`),
-    /// tracking remote moves, disconnect/other-client takeovers, and remote participant state.
+    /// caching pre-join occupants, syncing local/remote mute & server-mute flags, re-initializing
+    /// DAVE on moderator channel moves, and cleanly tearing down on remote disconnect/hijack.
     pub async fn handle_voice_state_update(&self, event: VoiceStateUpdateEvent) {
-        let mut should_leave = false;
+        let mut should_leave_gen: Option<u64> = None;
         let mut notify_signaling = false;
         let mut emit_status: Option<VoiceChannelStatus> = None;
+        let mut ctrl_mute: Option<bool> = None;
+        let mut ctrl_deaf: Option<bool> = None;
 
         if let Ok(mut guard) = self.state.lock() {
             if event.user_id == guard.local_user_id {
@@ -647,6 +824,10 @@ impl DiscordVoiceEngine {
                 if matches_pending && event.channel_id.is_some() {
                     guard.pending_signaling.session_id =
                         Some(Zeroizing::new(event.session_id.clone()));
+                    guard.pending_signaling.self_mute = Some(event.self_mute);
+                    guard.pending_signaling.self_deaf = Some(event.self_deaf);
+                    guard.pending_signaling.server_mute = event.mute;
+                    guard.pending_signaling.server_deaf = event.deaf;
                     guard.active_session_id = Some(event.session_id.clone());
                     notify_signaling = true;
                 } else {
@@ -654,57 +835,141 @@ impl DiscordVoiceEngine {
                         .active_session_id
                         .as_deref()
                         .is_none_or(|sid| sid == event.session_id);
-                    if let Some(status) = guard.status.as_mut() {
+                    let active_scope = guard.status.as_ref().map(|status| {
                         let same_scope = status.guild_id == event.guild_id
                             || (status.guild_id.is_none()
                                 && event.guild_id.is_none()
                                 && (event.channel_id == Some(status.channel_id)
                                     || event.channel_id.is_none()));
+                        (same_scope, status.guild_id, status.channel_id)
+                    });
 
-                        if same_scope {
-                            match event.channel_id {
-                                Some(new_ch) if same_session => {
+                    if let Some((true, active_guild_id, old_ch)) = active_scope {
+                        match event.channel_id {
+                            Some(new_ch) if same_session => {
+                                let local_uid = guard.local_user_id;
+                                let local_name = guard.local_display_name.clone();
+                                let moved = new_ch != old_ch;
+                                let (prev_eff_mute, prev_eff_deaf) =
+                                    guard.status.as_ref().map_or((false, false), |st| {
+                                        let local_p = st
+                                            .participants
+                                            .iter()
+                                            .find(|p| p.user_id == local_uid);
+                                        let srv_m = local_p.is_some_and(|p| p.server_mute);
+                                        let srv_d = local_p.is_some_and(|p| p.server_deaf);
+                                        (
+                                            st.self_mute || srv_m || st.self_deaf || srv_d,
+                                            st.self_deaf || srv_d,
+                                        )
+                                    });
+
+                                let new_name = if moved {
+                                    Some(guard.resolve_channel_name(active_guild_id, new_ch, None))
+                                } else {
+                                    None
+                                };
+
+                                if let Some(status) = guard.status.as_mut() {
                                     status.channel_id = new_ch;
                                     status.self_mute = event.self_mute;
                                     status.self_deaf = event.self_deaf;
-                                    emit_status = Some(status.clone());
+                                    if let Some(name) = new_name {
+                                        status.channel_name = name;
+                                        status.connection_state =
+                                            VoiceConnectionState::Reconnecting;
+                                        status.participants.retain(|p| p.user_id == local_uid);
+                                    }
                                 }
-                                _ => {
-                                    // Disconnected or moved to another Discord client session.
-                                    should_leave = true;
+
+                                if moved {
+                                    guard.last_signaled_target = Some((active_guild_id, new_ch));
+                                    guard.mixer.clear_speakers();
+                                    guard.dave = Some(DaveController::new(local_uid, new_ch));
+                                    guard.hydrate_cached_participants(new_ch);
                                 }
+
+                                guard.ensure_participant(local_uid, Some(local_name));
+                                let eff_deaf = event.self_deaf || event.deaf;
+                                let eff_mute = event.self_mute || event.mute || eff_deaf;
+                                guard.mixer.set_deafened(eff_deaf);
+                                if eff_mute {
+                                    guard.mixer.update_local_mic_level(MIN_RMS_DB, false);
+                                }
+
+                                if let Some(status) = guard.status.as_mut()
+                                    && let Some(me) = status
+                                        .participants
+                                        .iter_mut()
+                                        .find(|p| p.user_id == local_uid)
+                                {
+                                    me.self_mute = event.self_mute;
+                                    me.self_deaf = event.self_deaf;
+                                    me.server_mute = event.mute;
+                                    me.server_deaf = event.deaf;
+                                    me.streaming = event.self_stream;
+                                    if eff_mute {
+                                        me.speaking = false;
+                                        me.rms_db = MIN_RMS_DB;
+                                    }
+                                }
+
+                                if moved {
+                                    guard.sync_dave_into_status();
+                                }
+                                if eff_mute != prev_eff_mute {
+                                    ctrl_mute = Some(eff_mute);
+                                }
+                                if eff_deaf != prev_eff_deaf {
+                                    ctrl_deaf = Some(eff_deaf);
+                                }
+                                emit_status = guard.status.clone();
+                            }
+                            _ => {
+                                // Disconnected or moved to another Discord client session.
+                                should_leave_gen = Some(guard.session_gen);
                             }
                         }
                     }
                 }
-            } else if let Some(active_ch) = guard.status.as_ref().map(|s| s.channel_id) {
-                if event.channel_id == Some(active_ch) {
-                    guard.ensure_participant(event.user_id, event.display_name.clone());
-                    if let Some(dave) = guard.dave.as_mut() {
-                        dave.add_recognized_user(event.user_id);
-                    }
-                    if let Some(status) = guard.status.as_mut() {
-                        if let Some(p) = status
-                            .participants
-                            .iter_mut()
-                            .find(|p| p.user_id == event.user_id)
-                        {
-                            p.self_mute = event.self_mute;
-                            p.self_deaf = event.self_deaf;
-                            p.server_mute = event.mute;
-                            p.server_deaf = event.deaf;
-                            p.streaming = event.self_stream;
-                        }
-                        emit_status = Some(status.clone());
-                    }
-                } else if let Some(status) = guard.status.as_mut() {
-                    let before = status.participants.len();
-                    status.participants.retain(|p| p.user_id != event.user_id);
-                    if status.participants.len() != before {
-                        emit_status = Some(status.clone());
-                        guard.mixer.remove_user(event.user_id);
+            } else {
+                // Always maintain remote voice state cache so joining/moving into a channel
+                // immediately hydrates existing participants.
+                guard.upsert_cached_voice_state(&event);
+
+                if let Some(active_ch) = guard.status.as_ref().map(|s| s.channel_id) {
+                    if event.channel_id == Some(active_ch) {
+                        guard.ensure_participant(event.user_id, event.display_name.clone());
                         if let Some(dave) = guard.dave.as_mut() {
-                            dave.remove_recognized_user(event.user_id);
+                            dave.add_recognized_user(event.user_id);
+                        }
+                        if let Some(status) = guard.status.as_mut() {
+                            if let Some(p) = status
+                                .participants
+                                .iter_mut()
+                                .find(|p| p.user_id == event.user_id)
+                            {
+                                p.self_mute = event.self_mute;
+                                p.self_deaf = event.self_deaf;
+                                p.server_mute = event.mute;
+                                p.server_deaf = event.deaf;
+                                p.streaming = event.self_stream;
+                                if event.self_mute || event.mute || event.self_deaf || event.deaf {
+                                    p.speaking = false;
+                                    p.rms_db = MIN_RMS_DB;
+                                }
+                            }
+                            emit_status = Some(status.clone());
+                        }
+                    } else if let Some(status) = guard.status.as_mut() {
+                        let before = status.participants.len();
+                        status.participants.retain(|p| p.user_id != event.user_id);
+                        if status.participants.len() != before {
+                            emit_status = Some(status.clone());
+                            guard.mixer.remove_user(event.user_id);
+                            if let Some(dave) = guard.dave.as_mut() {
+                                dave.remove_recognized_user(event.user_id);
+                            }
                         }
                     }
                 }
@@ -714,40 +979,195 @@ impl DiscordVoiceEngine {
         if notify_signaling {
             self.signaling_notify.notify_waiters();
         }
+        if (ctrl_mute.is_some() || ctrl_deaf.is_some())
+            && let Some(ctrl) = self.control_sender().await
+        {
+            if let Some(deaf) = ctrl_deaf {
+                let _ = ctrl.send(RuntimeControl::SetDeaf(deaf)).await;
+            }
+            if let Some(muted) = ctrl_mute {
+                let _ = ctrl.send(RuntimeControl::SetMute(muted)).await;
+            }
+        }
         if let Some(st) = emit_status {
             let _ = self.events.send(BackendEvent::VoiceStatusUpdated(st));
         }
-        if should_leave {
-            let _ = self.stop_running_session().await;
+        if let Some(expected_gen) = should_leave_gen {
+            let _op = self.op_lock.lock().await;
+            let still_matches = self
+                .state
+                .lock()
+                .is_ok_and(|g| g.session_gen == expected_gen && g.status.is_some());
+            if still_matches {
+                let _ = self.stop_running_session_locked(true).await;
+                if let Ok(mut guard) = self.state.lock() {
+                    guard.last_signaled_target = None;
+                }
+            }
         }
     }
 
     /// Feed an inbound main Gateway `VOICE_SERVER_UPDATE` event into the engine.
     ///
     /// Works identically for Guild voice (`guild_id: Some(...)`) and 1:1 / Group DM calls
-    /// (`guild_id: None`, matched via `channel_id`).
+    /// (`guild_id: None`, matched via `channel_id`), handling both initial join handshakes and
+    /// mid-call voice server migrations / moderator channel moves.
     pub async fn handle_voice_server_update(&self, event: VoiceServerUpdateEvent) {
         let mut notify_signaling = false;
+        let mut mid_call_action: Option<MidCallServerAction> = None;
+
         if let Ok(mut guard) = self.state.lock() {
-            let matches_guild = event.guild_id.is_some()
+            let matches_pending_guild = event.guild_id.is_some()
                 && guard.pending_signaling.target_guild_id == event.guild_id;
-            let matches_dm_call = event.guild_id.is_none()
+            let matches_pending_dm = event.guild_id.is_none()
                 && guard.pending_signaling.target_guild_id.is_none()
                 && event.channel_id.is_some()
                 && guard.pending_signaling.target_channel_id == event.channel_id;
 
-            if matches_guild || matches_dm_call {
+            if matches_pending_guild || matches_pending_dm {
                 guard.pending_signaling.endpoint = event.endpoint;
                 guard.pending_signaling.token = Some(event.token);
                 notify_signaling = true;
+            } else if guard.pending_signaling.target_channel_id.is_none()
+                && let Some(status) = guard.status.as_ref()
+            {
+                let matches_active_guild =
+                    event.guild_id.is_some() && status.guild_id == event.guild_id;
+                let matches_active_dm = event.guild_id.is_none()
+                    && status.guild_id.is_none()
+                    && event.channel_id == Some(status.channel_id);
+
+                if matches_active_guild || matches_active_dm {
+                    mid_call_action = Some(MidCallServerAction {
+                        guild_id: event.guild_id,
+                        channel_id: event.channel_id,
+                        endpoint: event.endpoint,
+                        token: event.token,
+                    });
+                }
             }
         }
         if notify_signaling {
             self.signaling_notify.notify_waiters();
         }
+        if let Some(action) = mid_call_action {
+            self.handle_mid_call_server_update(action).await;
+        }
+    }
+
+    async fn handle_mid_call_server_update(&self, action: MidCallServerAction) {
+        let _op = self.op_lock.lock().await;
+
+        let snapshot = {
+            let Ok(mut guard) = self.state.lock() else {
+                return;
+            };
+            let Some(status) = guard.status.as_ref() else {
+                return;
+            };
+            let matches_active_guild =
+                action.guild_id.is_some() && status.guild_id == action.guild_id;
+            let matches_active_dm = action.guild_id.is_none()
+                && status.guild_id.is_none()
+                && action.channel_id == Some(status.channel_id);
+            if !matches_active_guild && !matches_active_dm {
+                return;
+            }
+            let Some(session_id) = guard.active_session_id.clone() else {
+                return;
+            };
+
+            let local_p = status
+                .participants
+                .iter()
+                .find(|p| p.user_id == guard.local_user_id);
+            let server_mute = local_p.is_some_and(|p| p.server_mute);
+            let server_deaf = local_p.is_some_and(|p| p.server_deaf);
+
+            let info = (
+                status.guild_id,
+                status.channel_id,
+                status.channel_name.clone(),
+                status.self_mute,
+                status.self_deaf,
+                server_mute,
+                server_deaf,
+                guard.local_user_id,
+                session_id,
+            );
+
+            if action.endpoint.is_none() {
+                // Server is clearing the endpoint mid-migration; mark Reconnecting and drop only
+                // the old WebSocket task while preserving active voice status and session_id.
+                guard.session_gen = guard.session_gen.wrapping_add(1);
+                if let Some(st) = guard.status.as_mut() {
+                    st.connection_state = VoiceConnectionState::Reconnecting;
+                    let _ = self
+                        .events
+                        .send(BackendEvent::VoiceStatusUpdated(st.clone()));
+                }
+                guard.mixer.clear_speakers();
+                None
+            } else {
+                Some(info)
+            }
+        };
+
+        let Some((
+            guild_id,
+            channel_id,
+            channel_name,
+            self_mute,
+            self_deaf,
+            server_mute,
+            server_deaf,
+            user_id,
+            session_id,
+        )) = snapshot
+        else {
+            // Endpoint was None: tear down only the active WS task & audio streams.
+            self.stop_ws_task_and_audio_only().await;
+            return;
+        };
+
+        let Some(endpoint) = action.endpoint else {
+            return;
+        };
+
+        let creds = VoiceGatewayCredentials {
+            guild_id,
+            channel_id,
+            channel_name: Some(channel_name),
+            user_id,
+            session_id: Zeroizing::new(session_id),
+            token: action.token,
+            endpoint,
+        };
+
+        if let Err(err) = self
+            .start_voice_gateway_session_locked(
+                creds,
+                self_mute,
+                self_deaf,
+                server_mute,
+                server_deaf,
+                true,
+            )
+            .await
+        {
+            warn!("mid-call voice server reconnect failed: {err}");
+            let _ = self.events.send(BackendEvent::ErrorBanner {
+                scope: "voice".to_string(),
+                message: format!("voice server reconnect failed: {err}"),
+                recoverable: true,
+            });
+        }
     }
 
     /// Feed an inbound main Gateway `CALL_CREATE` or `CALL_UPDATE` event for 1:1 / Group DM calls.
+    ///
+    /// Ring state notifications are channel-scoped so an idle update for an unrelated channel
+    /// cannot clobber an active ring on another channel.
     pub fn handle_call_update(&self, event: CallUpdateEvent) {
         let ring_state = if !event.connected_user_ids.is_empty() && event.ringing.is_empty() {
             CallRingState::Active {
@@ -777,30 +1197,54 @@ impl DiscordVoiceEngine {
             CallRingState::Idle
         };
 
+        let mut emit_ring: Option<CallRingState> = None;
         let mut emit_status = None;
         if let Ok(mut guard) = self.state.lock() {
-            guard
-                .call_rings
-                .insert(event.channel_id, ring_state.clone());
+            if matches!(ring_state, CallRingState::Idle) {
+                guard.call_rings.remove(&event.channel_id);
+                if guard.active_ring_channel == Some(event.channel_id) {
+                    let (next_ch, next_state) = guard.next_active_ring();
+                    guard.active_ring_channel = next_ch;
+                    emit_ring = Some(next_state);
+                }
+            } else {
+                guard
+                    .call_rings
+                    .insert(event.channel_id, ring_state.clone());
+                guard.active_ring_channel = Some(event.channel_id);
+                emit_ring = Some(ring_state.clone());
+            }
+
             if let Some(status) = guard.status.as_mut()
                 && status.channel_id == event.channel_id
             {
-                status.call_ring = ring_state.clone();
+                status.call_ring = ring_state;
                 emit_status = Some(status.clone());
             }
         }
 
-        let _ = self.events.send(BackendEvent::CallRingUpdated(ring_state));
+        if let Some(ring) = emit_ring {
+            let _ = self.events.send(BackendEvent::CallRingUpdated(ring));
+        }
         if let Some(st) = emit_status {
             let _ = self.events.send(BackendEvent::VoiceStatusUpdated(st));
         }
     }
 
     /// Feed an inbound main Gateway `CALL_DELETE` event when a DM/Group DM call ends.
+    ///
+    /// Strictly channel-scoped: deleting an unrelated DM call does not overwrite an active
+    /// ring banner belonging to another channel.
     pub fn handle_call_delete(&self, channel_id: Snowflake) {
+        let mut emit_ring: Option<CallRingState> = None;
         let mut emit_status = None;
         if let Ok(mut guard) = self.state.lock() {
-            guard.call_rings.insert(channel_id, CallRingState::Idle);
+            guard.call_rings.remove(&channel_id);
+            if guard.active_ring_channel == Some(channel_id) {
+                let (next_ch, next_state) = guard.next_active_ring();
+                guard.active_ring_channel = next_ch;
+                emit_ring = Some(next_state);
+            }
             if let Some(status) = guard.status.as_mut()
                 && status.channel_id == channel_id
             {
@@ -808,9 +1252,9 @@ impl DiscordVoiceEngine {
                 emit_status = Some(status.clone());
             }
         }
-        let _ = self
-            .events
-            .send(BackendEvent::CallRingUpdated(CallRingState::Idle));
+        if let Some(ring) = emit_ring {
+            let _ = self.events.send(BackendEvent::CallRingUpdated(ring));
+        }
         if let Some(st) = emit_status {
             let _ = self.events.send(BackendEvent::VoiceStatusUpdated(st));
         }
@@ -824,25 +1268,83 @@ impl DiscordVoiceEngine {
         &self,
         creds: VoiceGatewayCredentials,
     ) -> VoiceResult<VoiceChannelStatus> {
-        self.stop_running_session().await?;
+        let _op = self.op_lock.lock().await;
+        self.start_voice_gateway_session_locked(
+            creds,
+            self.config.join_muted,
+            false,
+            false,
+            false,
+            false,
+        )
+        .await
+    }
 
-        let channel_name = creds.channel_name.clone().unwrap_or_else(|| {
-            if creds.guild_id.is_none() {
-                format!("DM Call {}", creds.channel_id)
-            } else {
-                format!("Voice {}", creds.channel_id)
+    async fn stop_ws_task_and_audio_only(&self) {
+        let prev = {
+            let mut running = self.running.lock().await;
+            running.take()
+        };
+        if let Some(session) = prev {
+            let _ = session.stop_tx.send(true);
+            let _ = session.task.await;
+        }
+        let _ = self.audio_io.stop_capture().await;
+        let _ = self.audio_io.stop_playback().await;
+        self.playback_queue.clear();
+    }
+
+    async fn start_voice_gateway_session_locked(
+        &self,
+        creds: VoiceGatewayCredentials,
+        initial_self_mute: bool,
+        initial_self_deaf: bool,
+        initial_server_mute: bool,
+        initial_server_deaf: bool,
+        is_reconnect: bool,
+    ) -> VoiceResult<VoiceChannelStatus> {
+        if is_reconnect {
+            // Bump session generation BEFORE stopping the superseded task so its cleanup path
+            // does not emit a spurious `Disconnected` event or clobber our reconnecting status.
+            if let Ok(mut guard) = self.state.lock() {
+                guard.session_gen = guard.session_gen.wrapping_add(1);
             }
-        });
+            self.stop_ws_task_and_audio_only().await;
+        } else {
+            self.stop_running_session_locked(true).await?;
+        }
 
-        let initial_status = {
+        let (session_gen, initial_status) = {
             let mut guard = self
                 .state
                 .lock()
                 .map_err(|_| VoiceError::Internal("voice state lock poisoned".to_string()))?;
+
+            guard.session_gen = guard.session_gen.wrapping_add(1);
+            let my_gen = guard.session_gen;
+
+            let channel_name =
+                guard.resolve_channel_name(creds.guild_id, creds.channel_id, creds.channel_name.clone());
+            let eff_deaf = initial_self_deaf || initial_server_deaf;
+            let eff_mute = initial_self_mute || initial_server_mute || eff_deaf;
+
             guard.mixer.clear_speakers();
             guard.mixer.set_local_user(creds.user_id);
+            guard.mixer.set_deafened(eff_deaf);
             guard.active_session_id = Some(creds.session_id.as_str().to_string());
+            guard.last_signaled_target = Some((creds.guild_id, creds.channel_id));
             guard.dave = Some(DaveController::new(creds.user_id, creds.channel_id));
+
+            let preserved_participants: Vec<VoiceParticipant> = if is_reconnect {
+                guard
+                    .status
+                    .as_ref()
+                    .filter(|st| st.channel_id == creds.channel_id)
+                    .map(|st| st.participants.clone())
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
 
             let call_ring = if creds.guild_id.is_none() {
                 guard
@@ -861,23 +1363,66 @@ impl DiscordVoiceEngine {
                 guild_id: creds.guild_id,
                 channel_id: creds.channel_id,
                 channel_name,
-                connection_state: VoiceConnectionState::Connecting,
-                self_mute: false,
-                self_deaf: false,
+                connection_state: if is_reconnect {
+                    VoiceConnectionState::Reconnecting
+                } else {
+                    VoiceConnectionState::Connecting
+                },
+                self_mute: initial_self_mute,
+                self_deaf: initial_self_deaf,
                 push_to_talk: matches!(guard.input_mode, InputMode::PushToTalk),
                 ping_ms: None,
                 packet_loss_pct: 0.0,
                 dave: DaveSessionState::Handshaking,
                 call_ring,
-                participants: Vec::new(),
+                participants: preserved_participants,
             };
             guard.status = Some(status);
+
             let local_name = guard.local_display_name.clone();
             guard.ensure_participant(creds.user_id, Some(local_name));
-            guard
+            guard.hydrate_cached_participants(creds.channel_id);
+
+            // Register all known participants for this channel in the fresh DAVE MLS controller.
+            let known_peers: Vec<Snowflake> = guard
+                .status
+                .as_ref()
+                .map(|st| {
+                    st.participants
+                        .iter()
+                        .filter(|p| p.user_id != creds.user_id)
+                        .map(|p| p.user_id)
+                        .collect()
+                })
+                .unwrap_or_default();
+            if let Some(dave) = guard.dave.as_mut() {
+                for peer_uid in known_peers {
+                    dave.add_recognized_user(peer_uid);
+                }
+            }
+
+            if let Some(st) = guard.status.as_mut()
+                && let Some(me) = st
+                    .participants
+                    .iter_mut()
+                    .find(|p| p.user_id == creds.user_id)
+            {
+                me.self_mute = initial_self_mute;
+                me.self_deaf = initial_self_deaf;
+                me.server_mute = initial_server_mute;
+                me.server_deaf = initial_server_deaf;
+                if eff_mute {
+                    me.speaking = false;
+                    me.rms_db = MIN_RMS_DB;
+                }
+            }
+            guard.sync_dave_into_status();
+
+            let cloned = guard
                 .status
                 .clone()
-                .ok_or_else(|| VoiceError::Internal("missing voice status".to_string()))?
+                .ok_or_else(|| VoiceError::Internal("missing voice status".to_string()))?;
+            (my_gen, cloned)
         };
 
         let _ = self
@@ -903,25 +1448,32 @@ impl DiscordVoiceEngine {
             )
             .await;
 
-            // Guaranteed cleanup on both clean exit and error/zombie termination.
-            let _ = audio_io.stop_capture().await;
-            let _ = audio_io.stop_playback().await;
-            playback_queue.clear();
+            // Only clean up audio and emit Disconnected if this task was NOT superseded by a
+            // newer session or mid-call reconnect.
+            let is_current = state
+                .lock()
+                .is_ok_and(|guard| guard.session_gen == session_gen);
+            if is_current {
+                let _ = audio_io.stop_capture().await;
+                let _ = audio_io.stop_playback().await;
+                playback_queue.clear();
 
-            if let Ok(mut guard) = state.lock()
-                && let Some(st) = guard.status.as_mut()
-            {
-                st.connection_state = VoiceConnectionState::Disconnected;
-                let _ = events.send(BackendEvent::VoiceStatusUpdated(st.clone()));
-            }
+                if let Ok(mut guard) = state.lock()
+                    && guard.session_gen == session_gen
+                    && let Some(st) = guard.status.as_mut()
+                {
+                    st.connection_state = VoiceConnectionState::Disconnected;
+                    let _ = events.send(BackendEvent::VoiceStatusUpdated(st.clone()));
+                }
 
-            if let Err(err) = result {
-                warn!("voice gateway session ended with error: {err}");
-                let _ = events.send(BackendEvent::ErrorBanner {
-                    scope: "voice".to_string(),
-                    message: err.to_string(),
-                    recoverable: true,
-                });
+                if let Err(err) = result {
+                    warn!("voice gateway session ended with error: {err}");
+                    let _ = events.send(BackendEvent::ErrorBanner {
+                        scope: "voice".to_string(),
+                        message: err.to_string(),
+                        recoverable: true,
+                    });
+                }
             }
         });
 
@@ -940,7 +1492,44 @@ impl DiscordVoiceEngine {
         running.as_ref().map(|r| r.ctrl_tx.clone())
     }
 
-    async fn stop_running_session(&self) -> VoiceResult<()> {
+    async fn is_live_in_channel(
+        &self,
+        guild_id: Option<Snowflake>,
+        channel_id: Snowflake,
+    ) -> bool {
+        let task_alive = {
+            let running = self.running.lock().await;
+            running.as_ref().is_some_and(|r| !r.task.is_finished())
+        };
+        if !task_alive {
+            return false;
+        }
+        self.state.lock().is_ok_and(|g| {
+            g.status.as_ref().is_some_and(|st| {
+                st.guild_id == guild_id
+                    && st.channel_id == channel_id
+                    && st.connection_state != VoiceConnectionState::Disconnected
+            })
+        })
+    }
+
+    fn abort_pending_if_different(
+        &self,
+        target_guild_id: Option<Snowflake>,
+        target_channel_id: Option<Snowflake>,
+    ) {
+        let should_abort = self.state.lock().is_ok_and(|g| {
+            g.pending_signaling.target_channel_id.is_some()
+                && (g.pending_signaling.target_guild_id != target_guild_id
+                    || g.pending_signaling.target_channel_id != target_channel_id)
+        });
+        if should_abort {
+            self.signaling_abort.fetch_add(1, Ordering::SeqCst);
+            self.signaling_notify.notify_waiters();
+        }
+    }
+
+    async fn stop_running_session_locked(&self, emit_disconnect: bool) -> VoiceResult<()> {
         let prev = {
             let mut running = self.running.lock().await;
             running.take()
@@ -953,12 +1542,29 @@ impl DiscordVoiceEngine {
         let _ = self.audio_io.stop_playback().await;
         self.playback_queue.clear();
 
-        if let Ok(mut guard) = self.state.lock() {
-            guard.status = None;
+        let disconnect_event = if let Ok(mut guard) = self.state.lock() {
+            let ev = if emit_disconnect
+                && let Some(mut st) = guard.status.take()
+                && st.connection_state != VoiceConnectionState::Disconnected
+            {
+                st.connection_state = VoiceConnectionState::Disconnected;
+                Some(st)
+            } else {
+                guard.status = None;
+                None
+            };
+            guard.session_gen = guard.session_gen.wrapping_add(1);
             guard.dave = None;
             guard.active_session_id = None;
             guard.mixer.clear_speakers();
             guard.pending_signaling = PendingSignaling::default();
+            ev
+        } else {
+            None
+        };
+
+        if let Some(st) = disconnect_event {
+            let _ = self.events.send(BackendEvent::VoiceStatusUpdated(st));
         }
         Ok(())
     }
@@ -967,13 +1573,20 @@ impl DiscordVoiceEngine {
         &self,
         guild_id: Option<Snowflake>,
         channel_id: Snowflake,
-    ) -> VoiceResult<VoiceGatewayCredentials> {
+        abort_epoch: u64,
+    ) -> VoiceResult<ResolvedSignaling> {
         let deadline = tokio::time::Instant::now() + self.config.signaling_timeout;
         loop {
             // Register and enable the waiter BEFORE checking shared state to prevent lost wakeups.
             let notified = self.signaling_notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
+
+            if self.signaling_abort.load(Ordering::SeqCst) != abort_epoch {
+                return Err(VoiceError::Signaling(
+                    "voice join cancelled by newer voice operation".to_string(),
+                ));
+            }
 
             let maybe_ready = {
                 let guard = self
@@ -988,14 +1601,23 @@ impl DiscordVoiceEngine {
                         &guard.pending_signaling.endpoint,
                         &guard.pending_signaling.token,
                     ) {
-                        (Some(sid), Some(endpoint), Some(token)) => Some(VoiceGatewayCredentials {
-                            guild_id,
-                            channel_id,
-                            channel_name: None,
-                            user_id: guard.local_user_id,
-                            session_id: sid.clone(),
-                            token: token.clone(),
-                            endpoint: endpoint.clone(),
+                        (Some(sid), Some(endpoint), Some(token)) => Some(ResolvedSignaling {
+                            creds: VoiceGatewayCredentials {
+                                guild_id,
+                                channel_id,
+                                channel_name: guard.channel_names.get(&channel_id).cloned(),
+                                user_id: guard.local_user_id,
+                                session_id: sid.clone(),
+                                token: token.clone(),
+                                endpoint: endpoint.clone(),
+                            },
+                            self_mute: guard
+                                .pending_signaling
+                                .self_mute
+                                .unwrap_or(self.config.join_muted),
+                            self_deaf: guard.pending_signaling.self_deaf.unwrap_or(false),
+                            server_mute: guard.pending_signaling.server_mute,
+                            server_deaf: guard.pending_signaling.server_deaf,
                         }),
                         _ => None,
                     }
@@ -1004,8 +1626,8 @@ impl DiscordVoiceEngine {
                 }
             };
 
-            if let Some(creds) = maybe_ready {
-                return Ok(creds);
+            if let Some(resolved) = maybe_ready {
+                return Ok(resolved);
             }
 
             if tokio::time::timeout_at(deadline, notified).await.is_err() {
@@ -1015,17 +1637,55 @@ impl DiscordVoiceEngine {
             }
         }
     }
-}
 
-#[async_trait]
-impl VoiceEngine for DiscordVoiceEngine {
-    async fn join_voice(
+    async fn join_voice_locked(
         &self,
         guild_id: Option<Snowflake>,
         channel_id: Snowflake,
     ) -> CoreResult<VoiceChannelStatus> {
-        self.stop_running_session().await.map_err(CoreError::from)?;
+        // Idempotent guard: clicking the already-active voice channel must NOT tear down and
+        // re-send an identical Op 4 (Discord ignores identical Op 4, causing a 15s timeout).
+        if self.is_live_in_channel(guild_id, channel_id).await
+            && let Ok(guard) = self.state.lock()
+            && let Some(existing) = guard.status.clone()
+        {
+            return Ok(existing);
+        }
 
+        let prev_signaled_same_channel = self
+            .state
+            .lock()
+            .ok()
+            .and_then(|g| g.last_signaled_target)
+            == Some((guild_id, channel_id));
+
+        self.stop_running_session_locked(true)
+            .await
+            .map_err(CoreError::from)?;
+
+        let Some(bridge) = self.signaling.as_ref() else {
+            return Err(CoreError::Voice(
+                "no main gateway signaling bridge configured; use connect_voice_gateway for direct connections".to_string(),
+            ));
+        };
+
+        // If retrying the exact same channel after a dead Voice WebSocket while Discord still
+        // holds our voice state there, send an Op 4 leave first so Discord replies to the rejoin.
+        if prev_signaled_same_channel {
+            let _ = bridge
+                .send_voice_state_update(VoiceStateUpdateCommand {
+                    guild_id,
+                    channel_id: None,
+                    self_mute: false,
+                    self_deaf: false,
+                })
+                .await;
+            if let Ok(mut guard) = self.state.lock() {
+                guard.last_signaled_target = None;
+            }
+        }
+
+        let abort_epoch = self.signaling_abort.load(Ordering::SeqCst);
         {
             let mut guard = self
                 .state
@@ -1037,43 +1697,108 @@ impl VoiceEngine for DiscordVoiceEngine {
                 session_id: None,
                 endpoint: None,
                 token: None,
+                self_mute: None,
+                self_deaf: None,
+                server_mute: false,
+                server_deaf: false,
             };
         }
 
-        let Some(bridge) = self.signaling.as_ref() else {
-            return Err(CoreError::Voice(
-                "no main gateway signaling bridge configured; use connect_voice_gateway for direct connections".to_string(),
-            ));
-        };
-
-        bridge
+        if let Err(err) = bridge
             .send_voice_state_update(VoiceStateUpdateCommand {
                 guild_id,
                 channel_id: Some(channel_id),
-                self_mute: false,
+                self_mute: self.config.join_muted,
                 self_deaf: false,
             })
             .await
-            .map_err(CoreError::from)?;
+        {
+            if let Ok(mut guard) = self.state.lock() {
+                guard.pending_signaling = PendingSignaling::default();
+            }
+            return Err(CoreError::from(err));
+        }
 
-        let creds = self
-            .wait_for_signaling_credentials(guild_id, channel_id)
-            .await
-            .map_err(CoreError::from)?;
+        if let Ok(mut guard) = self.state.lock() {
+            guard.last_signaled_target = Some((guild_id, channel_id));
+        }
 
-        self.connect_voice_gateway(creds)
+        let resolved = match self
+            .wait_for_signaling_credentials(guild_id, channel_id, abort_epoch)
             .await
-            .map_err(CoreError::from)
+        {
+            Ok(res) => res,
+            Err(err) => {
+                let preempted = self.signaling_abort.load(Ordering::SeqCst) != abort_epoch;
+                if let Ok(mut guard) = self.state.lock() {
+                    guard.pending_signaling = PendingSignaling::default();
+                    if !preempted {
+                        guard.last_signaled_target = None;
+                    }
+                }
+                if !preempted {
+                    // Clear any half-established voice state on Discord so we do not linger as a ghost.
+                    let _ = bridge
+                        .send_voice_state_update(VoiceStateUpdateCommand {
+                            guild_id,
+                            channel_id: None,
+                            self_mute: false,
+                            self_deaf: false,
+                        })
+                        .await;
+                }
+                return Err(CoreError::from(err));
+            }
+        };
+
+        if let Ok(mut guard) = self.state.lock() {
+            guard.pending_signaling = PendingSignaling::default();
+        }
+
+        match self
+            .start_voice_gateway_session_locked(
+                resolved.creds,
+                resolved.self_mute,
+                resolved.self_deaf,
+                resolved.server_mute,
+                resolved.server_deaf,
+                false,
+            )
+            .await
+        {
+            Ok(status) => Ok(status),
+            Err(err) => {
+                if let Ok(mut guard) = self.state.lock() {
+                    guard.last_signaled_target = None;
+                }
+                let _ = bridge
+                    .send_voice_state_update(VoiceStateUpdateCommand {
+                        guild_id,
+                        channel_id: None,
+                        self_mute: false,
+                        self_deaf: false,
+                    })
+                    .await;
+                Err(CoreError::from(err))
+            }
+        }
     }
 
-    async fn leave_voice(&self) -> CoreResult<()> {
-        let prev_guild = self
-            .state
-            .lock()
-            .ok()
-            .and_then(|g| g.status.as_ref().map(|s| s.guild_id));
+    async fn leave_voice_locked(&self) -> CoreResult<()> {
+        let prev_guild = self.state.lock().ok().and_then(|g| {
+            g.status
+                .as_ref()
+                .map(|s| s.guild_id)
+                .or_else(|| g.last_signaled_target.map(|(gid, _)| gid))
+        });
 
-        self.stop_running_session().await.map_err(CoreError::from)?;
+        self.stop_running_session_locked(true)
+            .await
+            .map_err(CoreError::from)?;
+
+        if let Ok(mut guard) = self.state.lock() {
+            guard.last_signaled_target = None;
+        }
 
         if let (Some(bridge), Some(guild_id)) = (self.signaling.as_ref(), prev_guild) {
             bridge
@@ -1088,9 +1813,29 @@ impl VoiceEngine for DiscordVoiceEngine {
         }
         Ok(())
     }
+}
+
+#[async_trait]
+impl VoiceEngine for DiscordVoiceEngine {
+    async fn join_voice(
+        &self,
+        guild_id: Option<Snowflake>,
+        channel_id: Snowflake,
+    ) -> CoreResult<VoiceChannelStatus> {
+        self.abort_pending_if_different(guild_id, Some(channel_id));
+        let _op = self.op_lock.lock().await;
+        self.join_voice_locked(guild_id, channel_id).await
+    }
+
+    async fn leave_voice(&self) -> CoreResult<()> {
+        self.signaling_abort.fetch_add(1, Ordering::SeqCst);
+        self.signaling_notify.notify_waiters();
+        let _op = self.op_lock.lock().await;
+        self.leave_voice_locked().await
+    }
 
     async fn set_self_mute(&self, muted: bool) -> CoreResult<VoiceChannelStatus> {
-        let (status, guild_id, channel_id, self_deaf) = {
+        let (status, guild_id, channel_id, self_deaf, eff_mute, eff_deaf) = {
             let mut guard = self
                 .state
                 .lock()
@@ -1105,25 +1850,31 @@ impl VoiceEngine for DiscordVoiceEngine {
                 status.self_deaf = false;
             }
             let deaf = status.self_deaf;
+            let mut srv_mute = false;
+            let mut srv_deaf = false;
             if let Some(me) = status.participants.iter_mut().find(|p| p.user_id == local_uid) {
+                srv_mute = me.server_mute;
+                srv_deaf = me.server_deaf;
                 me.self_mute = muted;
                 me.self_deaf = deaf;
-                if muted {
+                if muted || srv_mute || deaf || srv_deaf {
                     me.speaking = false;
                     me.rms_db = MIN_RMS_DB;
                 }
             }
+            let eff_d = deaf || srv_deaf;
+            let eff_m = muted || srv_mute || eff_d;
             let cloned = status.clone();
             let gid = status.guild_id;
             let cid = status.channel_id;
-            guard.mixer.set_deafened(deaf);
-            (cloned, gid, cid, deaf)
+            guard.mixer.set_deafened(eff_d);
+            (cloned, gid, cid, deaf, eff_m, eff_d)
         };
 
         if let Some(ctrl) = self.control_sender().await {
-            let _ = ctrl.send(RuntimeControl::SetMute(muted)).await;
+            let _ = ctrl.send(RuntimeControl::SetMute(eff_mute)).await;
             if !muted {
-                let _ = ctrl.send(RuntimeControl::SetDeaf(false)).await;
+                let _ = ctrl.send(RuntimeControl::SetDeaf(eff_deaf)).await;
             }
         }
         if let Some(bridge) = self.signaling.as_ref() {
@@ -1143,7 +1894,7 @@ impl VoiceEngine for DiscordVoiceEngine {
     }
 
     async fn set_self_deaf(&self, deafened: bool) -> CoreResult<VoiceChannelStatus> {
-        let (status, guild_id, channel_id, self_mute) = {
+        let (status, guild_id, channel_id, self_mute, eff_mute, eff_deaf) = {
             let mut guard = self
                 .state
                 .lock()
@@ -1158,24 +1909,30 @@ impl VoiceEngine for DiscordVoiceEngine {
                 status.self_mute = true;
             }
             let mute = status.self_mute;
+            let mut srv_mute = false;
+            let mut srv_deaf = false;
             if let Some(me) = status.participants.iter_mut().find(|p| p.user_id == local_uid) {
+                srv_mute = me.server_mute;
+                srv_deaf = me.server_deaf;
                 me.self_deaf = deafened;
                 me.self_mute = mute;
-                if deafened {
+                if deafened || srv_deaf || mute || srv_mute {
                     me.speaking = false;
                     me.rms_db = MIN_RMS_DB;
                 }
             }
+            let eff_d = deafened || srv_deaf;
+            let eff_m = mute || srv_mute || eff_d;
             let cloned = status.clone();
             let gid = status.guild_id;
             let cid = status.channel_id;
-            guard.mixer.set_deafened(deafened);
-            (cloned, gid, cid, mute)
+            guard.mixer.set_deafened(eff_d);
+            (cloned, gid, cid, mute, eff_m, eff_d)
         };
 
         if let Some(ctrl) = self.control_sender().await {
-            let _ = ctrl.send(RuntimeControl::SetDeaf(deafened)).await;
-            if deafened {
+            let _ = ctrl.send(RuntimeControl::SetDeaf(eff_deaf)).await;
+            if eff_mute {
                 let _ = ctrl.send(RuntimeControl::SetMute(true)).await;
             }
         }
@@ -1331,6 +2088,8 @@ async fn run_voice_gateway_session(
     mut stop_rx: watch::Receiver<bool>,
     mut ctrl_rx: mpsc::Receiver<RuntimeControl>,
 ) -> VoiceResult<()> {
+    ensure_rustls_ring_provider();
+
     let ws_url = creds.gateway_ws_url();
     info!(
         "connecting voice gateway v8 (guild={:?}, channel={})",
@@ -1344,17 +2103,31 @@ async fn run_voice_gateway_session(
 
     let capture_queue = Arc::new(CaptureQueue::new());
     let mut mic_frame_buf = [0.0f32; FRAME_SAMPLES];
-    let mut mic_processor = {
-        let mode = state
+    let (mut self_muted, mut self_deafened, mut mic_processor) = {
+        let guard = state
             .lock()
-            .map_or_else(|_| InputMode::default(), |g| g.input_mode);
-        MicCaptureProcessor::new(mode)?
+            .map_err(|_| VoiceError::Internal("voice state lock poisoned".to_string()))?;
+        let (muted, deaf) = guard.status.as_ref().map_or((false, false), |st| {
+            let local_p = st
+                .participants
+                .iter()
+                .find(|p| p.user_id == guard.local_user_id);
+            let srv_mute = local_p.is_some_and(|p| p.server_mute);
+            let srv_deaf = local_p.is_some_and(|p| p.server_deaf);
+            let eff_deaf = st.self_deaf || srv_deaf;
+            let eff_mute = st.self_mute || srv_mute || eff_deaf;
+            (eff_mute, eff_deaf)
+        });
+        let mut proc = MicCaptureProcessor::new(guard.input_mode)?;
+        proc.set_ptt_active(guard.ptt_active);
+        proc.set_high_pass_enabled(guard.high_pass_enabled);
+        (muted, deaf, proc)
     };
-    let mut self_muted = false;
     let mut last_speaking_sent = false;
     let mut last_seq_ack: Option<u64> = None;
     let mut pending_heartbeat: Option<(u64, Instant)> = None;
     let mut heartbeat_interval: Option<tokio::time::Interval> = None;
+    let mut capture_ready_rx: Option<oneshot::Receiver<AudioBackendKind>> = None;
 
     let mut udp_socket: Option<UdpSocket> = None;
     let mut cipher: Option<RtpTransportCipher> = None;
@@ -1362,6 +2135,7 @@ async fn run_voice_gateway_session(
     let mut udp_rx_buf = vec![0u8; 4096];
     let mut mix_buf = [0.0f32; FRAME_SAMPLES];
     let mut mix_ticker = tokio::time::interval(Duration::from_millis(20));
+    mix_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut vu_tick_counter = 0u32;
 
     loop {
@@ -1370,6 +2144,25 @@ async fn run_voice_gateway_session(
                 if *stop_rx.borrow() {
                     let _ = ws_tx.close().await;
                     break;
+                }
+            }
+
+            cap_kind = async {
+                if let Some(rx) = capture_ready_rx.as_mut() {
+                    rx.await
+                } else {
+                    std::future::pending().await
+                }
+            } => {
+                capture_ready_rx = None;
+                if let Ok(AudioBackendKind::Headless) = cap_kind
+                    && last_speaking_sent
+                    && let Some(pkt) = packetizer.as_ref()
+                {
+                    debug!("capture backend is headless; clearing initial SPEAKING indicator");
+                    let spk = build_speaking_payload(0, 0, pkt.ssrc());
+                    let _ = ws_tx.send(WsMessage::Text(spk.to_string().into())).await;
+                    last_speaking_sent = false;
                 }
             }
 
@@ -1545,12 +2338,28 @@ async fn run_voice_gateway_session(
                                         .send(WsMessage::Text(spk.to_string().into()))
                                         .await
                                         .map_err(|e| VoiceError::Gateway(format!("SPEAKING send failed: {e}")))?;
-                                    last_speaking_sent = true;
+                                    if self_muted {
+                                        // Immediately clear the speaking indicator when joined muted
+                                        // so peers do not see a stuck green speaking ring.
+                                        let clear_spk = build_speaking_payload(0, 0, pkt.ssrc());
+                                        ws_tx
+                                            .send(WsMessage::Text(clear_spk.to_string().into()))
+                                            .await
+                                            .map_err(|e| VoiceError::Gateway(format!("SPEAKING(0) send failed: {e}")))?;
+                                        last_speaking_sent = false;
+                                    } else {
+                                        last_speaking_sent = true;
+                                    }
                                 }
 
-                                let _ = audio_io.start_playback(Arc::clone(&playback_queue)).await;
+                                // Start audio I/O asynchronously off the select! loop so slow ALSA/PipeWire
+                                // device probing never blocks heartbeats, RTP, or 20 ms mix ticks.
+                                if !self_deafened {
+                                    audio_io.request_start_playback(Arc::clone(&playback_queue));
+                                }
                                 if !self_muted {
-                                    let _ = audio_io.start_capture(Arc::clone(&capture_queue)).await;
+                                    capture_ready_rx =
+                                        Some(audio_io.request_start_capture(Arc::clone(&capture_queue)));
                                 }
                             }
 
@@ -1580,11 +2389,12 @@ async fn run_voice_gateway_session(
                                 ) && let Ok(user_id) = serde_json::from_value::<Snowflake>(uid_val.clone())
                                     && let Ok(ssrc) = u32::try_from(ssrc_u64)
                                 {
-                                    let speaking_flags = data
+                                    let is_speaking = data
                                         .get("speaking")
-                                        .and_then(Value::as_u64)
-                                        .unwrap_or(0);
-                                    let is_speaking = speaking_flags != 0;
+                                        .and_then(|v| {
+                                            v.as_u64().map(|n| n != 0).or_else(|| v.as_bool())
+                                        })
+                                        .unwrap_or(false);
 
                                     if let Ok(mut guard) = state.lock() {
                                         guard.mixer.bind_ssrc(ssrc, user_id);
@@ -1741,7 +2551,8 @@ async fn run_voice_gateway_session(
                     RuntimeControl::SetMute(muted) => {
                         self_muted = muted;
                         if muted {
-                            let _ = audio_io.stop_capture().await;
+                            capture_ready_rx = None;
+                            audio_io.request_stop_capture();
                             let silence_pkts = mic_processor.flush_on_mute();
                             if let (Some(sock), Some(c), Some(pkt)) = (
                                 udp_socket.as_ref(),
@@ -1765,16 +2576,18 @@ async fn run_voice_gateway_session(
                                 let _ = ws_tx.send(WsMessage::Text(spk.to_string().into())).await;
                                 last_speaking_sent = false;
                             }
-                        } else {
-                            let _ = audio_io.start_capture(Arc::clone(&capture_queue)).await;
+                        } else if packetizer.is_some() {
+                            capture_ready_rx =
+                                Some(audio_io.request_start_capture(Arc::clone(&capture_queue)));
                         }
                     }
                     RuntimeControl::SetDeaf(deaf) => {
+                        self_deafened = deaf;
                         if deaf {
-                            let _ = audio_io.stop_playback().await;
+                            audio_io.request_stop_playback();
                             playback_queue.clear();
-                        } else {
-                            let _ = audio_io.start_playback(Arc::clone(&playback_queue)).await;
+                        } else if packetizer.is_some() {
+                            audio_io.request_start_playback(Arc::clone(&playback_queue));
                         }
                     }
                     RuntimeControl::SetInputMode(mode) => {
@@ -1921,7 +2734,7 @@ async fn run_voice_gateway_session(
                     (active > 0, emit)
                 };
 
-                if mixed_any {
+                if mixed_any && !self_deafened {
                     playback_queue.push_samples(&mix_buf);
                 }
                 if let Some((channel_id, levels)) = levels_to_emit {
@@ -2245,5 +3058,554 @@ mod tests {
 
         engine.leave_voice().await.expect("leave");
         server.abort();
+    }
+
+    #[test]
+    fn rustls_ring_provider_allows_client_config_builder() {
+        ensure_rustls_ring_provider();
+        ensure_rustls_ring_provider();
+        let _builder = rustls::ClientConfig::builder();
+    }
+
+    #[tokio::test]
+    async fn join_voice_is_idempotent_and_toggle_voice_and_ghost_cleanup() {
+        use tokio::net::TcpListener;
+
+        struct RecordingBridge {
+            cmds: Mutex<Vec<VoiceStateUpdateCommand>>,
+            endpoint: Mutex<Option<String>>,
+            engine: Mutex<Option<Arc<DiscordVoiceEngine>>>,
+            user_id: Snowflake,
+        }
+
+        #[async_trait]
+        impl VoiceSignalingBridge for RecordingBridge {
+            async fn send_voice_state_update(
+                &self,
+                cmd: VoiceStateUpdateCommand,
+            ) -> VoiceResult<()> {
+                self.cmds.lock().expect("lock").push(cmd.clone());
+                let ep = self.endpoint.lock().expect("lock").clone();
+                let eng = self.engine.lock().expect("lock").clone();
+                if let (Some(ch), Some(endpoint), Some(engine)) = (cmd.channel_id, ep, eng) {
+                    let uid = self.user_id;
+                    tokio::spawn(async move {
+                        engine
+                            .handle_voice_state_update(VoiceStateUpdateEvent {
+                                guild_id: cmd.guild_id,
+                                channel_id: Some(ch),
+                                user_id: uid,
+                                session_id: "sess-1".to_string(),
+                                self_mute: cmd.self_mute,
+                                self_deaf: cmd.self_deaf,
+                                mute: false,
+                                deaf: false,
+                                self_stream: false,
+                                display_name: None,
+                            })
+                            .await;
+                        engine
+                            .handle_voice_server_update(VoiceServerUpdateEvent {
+                                guild_id: cmd.guild_id,
+                                channel_id: Some(ch),
+                                endpoint: Some(endpoint),
+                                token: Zeroizing::new("tok-1".to_string()),
+                            })
+                            .await;
+                    });
+                }
+                Ok(())
+            }
+        }
+
+        let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    if let Ok(ws) = tokio_tungstenite::accept_async(stream).await {
+                        let (mut tx, mut rx) = ws.split();
+                        let _ = tx
+                            .send(WsMessage::Text(
+                                json!({
+                                    "op": VOICE_OP_HELLO,
+                                    "d": { "heartbeat_interval": 30_000, "v": 8 }
+                                })
+                                .to_string()
+                                .into(),
+                            ))
+                            .await;
+                        while let Some(Ok(_)) = rx.next().await {}
+                    }
+                });
+            }
+        });
+
+        let user_id = Snowflake(42);
+        let guild_id = Snowflake(100);
+        let ch_id = Snowflake(200);
+        let bridge = Arc::new(RecordingBridge {
+            cmds: Mutex::new(Vec::new()),
+            endpoint: Mutex::new(Some(format!("ws://{addr}"))),
+            engine: Mutex::new(None),
+            user_id,
+        });
+
+        let cfg = VoiceEngineConfig {
+            audio_mode: AudioBackendMode::Headless,
+            signaling_timeout: Duration::from_millis(250),
+            ..VoiceEngineConfig::new(user_id, "SysOp")
+        };
+        assert!(cfg.join_muted, "VoiceEngineConfig::new must default join_muted = true");
+        let engine = Arc::new(
+            DiscordVoiceEngine::new(
+                cfg,
+                Some(Arc::clone(&bridge) as Arc<dyn VoiceSignalingBridge>),
+            )
+            .expect("engine"),
+        );
+        *bridge.engine.lock().expect("lock") = Some(Arc::clone(&engine));
+
+        // 1. First join succeeds with join_muted = true.
+        let st1 = engine
+            .join_voice(Some(guild_id), ch_id)
+            .await
+            .expect("first join");
+        assert!(st1.self_mute, "must join muted by default");
+        assert_eq!(bridge.cmds.lock().expect("lock").len(), 1);
+        assert!(bridge.cmds.lock().expect("lock")[0].self_mute);
+
+        // 2. Clicking same channel again is idempotent: zero extra Op 4 commands and no timeout!
+        let st2 = engine
+            .join_voice(Some(guild_id), ch_id)
+            .await
+            .expect("idempotent rejoin");
+        assert_eq!(st2.channel_id, ch_id);
+        assert_eq!(
+            bridge.cmds.lock().expect("lock").len(),
+            1,
+            "idempotent join_voice must NOT re-send Op 4"
+        );
+
+        // 3. toggle_voice on the active channel disconnects cleanly with Op 4 channel_id = None.
+        let toggled = engine
+            .toggle_voice(Some(guild_id), ch_id)
+            .await
+            .expect("toggle off");
+        assert!(toggled.is_none());
+        assert!(engine.status().await.expect("status").is_none());
+        {
+            let cmds = bridge.cmds.lock().expect("lock");
+            assert_eq!(cmds.len(), 2);
+            assert_eq!(cmds[1].guild_id, Some(guild_id));
+            assert_eq!(cmds[1].channel_id, None);
+        }
+
+        // 4. Signaling timeout cleans up ghost Discord voice state by sending Op 4 channel_id = None.
+        *bridge.endpoint.lock().expect("lock") = None;
+        let err = engine.join_voice(Some(guild_id), ch_id).await;
+        assert!(err.is_err(), "missing VOICE_SERVER_UPDATE must time out");
+        {
+            let cmds = bridge.cmds.lock().expect("lock");
+            assert_eq!(cmds.len(), 4, "timed-out join must send cleanup Op 4 disconnect");
+            assert_eq!(cmds[2].channel_id, Some(ch_id));
+            assert_eq!(cmds[3].channel_id, None);
+        }
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn join_muted_and_headless_capture_emit_speaking_zero() {
+        use crate::rtp::{DISCOVERY_PACKET_LEN, DISCOVERY_PAYLOAD_LEN, DISCOVERY_TYPE_RESPONSE};
+        use tokio::net::TcpListener;
+
+        async fn run_case(join_muted: bool) -> Vec<u64> {
+            let udp = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+                .await
+                .expect("udp bind");
+            let udp_addr = udp.local_addr().expect("udp addr");
+            let udp_task = tokio::spawn(async move {
+                let mut buf = [0u8; 256];
+                if let Ok((n, src)) = udp.recv_from(&mut buf).await
+                    && n == DISCOVERY_PACKET_LEN
+                {
+                    let mut resp = [0u8; DISCOVERY_PACKET_LEN];
+                    resp[0..2].copy_from_slice(&DISCOVERY_TYPE_RESPONSE.to_be_bytes());
+                    resp[2..4].copy_from_slice(&DISCOVERY_PAYLOAD_LEN.to_be_bytes());
+                    resp[4..8].copy_from_slice(&buf[4..8]);
+                    let ip_str = src.ip().to_string();
+                    resp[8..8 + ip_str.len()].copy_from_slice(ip_str.as_bytes());
+                    resp[72..74].copy_from_slice(&src.port().to_be_bytes());
+                    let _ = udp.send_to(&resp, src).await;
+                }
+            });
+
+            let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+                .await
+                .expect("bind");
+            let ws_addr = listener.local_addr().expect("addr");
+            let speaking_flags = Arc::new(Mutex::new(Vec::<u64>::new()));
+            let speaking_clone = Arc::clone(&speaking_flags);
+
+            let ws_task = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.expect("accept");
+                let ws = tokio_tungstenite::accept_async(stream)
+                    .await
+                    .expect("ws accept");
+                let (mut tx, mut rx) = ws.split();
+
+                let _ = tx
+                    .send(WsMessage::Text(
+                        json!({
+                            "op": VOICE_OP_HELLO,
+                            "d": { "heartbeat_interval": 30_000, "v": 8 }
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await;
+
+                while let Some(Ok(WsMessage::Text(txt))) = rx.next().await {
+                    let v: Value = serde_json::from_str(txt.as_str()).expect("json");
+                    match v["op"].as_u64() {
+                        Some(0) => {
+                            let _ = tx
+                                .send(WsMessage::Text(
+                                    json!({
+                                        "op": VOICE_OP_READY,
+                                        "d": {
+                                            "ssrc": 7777,
+                                            "ip": udp_addr.ip().to_string(),
+                                            "port": udp_addr.port(),
+                                            "modes": ["aead_xchacha20_poly1305_rtpsize"]
+                                        }
+                                    })
+                                    .to_string()
+                                    .into(),
+                                ))
+                                .await;
+                        }
+                        Some(1) => {
+                            let _ = tx
+                                .send(WsMessage::Text(
+                                    json!({
+                                        "op": VOICE_OP_SESSION_DESCRIPTION,
+                                        "d": {
+                                            "mode": "aead_xchacha20_poly1305_rtpsize",
+                                            "secret_key": vec![7u8; 32],
+                                            "dave_protocol_version": 0
+                                        }
+                                    })
+                                    .to_string()
+                                    .into(),
+                                ))
+                                .await;
+                        }
+                        Some(5) => {
+                            if let Some(flags) = v["d"]["speaking"].as_u64() {
+                                speaking_clone.lock().expect("lock").push(flags);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            });
+
+            let cfg = VoiceEngineConfig {
+                audio_mode: AudioBackendMode::Headless,
+                join_muted,
+                ..VoiceEngineConfig::new(Snowflake(55), "SysOp")
+            };
+            let engine = DiscordVoiceEngine::new(cfg, None).expect("engine");
+            engine
+                .connect_voice_gateway(VoiceGatewayCredentials {
+                    guild_id: Some(Snowflake(10)),
+                    channel_id: Snowflake(20),
+                    channel_name: Some("Lounge".into()),
+                    user_id: Snowflake(55),
+                    session_id: Zeroizing::new("s".into()),
+                    token: Zeroizing::new("t".into()),
+                    endpoint: format!("ws://{ws_addr}"),
+                })
+                .await
+                .expect("connect");
+
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+            while tokio::time::Instant::now() < deadline {
+                if speaking_flags.lock().expect("lock").len() >= 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+
+            engine.leave_voice().await.expect("leave");
+            ws_task.abort();
+            udp_task.abort();
+            let guard = speaking_flags.lock().expect("lock");
+            guard.clone()
+        }
+
+        let muted_seq = run_case(true).await;
+        assert_eq!(
+            muted_seq,
+            vec![u64::from(SPEAKING_FLAG_MICROPHONE), 0],
+            "joining muted must send SPEAKING(1) to wake SFU then immediately SPEAKING(0)"
+        );
+
+        let headless_seq = run_case(false).await;
+        assert_eq!(
+            headless_seq,
+            vec![u64::from(SPEAKING_FLAG_MICROPHONE), 0],
+            "headless capture degradation must send SPEAKING(0) to clear initial indicator"
+        );
+    }
+
+    #[tokio::test]
+    async fn mid_call_voice_server_update_reconnects_and_reinits_dave_for_moved_channel() {
+        use tokio::net::TcpListener;
+
+        async fn spawn_identify_capture_server() -> (SocketAddr, oneshot::Receiver<Value>, JoinHandle<()>) {
+            let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+                .await
+                .expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let (id_tx, id_rx) = oneshot::channel();
+            let task = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.expect("accept");
+                let ws = tokio_tungstenite::accept_async(stream)
+                    .await
+                    .expect("ws accept");
+                let (mut tx, mut rx) = ws.split();
+                let _ = tx
+                    .send(WsMessage::Text(
+                        json!({
+                            "op": VOICE_OP_HELLO,
+                            "d": { "heartbeat_interval": 30_000, "v": 8 }
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await;
+                if let Some(Ok(WsMessage::Text(msg))) = rx.next().await {
+                    let v: Value = serde_json::from_str(msg.as_str()).expect("json");
+                    let _ = id_tx.send(v);
+                }
+                while let Some(Ok(_)) = rx.next().await {}
+            });
+            (addr, id_rx, task)
+        }
+
+        let (addr1, id1_rx, srv1) = spawn_identify_capture_server().await;
+        let (addr2, id2_rx, srv2) = spawn_identify_capture_server().await;
+
+        let local_uid = Snowflake(1);
+        let peer_uid = Snowflake(9);
+        let guild_id = Snowflake(10);
+        let ch1 = Snowflake(101);
+        let ch2 = Snowflake(102);
+
+        let cfg = VoiceEngineConfig {
+            audio_mode: AudioBackendMode::Headless,
+            join_muted: true,
+            ..VoiceEngineConfig::new(local_uid, "SysOp")
+        };
+        let engine = DiscordVoiceEngine::new(cfg, None).expect("engine");
+        engine.set_channel_name(ch2, "Moved Room");
+
+        // Pre-cache a remote occupant sitting in ch2 before we get moved there.
+        engine
+            .handle_voice_state_update(VoiceStateUpdateEvent {
+                guild_id: Some(guild_id),
+                channel_id: Some(ch2),
+                user_id: peer_uid,
+                session_id: "peer-sess".to_string(),
+                self_mute: false,
+                self_deaf: false,
+                mute: false,
+                deaf: false,
+                self_stream: false,
+                display_name: Some("Alice".to_string()),
+            })
+            .await;
+
+        engine
+            .connect_voice_gateway(VoiceGatewayCredentials {
+                guild_id: Some(guild_id),
+                channel_id: ch1,
+                channel_name: Some("Lobby".into()),
+                user_id: local_uid,
+                session_id: Zeroizing::new("own-sess".into()),
+                token: Zeroizing::new("tok-1".into()),
+                endpoint: format!("ws://{addr1}"),
+            })
+            .await
+            .expect("connect 1");
+
+        let id1 = tokio::time::timeout(Duration::from_secs(3), id1_rx)
+            .await
+            .expect("id1 timeout")
+            .expect("id1");
+        assert_eq!(id1["d"]["token"], "tok-1");
+
+        // Moderator moves local user from ch1 -> ch2.
+        engine
+            .handle_voice_state_update(VoiceStateUpdateEvent {
+                guild_id: Some(guild_id),
+                channel_id: Some(ch2),
+                user_id: local_uid,
+                session_id: "own-sess".to_string(),
+                self_mute: true,
+                self_deaf: false,
+                mute: false,
+                deaf: false,
+                self_stream: false,
+                display_name: None,
+            })
+            .await;
+
+        let moved_st = engine.status().await.expect("status").expect("active");
+        assert_eq!(moved_st.channel_id, ch2);
+        assert_eq!(moved_st.channel_name, "Moved Room");
+        assert_eq!(moved_st.connection_state, VoiceConnectionState::Reconnecting);
+        assert!(
+            moved_st.participants.iter().any(|p| p.user_id == peer_uid && p.display_name == "Alice"),
+            "moving into ch2 must hydrate cached occupants"
+        );
+
+        // Discord clears endpoint mid-migration (endpoint: None) -> stays Reconnecting.
+        engine
+            .handle_voice_server_update(VoiceServerUpdateEvent {
+                guild_id: Some(guild_id),
+                channel_id: None,
+                endpoint: None,
+                token: Zeroizing::new("tok-pending".to_string()),
+            })
+            .await;
+        let mid_st = engine.status().await.expect("status").expect("active");
+        assert_eq!(mid_st.connection_state, VoiceConnectionState::Reconnecting);
+
+        // Discord delivers new voice server endpoint -> engine reconnects & preserves mute state.
+        engine
+            .handle_voice_server_update(VoiceServerUpdateEvent {
+                guild_id: Some(guild_id),
+                channel_id: None,
+                endpoint: Some(format!("ws://{addr2}")),
+                token: Zeroizing::new("tok-2".to_string()),
+            })
+            .await;
+
+        let id2 = tokio::time::timeout(Duration::from_secs(3), id2_rx)
+            .await
+            .expect("id2 timeout")
+            .expect("id2");
+        assert_eq!(id2["d"]["token"], "tok-2");
+        assert_eq!(id2["d"]["server_id"], guild_id.to_string());
+
+        let reconnected_st = engine.status().await.expect("status").expect("active");
+        assert_eq!(reconnected_st.channel_id, ch2);
+        assert!(reconnected_st.self_mute, "reconnect must preserve self_mute");
+
+        engine.leave_voice().await.expect("leave");
+        srv1.abort();
+        srv2.abort();
+    }
+
+    #[tokio::test]
+    async fn local_server_mute_deaf_sync_and_channel_scoped_call_delete() {
+        let local_uid = Snowflake(100);
+        let guild_id = Snowflake(200);
+        let ch_id = Snowflake(300);
+        let cfg = VoiceEngineConfig {
+            audio_mode: AudioBackendMode::Headless,
+            ..VoiceEngineConfig::new(local_uid, "SysOp")
+        };
+        let engine = DiscordVoiceEngine::new(cfg, None).expect("engine");
+        let mut rx = engine.subscribe_voice_events();
+
+        // Populate an active voice session to verify local server_mute / server_deaf sync.
+        {
+            let mut g = engine.state.lock().expect("lock");
+            g.active_session_id = Some("sess-x".to_string());
+            g.status = Some(VoiceChannelStatus {
+                guild_id: Some(guild_id),
+                channel_id: ch_id,
+                channel_name: "General".to_string(),
+                connection_state: VoiceConnectionState::Connected,
+                self_mute: false,
+                self_deaf: false,
+                push_to_talk: false,
+                ping_ms: Some(10),
+                packet_loss_pct: 0.0,
+                dave: DaveSessionState::Disabled,
+                call_ring: CallRingState::Idle,
+                participants: Vec::new(),
+            });
+            g.ensure_participant(local_uid, Some("SysOp".to_string()));
+        }
+
+        engine
+            .handle_voice_state_update(VoiceStateUpdateEvent {
+                guild_id: Some(guild_id),
+                channel_id: Some(ch_id),
+                user_id: local_uid,
+                session_id: "sess-x".to_string(),
+                self_mute: false,
+                self_deaf: false,
+                mute: true,
+                deaf: true,
+                self_stream: true,
+                display_name: None,
+            })
+            .await;
+
+        let st = engine.status().await.expect("status").expect("active");
+        let me = st
+            .participants
+            .iter()
+            .find(|p| p.user_id == local_uid)
+            .expect("local participant");
+        assert!(me.server_mute, "local server_mute must sync into participant");
+        assert!(me.server_deaf, "local server_deaf must sync into participant");
+        assert!(me.streaming, "local self_stream must sync into participant");
+        assert!(!me.speaking);
+
+        // Drain the VoiceStatusUpdated event before testing call_delete channel scoping.
+        let _ = rx.recv().await;
+
+        // Incoming ring on DM channel 500.
+        engine.handle_call_update(CallUpdateEvent {
+            channel_id: Snowflake(500),
+            ringing: vec![local_uid],
+            connected_user_ids: vec![Snowflake(201)],
+            caller_id: Some(Snowflake(201)),
+            caller_name: Some("Alice".into()),
+            is_group_dm: false,
+        });
+        let ring_ev = rx.recv().await.expect("ring event");
+        assert!(matches!(
+            ring_ev,
+            BackendEvent::CallRingUpdated(CallRingState::IncomingRinging {
+                channel_id: Snowflake(500),
+                ..
+            })
+        ));
+
+        // Unrelated DM channel 999 CALL_DELETE must NOT emit CallRingUpdated(Idle).
+        engine.handle_call_delete(Snowflake(999));
+        assert!(
+            rx.try_recv().is_err(),
+            "CALL_DELETE for unrelated channel must not emit Idle or clobber active ring"
+        );
+
+        // Deleting channel 500 DOES emit CallRingUpdated(Idle).
+        engine.handle_call_delete(Snowflake(500));
+        let idle_ev = rx.recv().await.expect("idle event");
+        assert!(matches!(
+            idle_ev,
+            BackendEvent::CallRingUpdated(CallRingState::Idle)
+        ));
     }
 }

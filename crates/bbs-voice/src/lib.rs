@@ -12,7 +12,10 @@ pub mod player;
 pub mod rtp;
 pub mod session;
 
-pub use audio_io::{AudioBackendKind, AudioBackendMode, AudioIoHandle, CaptureQueue, PlaybackQueue};
+pub use audio_io::{
+    AudioBackendKind, AudioBackendMode, AudioIoHandle, CaptureQueue,
+    DEFAULT_PLAYBACK_PREFILL_SAMPLES, PlaybackQueue,
+};
 pub use dave::{
     DaveController, DaveInboundMessage, DaveOutboundMessage, DaveWireFrame,
     MAX_DAVE_PROTOCOL_VERSION, format_verification_code, parse_binary_dave_frame,
@@ -23,8 +26,8 @@ pub use mixer::{
     AudioMixer, CHANNELS, DEFAULT_HIGH_PASS_CUTOFF_HZ, DEFAULT_JITTER_CUSHION_FRAMES,
     EncodedMicPacket, FRAME_DURATION_MS, FRAME_SAMPLES, FRAME_SAMPLES_PER_CHANNEL, HighPassFilter,
     InputMode, MAX_OPUS_PACKET_BYTES, MIN_RMS_DB, MicCaptureProcessor, MicFrameResult,
-    OPUS_SILENCE_FRAME, SAMPLE_RATE, SpeakerPipeline, TRAILING_SILENCE_FRAMES, VAD_HANGOVER_FRAMES,
-    compute_rms_db, smooth_rms_db, soft_clip_tanh,
+    OPUS_SILENCE_FRAME, SAMPLE_RATE, SPEAKER_IDLE_RESET_FRAMES, SpeakerPipeline,
+    TRAILING_SILENCE_FRAMES, VAD_HANGOVER_FRAMES, compute_rms_db, smooth_rms_db, soft_clip_tanh,
 };
 pub use player::{
     DecodedVoiceMessage, MAX_VOICE_MESSAGE_BYTES, MAX_VOICE_MESSAGE_DURATION_SECS, OpusHead,
@@ -43,5 +46,5 @@ pub use session::{
     SPEAKING_FLAG_SOUNDSHARE, VoiceEngineConfig, VoiceGatewayCredentials, VoiceServerUpdateEvent,
     VoiceSignalingBridge, VoiceStateUpdateCommand, VoiceStateUpdateEvent, build_heartbeat_payload,
     build_identify_payload, build_resume_payload, build_select_protocol_payload,
-    build_speaking_payload,
+    build_speaking_payload, ensure_rustls_ring_provider,
 };

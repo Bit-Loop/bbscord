@@ -18,6 +18,7 @@ thiserror.workspace = true
 tracing.workspace = true
 zeroize.workspace = true
 tokio-tungstenite.workspace = true
+rustls.workspace = true
 davey.workspace = true
 ashpd = { workspace = true, features = ["screencast"] }
 gstreamer.workspace = true

@@ -732,6 +732,9 @@ impl VoiceMessagePlayer {
 
                             if let Some(chunk) = chunk_to_push {
                                 queue_arc.push_samples(&chunk);
+                                if !still_playing {
+                                    queue_arc.flush_prefill();
+                                }
                             }
                             if let Some(state) = maybe_emit {
                                 let _ = events.send(BackendEvent::VoicePlaybackUpdated(state));
