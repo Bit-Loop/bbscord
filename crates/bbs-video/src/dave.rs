@@ -463,18 +463,39 @@ impl DaveVideoContext {
         let allow_passthrough = guard.allow_passthrough;
         match guard.session.as_mut() {
             Some(session) if session.can_encrypt() && is_session_actively_encrypted(session) => {
+                // ITU-T H.264 Annex B parsers (including GStreamer `rtph264pay`) treat any
+                // `00 00 00` run not belonging to a `00 00 00 01` start code (including a
+                // trailing `0x00` ciphertext byte immediately before `00 00 00 01`, forming
+                // `00 00 00 00 01`) as `trailing_zero_8bits` and strip it, breaking the DAVE
+                // AEAD tag on the receiver. `davey 0.2.0` retries nonces for `00 00 01` but
+                // does not reject `00 00 00`; mirror DAVE's spec-compliant nonce-retry here.
+                const MAX_H264_ANNEX_B_ATTEMPTS: usize = 8;
+                let max_attempts = if codec == VideoCodec::H264 {
+                    MAX_H264_ANNEX_B_ATTEMPTS
+                } else {
+                    1
+                };
                 let mut encrypted = Vec::with_capacity(plaintext.len().saturating_add(64));
-                session
-                    .encrypt_into(
-                        MediaType::VIDEO,
-                        codec.to_dave_codec(),
-                        plaintext,
-                        &mut encrypted,
-                    )
-                    .map_err(|err| {
-                        self.metrics.crypto_errors.fetch_add(1, Ordering::Relaxed);
-                        CoreError::Video(format!("DAVE video encrypt failed: {err}"))
-                    })?;
+                for attempt in 0..max_attempts {
+                    encrypted.clear();
+                    session
+                        .encrypt_into(
+                            MediaType::VIDEO,
+                            codec.to_dave_codec(),
+                            plaintext,
+                            &mut encrypted,
+                        )
+                        .map_err(|err| {
+                            self.metrics.crypto_errors.fetch_add(1, Ordering::Relaxed);
+                            CoreError::Video(format!("DAVE video encrypt failed: {err}"))
+                        })?;
+                    if codec != VideoCodec::H264
+                        || !has_forbidden_h264_annex_b_zero_run(&encrypted)
+                        || attempt + 1 == max_attempts
+                    {
+                        break;
+                    }
+                }
                 self.metrics
                     .encrypted_frames
                     .fetch_add(1, Ordering::Relaxed);
@@ -538,6 +559,31 @@ impl DaveVideoContext {
             .lock()
             .map_err(|_| CoreError::Internal("DAVE video context lock poisoned".to_string()))
     }
+}
+
+/// Returns `true` if `frame` contains an Annex-B `00 00 00` zero run that is NOT an isolated
+/// 4-byte `00 00 00 01` start code (for example `00 00 00 00 01` when an encrypted slice ends with
+/// `0x00`, or `00 00 00 XX` with `XX != 0x01`), which Annex-B RTP packetizers (`rtph264pay`) strip
+/// as `trailing_zero_8bits` and corrupt the DAVE ciphertext length.
+fn has_forbidden_h264_annex_b_zero_run(frame: &[u8]) -> bool {
+    let len = frame.len();
+    if len < 3 {
+        return false;
+    }
+    let mut i = 0;
+    while i + 2 < len {
+        if frame[i] == 0 && frame[i + 1] == 0 && frame[i + 2] == 0 {
+            let is_clean_start_code =
+                frame.get(i + 3) == Some(&1) && (i == 0 || frame[i - 1] != 0);
+            if !is_clean_start_code {
+                return true;
+            }
+            i += 4;
+            continue;
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Returns `true` only when `davey::DaveSession` has an established, active MLS group (`epoch > 0`).
@@ -708,5 +754,23 @@ mod tests {
             .expect_err("must not leak plaintext before MLS handshake completes");
         assert!(err.to_string().contains("not ready"));
         assert_eq!(ctx.stats().crypto_errors, 1);
+    }
+
+    #[test]
+    fn h264_annex_b_zero_run_detector_catches_trailing_zero_before_start_code() {
+        // Clean multi-slice Annex-B Access Unit with 4-byte `00 00 00 01` start codes only.
+        assert!(!has_forbidden_h264_annex_b_zero_run(&[
+            0x00, 0x00, 0x00, 0x01, 0x41, 0x9a, 0x12, 0x00, 0x00, 0x00, 0x01, 0x41, 0x34, 0xFA,
+            0xFA,
+        ]));
+        // Encrypted slice ending with `0x00` immediately before `00 00 00 01` (`00 00 00 00 01`).
+        assert!(has_forbidden_h264_annex_b_zero_run(&[
+            0x00, 0x00, 0x00, 0x01, 0x41, 0x9a, 0x00, 0x00, 0x00, 0x00, 0x01, 0x41, 0x34, 0xFA,
+            0xFA,
+        ]));
+        // Three consecutive zero bytes inside ciphertext (`00 00 00 02`).
+        assert!(has_forbidden_h264_annex_b_zero_run(&[
+            0x00, 0x00, 0x00, 0x01, 0x41, 0x00, 0x00, 0x00, 0x02, 0xFA, 0xFA,
+        ]));
     }
 }

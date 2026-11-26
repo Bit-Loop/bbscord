@@ -516,6 +516,31 @@ pub fn create_configured_encoder(
             }
             set_str_prop_if_present(&encoder, "preset", "low-latency-hq");
         }
+        "vtenc_h264_hw" => {
+            if encoder.find_property("bitrate").is_some() {
+                encoder.set_property("bitrate", bitrate_kbps);
+            }
+            if encoder.find_property("realtime").is_some() {
+                encoder.set_property("realtime", true);
+            }
+            if encoder.find_property("allow-frame-reordering").is_some() {
+                encoder.set_property("allow-frame-reordering", false);
+            }
+            if encoder.find_property("max-keyframe-interval").is_some() {
+                encoder.set_property("max-keyframe-interval", keyframe_interval as i32);
+            }
+        }
+        "mfh264enc" => {
+            if encoder.find_property("bitrate").is_some() {
+                encoder.set_property("bitrate", bitrate_kbps);
+            }
+            if encoder.find_property("low-latency").is_some() {
+                encoder.set_property("low-latency", true);
+            }
+            if encoder.find_property("gop-size").is_some() {
+                encoder.set_property("gop-size", keyframe_interval as i32);
+            }
+        }
         "openh264enc" => {
             if encoder.find_property("bitrate").is_some() {
                 encoder.set_property("bitrate", bitrate_kbps.saturating_mul(1_000));

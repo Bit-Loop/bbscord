@@ -489,7 +489,25 @@ impl BroadcastPipeline {
             Arc::clone(&frames_encoded),
         )?;
 
-        // 4. Encoded elementary-stream caps (enforces Annex-B byte-stream for H.264 DAVE parsing)
+        // 4. Encoded elementary-stream caps (enforces Annex-B byte-stream for H.264 DAVE parsing).
+        // Insert `h264parse` between H.264 encoders (such as macOS VideoToolbox `vtenc_h264_hw`,
+        // which outputs `stream-format=avc`) and `broadcast_encoded_caps` (`byte-stream, alignment=au`)
+        // so both hardware and software H.264 encoders deliver clean Annex-B Access Units into DAVE.
+        let h264_parser = if encoder_selection.codec == VideoCodec::H264 {
+            let parser = gst::ElementFactory::make("h264parse")
+                .name("broadcast_h264_parse")
+                .build()
+                .ok();
+            if let Some(ref p) = parser
+                && p.find_property("config-interval").is_some()
+            {
+                p.set_property("config-interval", -1i32);
+            }
+            parser
+        } else {
+            None
+        };
+
         let encoded_capsfilter = gst::ElementFactory::make("capsfilter")
             .name("broadcast_encoded_caps")
             .build()
@@ -518,23 +536,7 @@ impl BroadcastPipeline {
         let _enc_probe =
             install_dave_encrypt_probe(&dave_encrypt, config.dave.clone(), encoder_selection.codec)?;
 
-        pipeline
-            .add_many([
-                &source,
-                &pre_convert,
-                &videoscale,
-                &videorate,
-                &raw_capsfilter,
-                &enc_convert,
-                &encoder,
-                &encoded_capsfilter,
-                &dave_encrypt,
-            ])
-            .map_err(|err| {
-                CoreError::Video(format!("failed to add broadcast capture/encode elements: {err}"))
-            })?;
-
-        gst::Element::link_many([
+        let mut chain: Vec<&gst::Element> = vec![
             &source,
             &pre_convert,
             &videoscale,
@@ -542,10 +544,20 @@ impl BroadcastPipeline {
             &raw_capsfilter,
             &enc_convert,
             &encoder,
-            &encoded_capsfilter,
-            &dave_encrypt,
-        ])
-        .map_err(|err| {
+        ];
+        if let Some(ref parser) = h264_parser {
+            chain.push(parser);
+        }
+        chain.push(&encoded_capsfilter);
+        chain.push(&dave_encrypt);
+
+        pipeline
+            .add_many(chain.iter().copied())
+            .map_err(|err| {
+                CoreError::Video(format!("failed to add broadcast capture/encode elements: {err}"))
+            })?;
+
+        gst::Element::link_many(chain.iter().copied()).map_err(|err| {
             CoreError::Video(format!("failed to link broadcast capture/encode pipeline: {err}"))
         })?;
 

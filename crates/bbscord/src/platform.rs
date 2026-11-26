@@ -196,6 +196,7 @@ pub fn run_external_editor(
 }
 
 /// Parse a `±HHMM` UTC offset string (such as `"+0900"` or `"-0530"`) into signed minutes.
+#[cfg(any(not(target_os = "windows"), test))]
 #[must_use]
 pub fn parse_utc_offset_hhmm(raw: &str) -> Option<i32> {
     let s = raw.trim();
