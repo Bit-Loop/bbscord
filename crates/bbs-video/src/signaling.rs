@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::fmt;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bbs_core::{CoreError, CoreResult, DaveSessionState, Snowflake, StreamQuality};
@@ -889,9 +889,20 @@ impl fmt::Debug for StreamRtcClient {
     }
 }
 
+static RUSTLS_PROVIDER_INIT: Once = Once::new();
+
+/// Ensure `rustls` has its process-wide `ring` [`CryptoProvider`](rustls::crypto::CryptoProvider)
+/// installed before dialing any `wss://` Discord Stream RTC WebSocket.
+pub fn ensure_rustls_ring_provider() {
+    RUSTLS_PROVIDER_INIT.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 impl StreamRtcClient {
     /// Dial the Stream RTC WebSocket and spawn its non-blocking protocol/heartbeat/DAVE state machine.
     pub async fn connect(config: StreamRtcConfig, dave: DaveVideoContext) -> CoreResult<Self> {
+        ensure_rustls_ring_provider();
         let url = normalize_rtc_endpoint_url(&config.endpoint);
         info!(
             stream_key = %config.stream_key,
@@ -1841,5 +1852,13 @@ mod tests {
             "client must re-init MLS and upload fresh Op 26 KeyPackage after Op 31"
         );
         client.disconnect().await;
+    }
+
+    #[test]
+    fn rustls_ring_provider_allows_client_config_builder() {
+        ensure_rustls_ring_provider();
+        let _cfg = rustls::ClientConfig::builder()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
     }
 }

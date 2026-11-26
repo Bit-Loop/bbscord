@@ -2,6 +2,7 @@
 //! and soft-clipping multi-speaker output mixer.
 
 use std::collections::{BTreeMap, HashMap};
+use std::time::{Duration, Instant};
 
 use audiopus::coder::{Decoder as OpusDecoder, Encoder as OpusEncoder};
 use audiopus::{Application, Bitrate, Channels as OpusChannels, SampleRate as OpusSampleRate};
@@ -36,6 +37,11 @@ pub const DEFAULT_JITTER_CUSHION_FRAMES: usize = 3;
 pub const MAX_JITTER_BUFFER_FRAMES: usize = 10;
 /// Maximum consecutive missing packets concealed via Opus PLC (`3 * 20 ms = 60 ms`).
 pub const MAX_CONSECUTIVE_PLC_FRAMES: usize = 3;
+/// Number of consecutive silent 20 ms mixer ticks (`500 ms`) after which a drained
+/// [`SpeakerPipeline`] resets its RTP sequence tracking so peer reconnects never stall.
+pub const SPEAKER_IDLE_RESET_FRAMES: usize = 25;
+/// Wall-clock idle threshold (`500 ms`) resetting sequence tracking on the next talkspurt.
+const SPEAKER_IDLE_RESET_DURATION: Duration = Duration::from_millis(500);
 /// Maximum allowed per-user or master volume percentage (`200%`).
 pub const MAX_VOLUME_PERCENT: u8 = VoiceParticipant::MAX_VOLUME;
 /// Default high-pass DC / rumble filter cutoff frequency (`80 Hz`).
@@ -353,6 +359,8 @@ pub struct SpeakerPipeline {
     jitter_cushion: usize,
     playing: bool,
     consecutive_plc: usize,
+    idle_frames: usize,
+    last_packet_at: Option<Instant>,
     packets_received: u64,
     packets_lost: u64,
     smoothed_rms_db: f32,
@@ -390,6 +398,8 @@ impl SpeakerPipeline {
             jitter_cushion: jitter_cushion.clamp(1, MAX_JITTER_BUFFER_FRAMES),
             playing: false,
             consecutive_plc: 0,
+            idle_frames: 0,
+            last_packet_at: None,
             packets_received: 0,
             packets_lost: 0,
             smoothed_rms_db: MIN_RMS_DB,
@@ -458,11 +468,31 @@ impl SpeakerPipeline {
         }
     }
 
+    fn reset_sequence_tracking(&mut self) {
+        self.last_rx_seq = None;
+        self.seq_cycles = 0;
+        self.next_play_seq = None;
+        self.consecutive_plc = 0;
+        self.idle_frames = 0;
+    }
+
     /// Insert a decrypted Opus packet with RTP sequence number `seq` into the jitter buffer.
     pub fn push_packet(&mut self, seq: u16, opus_payload: Vec<u8>) {
         if opus_payload.is_empty() {
             return;
         }
+        let now = Instant::now();
+        if !self.playing
+            && self.pending.is_empty()
+            && self
+                .last_packet_at
+                .is_some_and(|last| now.saturating_duration_since(last) >= SPEAKER_IDLE_RESET_DURATION)
+        {
+            self.reset_sequence_tracking();
+        }
+        self.last_packet_at = Some(now);
+        self.idle_frames = 0;
+
         let ext_seq = self.unwrap_sequence(seq);
         self.packets_received = self.packets_received.saturating_add(1);
 
@@ -520,6 +550,12 @@ impl SpeakerPipeline {
             } else {
                 self.speaking = false;
                 self.smoothed_rms_db = smooth_rms_db(self.smoothed_rms_db, MIN_RMS_DB);
+                if self.pending.is_empty() && self.next_play_seq.is_some() {
+                    self.idle_frames = self.idle_frames.saturating_add(1);
+                    if self.idle_frames >= SPEAKER_IDLE_RESET_FRAMES {
+                        self.reset_sequence_tracking();
+                    }
+                }
                 return Ok(false);
             }
         }
@@ -566,6 +602,10 @@ impl SpeakerPipeline {
         self.playing = false;
         self.speaking = false;
         self.consecutive_plc = 0;
+        self.idle_frames = self.idle_frames.saturating_add(1);
+        if self.idle_frames >= SPEAKER_IDLE_RESET_FRAMES {
+            self.reset_sequence_tracking();
+        }
         self.smoothed_rms_db = smooth_rms_db(self.smoothed_rms_db, MIN_RMS_DB);
         Ok(false)
     }
@@ -1010,5 +1050,47 @@ mod tests {
         assert!(mixer.packet_loss_pct() > 0.0, "expected recorded packet loss > 0");
         let levels = mixer.audio_levels_snapshot();
         assert!(levels.iter().any(|(uid, rms, _)| *uid == alice && *rms > -30.0));
+    }
+
+    #[test]
+    fn jitter_buffer_resets_sequence_after_idle_timeout() {
+        let mut mic = MicCaptureProcessor::new(InputMode::PushToTalk).expect("mic");
+        mic.set_ptt_active(true);
+
+        let mut speaker = SpeakerPipeline::new(55, Some(Snowflake(202)), 2).expect("speaker");
+        let mut out = [0.0f32; FRAME_SAMPLES];
+
+        // First talkspurt at high sequence numbers (5000..5004).
+        for idx in 0..4 {
+            let frame = generate_stereo_sine(440.0, 0.5, idx);
+            let EncodedMicPacket::Audio(pkt) = mic.process_frame(&frame).expect("enc").packet
+            else {
+                panic!("expected audio");
+            };
+            speaker.push_packet(5000 + idx as u16, pkt);
+        }
+        for _ in 0..4 {
+            assert!(speaker.decode_next_frame(&mut out).expect("decode burst 1"));
+        }
+
+        // Advance past SPEAKER_IDLE_RESET_FRAMES silent mixer ticks so sequence state resets.
+        for _ in 0..=SPEAKER_IDLE_RESET_FRAMES {
+            assert!(!speaker.decode_next_frame(&mut out).expect("idle tick"));
+        }
+        assert!(speaker.next_play_seq.is_none());
+
+        // Peer reconnects with a much lower random initial RTP sequence (e.g. 42..46) on same SSRC.
+        for idx in 0..4 {
+            let frame = generate_stereo_sine(440.0, 0.5, idx);
+            let EncodedMicPacket::Audio(pkt) = mic.process_frame(&frame).expect("enc").packet
+            else {
+                panic!("expected audio");
+            };
+            speaker.push_packet(42 + idx as u16, pkt);
+        }
+        assert!(
+            speaker.decode_next_frame(&mut out).expect("decode burst 2"),
+            "packets after idle reset must lock onto new lower sequence instead of dropping"
+        );
     }
 }
