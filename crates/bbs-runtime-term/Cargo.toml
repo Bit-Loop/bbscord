@@ -1,0 +1,14 @@
+[package]
+name = "bbs-runtime-term"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Terminal capability probing, graphics protocol detection, input normalization, and image/GIF decoding for bbscord"
+
+[dependencies]
+bbs-core.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

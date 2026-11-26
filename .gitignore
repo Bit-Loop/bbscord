@@ -1,0 +1,28 @@
+# Rust / Cargo build outputs
+/target
+**/*.rs.bk
+*.pdb
+
+# Secrets, tokens, credentials, and local overrides (NEVER commit)
+.env
+.env.*
+*.token
+*.key
+*.pem
+*.secret
+*keyring*
+config.local.toml
+secrets.toml
+
+# Runtime logs & local caches
+logs/
+*.log
+
+# OS / Editor artifacts
+.DS_Store
+Thumbs.db
+*~
+*.swp
+*.swo
+.vscode/
+.idea/

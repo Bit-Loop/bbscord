@@ -1,0 +1,15 @@
+[package]
+name = "bbs-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Adaptive BBS-styled Ratatui interface (16x2 micro LCD through 4K ultrawide cockpit) for bbscord"
+
+[dependencies]
+bbs-core.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

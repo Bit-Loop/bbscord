@@ -1,0 +1,15 @@
+[package]
+name = "bbs-voice"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Discord Voice Gateway, UDP/Opus audio, DAVE E2EE, and voice-message playback for bbscord"
+
+[dependencies]
+bbs-core.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

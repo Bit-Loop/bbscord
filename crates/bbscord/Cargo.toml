@@ -1,0 +1,25 @@
+[package]
+name = "bbscord"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Production-ready BBS-styled Discord terminal client"
+
+[[bin]]
+name = "bbscord"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+bbs-core.workspace = true
+bbs-protocol.workspace = true
+bbs-runtime-term.workspace = true
+bbs-tui.workspace = true
+bbs-video.workspace = true
+bbs-voice.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
