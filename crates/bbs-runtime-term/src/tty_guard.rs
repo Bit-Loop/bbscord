@@ -66,6 +66,11 @@ pub const END_SYNC_OUTPUT_SEQ: &[u8] = b"\x1b[?2026l";
 /// ASCII and `0x7F`/`0x08` Backspace functional everywhere.
 pub const PUSH_KITTY_KEYBOARD_FLAGS_SEQ: &[u8] = b"\x1b[>1u";
 
+/// Set (replace) the active Kitty keyboard enhancement flags without pushing onto the terminal's
+/// keyboard stack (`CSI = 1 ; 1 u`). Used on `Ctrl+L` mode refresh so repeated refreshes never
+/// leak stack entries past the single [`POP_KITTY_KEYBOARD_FLAGS_SEQ`] on teardown.
+pub const SET_KITTY_KEYBOARD_FLAGS_SEQ: &[u8] = b"\x1b[=1;1u";
+
 /// Pop Kitty keyboard enhancement flags (`CSI < u`).
 pub const POP_KITTY_KEYBOARD_FLAGS_SEQ: &[u8] = b"\x1b[<u";
 
@@ -75,11 +80,30 @@ pub const KITTY_DELETE_PLACEMENTS_SEQ: &[u8] = b"\x1b_Ga=d\x1b\\";
 /// Delete all Kitty graphics placements AND free stored pixel buffers silently (`d=A,q=2`).
 pub const KITTY_DELETE_ALL_DATA_SEQ: &[u8] = b"\x1b_Ga=d,d=A,q=2\x1b\\";
 
+/// `tmux` DCS-passthrough-wrapped [`KITTY_DELETE_PLACEMENTS_SEQ`].
+pub const KITTY_TMUX_DELETE_PLACEMENTS_SEQ: &[u8] = b"\x1bPtmux;\x1b\x1b_Ga=d\x1b\x1b\\\x1b\\";
+
+/// `tmux` DCS-passthrough-wrapped [`KITTY_DELETE_ALL_DATA_SEQ`].
+pub const KITTY_TMUX_DELETE_ALL_DATA_SEQ: &[u8] =
+    b"\x1bPtmux;\x1b\x1b_Ga=d,d=A,q=2\x1b\x1b\\\x1b\\";
+
 /// Format a Kitty graphics deletion command that frees both placement and pixel memory (`d=I`)
 /// for a specific image ID `id`.
 #[must_use]
 pub fn kitty_delete_image_data_seq(id: u32) -> String {
-    format!("\x1b_Ga=d,d=I,i={id},q=2\x1b\\")
+    kitty_delete_image_data_seq_for(id, false)
+}
+
+/// Format a Kitty graphics deletion command (`d=I`) for image ID `id`, optionally wrapped in
+/// `tmux` DCS passthrough (`\x1bPtmux;...\x1b\\`) with doubled inner escapes when `tmux_passthrough`
+/// is enabled.
+#[must_use]
+pub fn kitty_delete_image_data_seq_for(id: u32, tmux_passthrough: bool) -> String {
+    if tmux_passthrough {
+        format!("\x1bPtmux;\x1b\x1b_Ga=d,d=I,i={id},q=2\x1b\x1b\\\x1b\\")
+    } else {
+        format!("\x1b_Ga=d,d=I,i={id},q=2\x1b\\")
+    }
 }
 
 /// Configuration for [`TtyGuard`] terminal mode initialization and restoration.
@@ -99,6 +123,8 @@ pub struct TtyGuardConfig {
     pub enable_grapheme_mode_2027: bool,
     /// Emit Kitty graphics delete sequence on teardown/suspend.
     pub delete_kitty_images_on_exit: bool,
+    /// Wrap Kitty graphics delete APC sequences in `tmux` DCS passthrough (`\x1bPtmux;...`).
+    pub tmux_passthrough: bool,
     /// Install a once-only panic hook calling [`restore_terminal`].
     pub install_panic_hook: bool,
 }
@@ -113,6 +139,7 @@ impl Default for TtyGuardConfig {
             disable_line_wrap: true,
             enable_grapheme_mode_2027: false,
             delete_kitty_images_on_exit: true,
+            tmux_passthrough: false,
             install_panic_hook: true,
         }
     }
@@ -133,6 +160,7 @@ impl TtyGuardConfig {
             disable_line_wrap: true,
             enable_grapheme_mode_2027: report.grapheme_mode_2027,
             delete_kitty_images_on_exit: allow_kitty_delete,
+            tmux_passthrough: report.tmux_passthrough_active,
             install_panic_hook: true,
         }
     }
@@ -172,10 +200,15 @@ pub fn build_enter_sequence(config: &TtyGuardConfig) -> Vec<u8> {
 /// and restores cursor visibility.
 #[must_use]
 pub fn build_restore_sequence(config: &TtyGuardConfig) -> Vec<u8> {
-    let mut out = Vec::with_capacity(160);
+    let mut out = Vec::with_capacity(192);
     if config.delete_kitty_images_on_exit {
-        out.extend_from_slice(KITTY_DELETE_PLACEMENTS_SEQ);
-        out.extend_from_slice(KITTY_DELETE_ALL_DATA_SEQ);
+        if config.tmux_passthrough {
+            out.extend_from_slice(KITTY_TMUX_DELETE_PLACEMENTS_SEQ);
+            out.extend_from_slice(KITTY_TMUX_DELETE_ALL_DATA_SEQ);
+        } else {
+            out.extend_from_slice(KITTY_DELETE_PLACEMENTS_SEQ);
+            out.extend_from_slice(KITTY_DELETE_ALL_DATA_SEQ);
+        }
     }
     if config.enable_kitty_keyboard {
         out.extend_from_slice(POP_KITTY_KEYBOARD_FLAGS_SEQ);
@@ -203,6 +236,9 @@ pub fn build_restore_sequence(config: &TtyGuardConfig) -> Vec<u8> {
 }
 
 /// Build the escape sequence used to re-assert terminal modes on `Ctrl+L` full repaint.
+///
+/// Uses [`SET_KITTY_KEYBOARD_FLAGS_SEQ`] (`\x1b[=1;1u`, mode 1 replace) instead of pushing onto
+/// the keyboard stack so repeated `Ctrl+L` refreshes never leak stack entries on exit.
 #[must_use]
 pub fn build_mode_refresh_sequence(config: &TtyGuardConfig) -> Vec<u8> {
     let mut out = Vec::with_capacity(96);
@@ -223,7 +259,7 @@ pub fn build_mode_refresh_sequence(config: &TtyGuardConfig) -> Vec<u8> {
         out.extend_from_slice(ENABLE_GRAPHEME_MODE_2027_SEQ);
     }
     if config.enable_kitty_keyboard {
-        out.extend_from_slice(PUSH_KITTY_KEYBOARD_FLAGS_SEQ);
+        out.extend_from_slice(SET_KITTY_KEYBOARD_FLAGS_SEQ);
     }
     out
 }
@@ -413,16 +449,48 @@ impl TtyGuard {
 
     /// Re-initialize raw mode + all configured terminal modes after receiving `SIGCONT` and emit
     /// a synthetic resize + full repaint notification.
+    ///
+    /// Rolls back raw mode and `termios` cleanly if emitting the enter escape sequence fails so
+    /// the terminal is never left stuck in raw mode.
     pub fn resume_after_sigcont(&mut self) -> io::Result<ResumeNotification> {
         #[cfg(unix)]
-        let saved_termios = capture_stdin_termios();
-
-        crossterm::terminal::enable_raw_mode()?;
+        let saved_termios = capture_stdin_termios().or_else(|| {
+            let guard = SAVED_STATE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.as_ref().and_then(|s| s.saved_termios)
+        });
 
         let mut stdout = io::stdout();
+        self.resume_with_io(
+            crossterm::terminal::enable_raw_mode,
+            || {
+                #[cfg(unix)]
+                if let Some(ref orig) = saved_termios {
+                    restore_stdin_termios(orig);
+                }
+                let _ = crossterm::terminal::disable_raw_mode();
+            },
+            &mut stdout,
+            #[cfg(unix)]
+            saved_termios,
+        )
+    }
+
+    fn resume_with_io<W: Write>(
+        &mut self,
+        enable_raw: impl FnOnce() -> io::Result<()>,
+        rollback_raw: impl FnOnce(),
+        writer: &mut W,
+        #[cfg(unix)] saved_termios: Option<libc::termios>,
+    ) -> io::Result<ResumeNotification> {
+        enable_raw()?;
+
         let seq = build_enter_sequence(&self.config);
-        stdout.write_all(&seq)?;
-        stdout.flush()?;
+        if let Err(err) = writer.write_all(&seq).and_then(|()| writer.flush()) {
+            rollback_raw();
+            return Err(err);
+        }
 
         {
             let mut guard = SAVED_STATE
@@ -431,7 +499,8 @@ impl TtyGuard {
             *guard = Some(SavedTerminalState {
                 config: self.config.clone(),
                 #[cfg(unix)]
-                saved_termios: saved_termios.or_else(|| guard.as_ref().and_then(|s| s.saved_termios)),
+                saved_termios: saved_termios
+                    .or_else(|| guard.as_ref().and_then(|s| s.saved_termios)),
             });
         }
         TERMINAL_ACTIVE.store(true, Ordering::SeqCst);
@@ -577,6 +646,8 @@ mod tests {
     use super::*;
     use crossterm::event::{KeyEventKind, KeyEventState};
 
+    static GLOBAL_STATE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn enter_and_restore_sequences_preserve_strict_ordering() {
         let cfg = TtyGuardConfig {
@@ -587,6 +658,7 @@ mod tests {
             disable_line_wrap: true,
             enable_grapheme_mode_2027: true,
             delete_kitty_images_on_exit: true,
+            tmux_passthrough: false,
             install_panic_hook: false,
         };
 
@@ -639,6 +711,9 @@ mod tests {
 
     #[test]
     fn restore_terminal_is_idempotent() {
+        let _lock = GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Seed active state explicitly for deterministic test without touching real TTY.
         {
             let mut guard = SAVED_STATE
@@ -740,7 +815,10 @@ mod tests {
         let refresh = build_mode_refresh_sequence(&cfg);
         assert!(find_subslice(&refresh, DISABLE_LINE_WRAP_SEQ).is_some());
         assert!(find_subslice(&refresh, ENABLE_BRACKETED_PASTE_SEQ).is_some());
-        assert!(find_subslice(&refresh, PUSH_KITTY_KEYBOARD_FLAGS_SEQ).is_some());
+        // Ctrl+L refresh MUST use set-current (`\x1b[=1;1u`), NEVER push (`\x1b[>1u`), to avoid
+        // leaking entries onto the Kitty keyboard stack across multiple refreshes.
+        assert!(find_subslice(&refresh, SET_KITTY_KEYBOARD_FLAGS_SEQ).is_some());
+        assert!(find_subslice(&refresh, PUSH_KITTY_KEYBOARD_FLAGS_SEQ).is_none());
 
         // 16x2 ASCII mode disables mouse, Kitty keyboard push, and Kitty APC deletion.
         env.term = Some("vt100".to_owned());
@@ -760,6 +838,98 @@ mod tests {
         assert!(!ascii_cfg.enable_mouse);
         assert!(!ascii_cfg.enable_kitty_keyboard);
         assert!(!ascii_cfg.delete_kitty_images_on_exit);
+    }
+
+    #[test]
+    fn tmux_passthrough_wraps_kitty_delete_sequences() {
+        use crate::probe::{
+            GeometrySource, ProbeOptions, ProbeResponse, TerminalEnv, negotiate_capabilities,
+        };
+
+        let env = TerminalEnv {
+            term: Some("tmux-256color".to_owned()),
+            tmux: Some("/tmp/tmux-1000/default,1,0".to_owned()),
+            kitty_window_id: Some("1".to_owned()),
+            lang: Some("en_US.UTF-8".to_owned()),
+            ..TerminalEnv::default()
+        };
+        let probe = ProbeResponse {
+            kitty_graphics: true,
+            da1_received: true,
+            ..ProbeResponse::default()
+        };
+        let report = negotiate_capabilities(
+            &env,
+            ViewportGeometry::new(120, 40),
+            GeometrySource::IoctlWinsize,
+            &probe,
+            &ProbeOptions {
+                tmux_passthrough: true,
+                ..ProbeOptions::default()
+            },
+            false,
+            false,
+        );
+        let cfg = TtyGuardConfig::from_probe(&report);
+        assert!(cfg.tmux_passthrough);
+        assert!(cfg.delete_kitty_images_on_exit);
+
+        let restore = build_restore_sequence(&cfg);
+        assert!(find_subslice(&restore, KITTY_TMUX_DELETE_PLACEMENTS_SEQ).is_some());
+        assert!(find_subslice(&restore, KITTY_TMUX_DELETE_ALL_DATA_SEQ).is_some());
+        // Must NOT emit unwrapped raw APC sequences that tmux would silently drop.
+        assert!(find_subslice(&restore, KITTY_DELETE_PLACEMENTS_SEQ).is_none());
+        assert!(find_subslice(&restore, KITTY_DELETE_ALL_DATA_SEQ).is_none());
+
+        assert_eq!(
+            kitty_delete_image_data_seq_for(42, true),
+            "\x1bPtmux;\x1b\x1b_Ga=d,d=I,i=42,q=2\x1b\x1b\\\x1b\\"
+        );
+        assert_eq!(
+            kitty_delete_image_data_seq_for(42, false),
+            "\x1b_Ga=d,d=I,i=42,q=2\x1b\\"
+        );
+    }
+
+    #[test]
+    fn sigcont_resume_rolls_back_raw_mode_on_write_failure() {
+        struct FailingWriter;
+        impl Write for FailingWriter {
+            fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "simulated pty write failure"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let _lock = GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        TERMINAL_ACTIVE.store(false, Ordering::SeqCst);
+
+        let mut guard = TtyGuard {
+            config: TtyGuardConfig::default(),
+            suspended: true,
+            last_geometry: ViewportGeometry::new(80, 24),
+        };
+        let mut rolled_back = false;
+        let mut writer = FailingWriter;
+
+        let res = guard.resume_with_io(
+            || Ok(()),
+            || {
+                rolled_back = true;
+            },
+            &mut writer,
+            #[cfg(unix)]
+            None,
+        );
+
+        assert!(res.is_err());
+        assert!(rolled_back, "raw mode MUST roll back if SIGCONT enter write fails");
+        assert!(guard.is_suspended());
+        assert!(!TERMINAL_ACTIVE.load(Ordering::SeqCst));
     }
 
     fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {

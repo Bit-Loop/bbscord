@@ -714,9 +714,11 @@ impl KittyDirectFrame {
                 payload.push_str("\x1bPtmux;");
             }
             if idx == 0 {
+                // `C=1` suppresses terminal cursor advance so `ratatui`'s `ForcedWidth(1)` cursor
+                // tracking remains synchronized on WezTerm and Konsole.
                 let _ = write!(
                     payload,
-                    "{esc}_Ga=T,f=32,s={px_w},v={px_h},c={},r={},i={id},q=2,m={more};{chunk}{esc}\\",
+                    "{esc}_Ga=T,f=32,s={px_w},v={px_h},c={},r={},i={id},C=1,q=2,m={more};{chunk}{esc}\\",
                     size.width, size.height
                 );
             } else {
@@ -1003,10 +1005,15 @@ impl MediaRenderer {
         let cell_pixels = (cell_pixels.0.max(1), cell_pixels.1.max(1));
         let mut picker = Picker::halfblocks();
         let proto_type = match tier {
-            GraphicsTier::KittyPlaceholder | GraphicsTier::KittyDirect => ProtocolType::Kitty,
+            GraphicsTier::KittyPlaceholder => ProtocolType::Kitty,
             GraphicsTier::Sixel => ProtocolType::Sixel,
             GraphicsTier::ITerm2 => ProtocolType::Iterm2,
-            GraphicsTier::HalfBlock | GraphicsTier::TextTagOnly => ProtocolType::Halfblocks,
+            // `ratatui-image` Kitty uses `U=1` Unicode placeholders unsupported by KittyDirect
+            // terminals (WezTerm/Konsole); keep Picker on Halfblocks and render KittyDirect via
+            // `MediaRenderer::render_frame` (`KittyDirectFrame`).
+            GraphicsTier::KittyDirect | GraphicsTier::HalfBlock | GraphicsTier::TextTagOnly => {
+                ProtocolType::Halfblocks
+            }
         };
         picker.set_protocol_type(proto_type);
 
@@ -1060,17 +1067,27 @@ impl MediaRenderer {
 
     /// Build a `ratatui-image` [`StatefulProtocol`] configured with our exact probed [`FontSize`]
     /// and `tmux` passthrough settings.
+    ///
+    /// Returns [`TermError::MediaEncode`] for [`GraphicsTier::KittyDirect`] because `ratatui-image`'s
+    /// `StatefulKitty` unconditionally emits `U=1` (`U+10EEEE`) Unicode placeholders unsupported by
+    /// WezTerm and Konsole — callers on `KittyDirect` should use [`Self::render_frame`] (which emits
+    /// [`KittyDirectFrame`]) or [`Self::render_halfblock_proxy`].
     pub fn create_stateful_protocol(&self, frame: &RgbaFrame) -> TermResult<StatefulProtocol> {
+        if self.tier == GraphicsTier::KittyDirect {
+            return Err(TermError::MediaEncode(
+                "KittyDirect does not support ratatui-image StatefulKitty (U=1 Unicode placeholders); use MediaRenderer::render_frame or render_halfblock_proxy instead"
+                    .to_owned(),
+            ));
+        }
+
         let image = rgba_frame_to_dynamic_image(frame)?;
         let font_size = FontSize::new(self.cell_pixels.0, self.cell_pixels.1);
         let proto_type = match self.tier {
-            GraphicsTier::KittyPlaceholder | GraphicsTier::KittyDirect => {
-                StatefulProtocolType::Kitty(StatefulKitty::new(
-                    self.alloc_kitty_id(),
-                    self.tmux_passthrough,
-                    false,
-                ))
-            }
+            GraphicsTier::KittyPlaceholder => StatefulProtocolType::Kitty(StatefulKitty::new(
+                self.alloc_kitty_id(),
+                self.tmux_passthrough,
+                false,
+            )),
             GraphicsTier::Sixel => StatefulProtocolType::Sixel(Sixel {
                 is_tmux: self.tmux_passthrough,
                 ..Sixel::default()
@@ -1081,6 +1098,11 @@ impl MediaRenderer {
             }),
             GraphicsTier::HalfBlock | GraphicsTier::TextTagOnly => {
                 StatefulProtocolType::Halfblocks(Halfblocks::default())
+            }
+            GraphicsTier::KittyDirect => {
+                return Err(TermError::MediaEncode(
+                    "KittyDirect is unsupported by StatefulProtocol".to_owned(),
+                ));
             }
         };
         Ok(StatefulProtocol::new(image, font_size, None, proto_type))
@@ -1672,18 +1694,23 @@ mod tests {
         // 64x64 RGBA = 16_384 raw bytes -> ~21_848 base64 bytes -> multiple 4096-byte chunks!
         let img = DynamicImage::ImageRgba8(RgbaImage::from_pixel(64, 64, Rgba([10, 20, 30, 255])));
         let direct = KittyDirectFrame::encode(&img, Size::new(8, 4), 123, false);
-        assert!(direct.payload.starts_with("\x1b_Ga=T,f=32,s=64,v=64,c=8,r=4,i=123,q=2,m=1;"));
+        assert!(
+            direct
+                .payload
+                .starts_with("\x1b_Ga=T,f=32,s=64,v=64,c=8,r=4,i=123,C=1,q=2,m=1;")
+        );
         assert!(direct.payload.contains("\x1b_Gm=1;"));
         assert!(direct.payload.contains("\x1b_Gm=0;"));
         assert!(direct.payload.ends_with("\x1b\\"));
 
-        // Tmux DCS passthrough MUST wrap each chunk with `\x1bPtmux;\x1b\x1b_G...\x1b\x1b\\\x1b\\`.
+        // Tmux DCS passthrough MUST wrap each chunk with `\x1bPtmux;\x1b\x1b_G...\x1b\x1b\\\x1b\\`
+        // and include `C=1` on chunk 0 so terminal cursor tracking stays synced.
         let small = DynamicImage::ImageRgba8(RgbaImage::from_pixel(2, 2, Rgba([255, 0, 0, 255])));
         let tmux_direct = KittyDirectFrame::encode(&small, Size::new(1, 1), 77, true);
         assert!(
             tmux_direct
                 .payload
-                .starts_with("\x1bPtmux;\x1b\x1b_Ga=T,f=32,s=2,v=2,c=1,r=1,i=77,q=2,m=0;")
+                .starts_with("\x1bPtmux;\x1b\x1b_Ga=T,f=32,s=2,v=2,c=1,r=1,i=77,C=1,q=2,m=0;")
         );
         assert!(tmux_direct.payload.ends_with("\x1b\x1b\\\x1b\\"));
     }
@@ -1704,5 +1731,29 @@ mod tests {
             Err(err) => panic!("proxy failed: {err}"),
         };
         assert_eq!(proxy.tier(), GraphicsTier::HalfBlock);
+
+        // KittyPlaceholder uses StatefulKitty (`U=1`), whereas KittyDirect MUST NOT route to
+        // StatefulKitty (unsupported by WezTerm/Konsole) and instead renders via KittyDirectFrame.
+        let kp_renderer =
+            MediaRenderer::new(GraphicsTier::KittyPlaceholder, ResolvedCharset::Utf8, (8, 16), false);
+        assert_eq!(kp_renderer.picker().protocol_type(), ProtocolType::Kitty);
+        let kp_stateful = match kp_renderer.create_stateful_protocol(&media.frames[0]) {
+            Ok(s) => s,
+            Err(err) => panic!("KittyPlaceholder stateful protocol failed: {err}"),
+        };
+        assert!(matches!(
+            kp_stateful.protocol_type(),
+            StatefulProtocolType::Kitty(_)
+        ));
+
+        let kd_renderer =
+            MediaRenderer::new(GraphicsTier::KittyDirect, ResolvedCharset::Utf8, (8, 16), false);
+        assert_eq!(kd_renderer.picker().protocol_type(), ProtocolType::Halfblocks);
+        assert!(kd_renderer.create_stateful_protocol(&media.frames[0]).is_err());
+        let kd_frame = match kd_renderer.render_frame(&media, 0, 12, 6, MediaFitMode::Contain) {
+            Ok(f) => f,
+            Err(err) => panic!("KittyDirect render_frame failed: {err}"),
+        };
+        assert!(matches!(kd_frame, RenderedMedia::KittyDirect(_)));
     }
 }

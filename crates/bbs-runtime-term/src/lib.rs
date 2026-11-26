@@ -72,8 +72,8 @@ pub use probe::{probe_fd_pair, query_winsize_fd};
 pub use tty_guard::{
     ResumeNotification, TerminalSignal, TtyGuard, TtyGuardConfig, build_enter_sequence,
     build_mode_refresh_sequence, build_restore_sequence, install_panic_hook, is_backspace_key,
-    kitty_delete_image_data_seq, looks_like_unbracketed_paste, normalize_key_event,
-    restore_terminal,
+    kitty_delete_image_data_seq, kitty_delete_image_data_seq_for, looks_like_unbracketed_paste,
+    normalize_key_event, restore_terminal,
 };
 #[cfg(unix)]
 pub use tty_guard::spawn_signal_listener;
