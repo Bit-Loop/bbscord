@@ -258,8 +258,12 @@ pub fn decode_ogg_opus(data: &[u8]) -> VoiceResult<DecodedVoiceMessage> {
         if packet.is_empty() {
             continue;
         }
+        let opus_pkt = audiopus::packet::Packet::try_from(packet.as_slice())
+            .map_err(|e| VoiceError::Opus(format!("invalid Ogg Opus packet: {e}")))?;
+        let signals = audiopus::MutSignals::try_from(&mut decode_buf[..])
+            .map_err(|e| VoiceError::Opus(format!("invalid Ogg Opus decode buffer: {e}")))?;
         let decoded_per_ch = decoder
-            .decode_float(Some(packet.as_slice()), &mut decode_buf[..], false)
+            .decode_float(Some(opus_pkt), signals, false)
             .map_err(|e| VoiceError::Opus(format!("Ogg Opus decode_float failed: {e}")))?;
 
         let start_frame = pre_skip_remaining.min(decoded_per_ch);

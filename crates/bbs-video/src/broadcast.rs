@@ -21,10 +21,7 @@ use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
 use gstreamer_webrtc as gst_webrtc;
 use tokio::sync::mpsc;
-#[cfg(target_os = "linux")]
 use tracing::{debug, info};
-#[cfg(not(target_os = "linux"))]
-use tracing::info;
 
 use crate::codec::{
     EncoderSelection, VideoCodec, create_configured_encoder, create_configured_payloader,

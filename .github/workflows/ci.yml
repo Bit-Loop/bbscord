@@ -13,6 +13,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
 
 jobs:
   secret-firewall:
@@ -157,14 +158,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install GStreamer, Opus, pkg-config, and CMake via Homebrew
+      - name: Install GStreamer 1.28.9 Universal (runtime + devel + Opus)
         run: |
-          brew update
-          brew install gstreamer opus pkg-config cmake
-          BREW_PREFIX="$(brew --prefix)"
-          echo "PKG_CONFIG_PATH=${BREW_PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH:-}" >> "$GITHUB_ENV"
-          echo "GST_PLUGIN_PATH=${BREW_PREFIX}/lib/gstreamer-1.0" >> "$GITHUB_ENV"
-          echo "${BREW_PREFIX}/bin" >> "$GITHUB_PATH"
+          GST_VER="1.28.9"
+          BASE="https://gstreamer.freedesktop.org/data/pkg/osx/${GST_VER}"
+          curl -fsSL "${BASE}/gstreamer-1.0-${GST_VER}-universal.pkg" -o /tmp/gst-runtime.pkg
+          curl -fsSL "${BASE}/gstreamer-1.0-devel-${GST_VER}-universal.pkg" -o /tmp/gst-devel.pkg
+          sudo installer -pkg /tmp/gst-runtime.pkg -target /
+          sudo installer -pkg /tmp/gst-devel.pkg -target /
+          rm -f /tmp/gst-runtime.pkg /tmp/gst-devel.pkg
+          GST_ROOT="/Library/Frameworks/GStreamer.framework/Versions/1.0"
+          echo "${GST_ROOT}/bin" >> "$GITHUB_PATH"
+          echo "PKG_CONFIG=${GST_ROOT}/bin/pkg-config" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_PATH=${GST_ROOT}/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "GST_PLUGIN_PATH=${GST_ROOT}/lib/gstreamer-1.0" >> "$GITHUB_ENV"
+          echo "DYLD_FALLBACK_LIBRARY_PATH=${GST_ROOT}/lib" >> "$GITHUB_ENV"
+          command -v cmake >/dev/null 2>&1 || brew install cmake
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

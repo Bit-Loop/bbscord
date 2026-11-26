@@ -619,16 +619,21 @@ impl SpeakerPipeline {
         let is_explicit_silence = packet == Some(OPUS_SILENCE_FRAME.as_slice());
 
         let decoded_per_ch = if let Some(pkt) = packet {
+            let opus_pkt = audiopus::packet::Packet::try_from(pkt)
+                .map_err(|e| VoiceError::Opus(format!("invalid Opus packet: {e}")))?;
             if fec {
-                self.decoder
-                    .decode_float(Some(pkt), &mut self.decode_scratch[..FRAME_SAMPLES], true)
+                let signals = audiopus::MutSignals::try_from(&mut self.decode_scratch[..FRAME_SAMPLES])
+                    .map_err(|e| VoiceError::Opus(format!("invalid Opus FEC buffer: {e}")))?;
+                self.decoder.decode_float(Some(opus_pkt), signals, true)
             } else {
-                self.decoder
-                    .decode_float(Some(pkt), &mut self.decode_scratch[..], false)
+                let signals = audiopus::MutSignals::try_from(&mut self.decode_scratch[..])
+                    .map_err(|e| VoiceError::Opus(format!("invalid Opus decode buffer: {e}")))?;
+                self.decoder.decode_float(Some(opus_pkt), signals, false)
             }
         } else {
-            self.decoder
-                .decode_float(None::<&[u8]>, &mut self.decode_scratch[..FRAME_SAMPLES], false)
+            let signals = audiopus::MutSignals::try_from(&mut self.decode_scratch[..FRAME_SAMPLES])
+                .map_err(|e| VoiceError::Opus(format!("invalid Opus PLC buffer: {e}")))?;
+            self.decoder.decode_float(None, signals, false)
         }
         .map_err(|e| VoiceError::Opus(format!("Opus decode_float failed: {e}")))?;
 
