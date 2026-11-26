@@ -74,7 +74,9 @@ pub fn sparkline(samples: &[f32], width: usize, charset: ResolvedCharset) -> Str
                 l
             };
             let w: Vec<Option<f32>> = window(samples, width * 2).collect();
-            w.chunks_exact(2)
+            w.as_chunks::<2>()
+                .0
+                .iter()
                 .map(|p| braille_column_bits(h(p[0]), h(p[1])))
                 .collect()
         }

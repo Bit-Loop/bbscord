@@ -113,6 +113,22 @@ const ZONEINFO_PREFIXES: &[&str] = &[
     "/var/db/timezone/zoneinfo/",
 ];
 
+/// Chrome-like header emission order for HTTP/1.1 WebSocket upgrade requests.
+static CHROME_WS_HEADER_ORDER: &[HeaderName] = &[
+    header::HOST,
+    header::CONNECTION,
+    header::PRAGMA,
+    header::CACHE_CONTROL,
+    header::USER_AGENT,
+    header::UPGRADE,
+    header::ORIGIN,
+    header::SEC_WEBSOCKET_VERSION,
+    header::ACCEPT_ENCODING,
+    header::ACCEPT_LANGUAGE,
+    header::COOKIE,
+    header::SEC_WEBSOCKET_KEY,
+];
+
 /// Chrome-like header emission order for REST requests.
 static CHROME_HEADER_ORDER: &[HeaderName] = &[
     header::HOST,
@@ -710,7 +726,30 @@ impl DiscordFingerprint {
             .max_tls_version(TlsVersion::TLS_1_3)
             .build();
 
-        let emulation = EmulationProvider::builder().tls_config(tls).build();
+        let http1 = Http1Config::builder().title_case_headers(true).build();
+
+        let mut default_headers = HeaderMap::new();
+        insert_header(&mut default_headers, header::PRAGMA, "no-cache")?;
+        insert_header(&mut default_headers, header::CACHE_CONTROL, "no-cache")?;
+        insert_header(&mut default_headers, header::USER_AGENT, &self.user_agent)?;
+        insert_header(&mut default_headers, header::ORIGIN, DISCORD_ORIGIN)?;
+        insert_header(
+            &mut default_headers,
+            header::ACCEPT_ENCODING,
+            "gzip, deflate, br",
+        )?;
+        insert_header(
+            &mut default_headers,
+            header::ACCEPT_LANGUAGE,
+            "en-US,en;q=0.9",
+        )?;
+
+        let emulation = EmulationProvider::builder()
+            .tls_config(tls)
+            .http1_config(http1)
+            .default_headers(default_headers)
+            .headers_order(CHROME_WS_HEADER_ORDER)
+            .build();
 
         Client::builder()
             .emulation(emulation)

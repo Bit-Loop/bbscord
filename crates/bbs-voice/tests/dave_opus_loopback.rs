@@ -116,7 +116,7 @@ fn goertzel_power_left(pcm_stereo: &[f32], target_hz: f64) -> f64 {
     let coeff = 2.0 * omega.cos();
     let mut s_prev = 0.0f64;
     let mut s_prev2 = 0.0f64;
-    for frame in pcm_stereo.chunks_exact(2) {
+    for frame in pcm_stereo.as_chunks::<2>().0 {
         let s = f64::from(frame[0]) + coeff * s_prev - s_prev2;
         s_prev2 = s_prev;
         s_prev = s;

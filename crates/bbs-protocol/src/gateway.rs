@@ -1063,9 +1063,17 @@ impl GatewaySessionState {
     }
 
     fn handle_ready(&mut self, data: serde_json::Value, outcome: &mut GatewayFrameOutcome) {
-        let Ok(ready) = serde_json::from_value::<WireReady>(data) else {
-            warn!("failed to decode READY dispatch");
-            return;
+        let ready = match serde_json::from_value::<WireReady>(data) {
+            Ok(ready) => ready,
+            Err(err) => {
+                warn!("failed to decode READY dispatch: {err}");
+                outcome.events.push(BackendEvent::ErrorBanner {
+                    scope: "gateway".to_owned(),
+                    message: format!("READY decode failed: {err}"),
+                    recoverable: true,
+                });
+                return;
+            }
         };
 
         self.session_id = Some(ready.session_id);
@@ -1656,6 +1664,11 @@ impl DiscordGateway {
             Ok(resp) => resp,
             Err(err) => {
                 warn!("gateway connect error: {err}");
+                let _ = self.events_tx.send(BackendEvent::ErrorBanner {
+                    scope: "gateway".to_owned(),
+                    message: compact_gateway_error("gateway connect error", &err),
+                    recoverable: true,
+                });
                 return SessionExit::Reconnect {
                     reset_backoff: false,
                     min_delay: None,
@@ -1667,6 +1680,11 @@ impl DiscordGateway {
             Ok(ws) => ws,
             Err(err) => {
                 warn!("gateway websocket upgrade error: {err}");
+                let _ = self.events_tx.send(BackendEvent::ErrorBanner {
+                    scope: "gateway".to_owned(),
+                    message: compact_gateway_error("gateway upgrade error", &err),
+                    recoverable: true,
+                });
                 return SessionExit::Reconnect {
                     reset_backoff: false,
                     min_delay: None,
@@ -1790,6 +1808,16 @@ impl DiscordGateway {
                         wreq::Message::Pong(_) => continue,
                         wreq::Message::Close(close_frame) => {
                             let code = close_frame.as_ref().map(|c| c.code.0);
+                            let reason = close_frame
+                                .as_ref()
+                                .map(|c| c.reason.as_str())
+                                .unwrap_or("");
+                            warn!(close_code = ?code, close_reason = %reason, "gateway websocket closed by remote");
+                            let _ = self.events_tx.send(BackendEvent::ErrorBanner {
+                                scope: "gateway".to_owned(),
+                                message: format!("gateway closed (code={code:?}, reason={reason})"),
+                                recoverable: true,
+                            });
                             return classify_close_code(code, established_ready, &mut self.state);
                         }
                     };
@@ -1926,6 +1954,20 @@ enum SessionExit {
         reset_backoff: bool,
         min_delay: Option<Duration>,
     },
+}
+
+fn compact_gateway_error(prefix: &str, err: &dyn fmt::Display) -> String {
+    let raw = err.to_string();
+    let single_line: String = raw
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let clipped: String = single_line.chars().take(120).collect();
+    if single_line.chars().count() > 120 {
+        format!("{prefix}: {clipped}…")
+    } else {
+        format!("{prefix}: {clipped}")
+    }
 }
 
 fn classify_close_code(

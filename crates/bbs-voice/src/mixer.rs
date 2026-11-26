@@ -110,8 +110,8 @@ impl HighPassFilter {
 
     /// Filter an interleaved stereo PCM frame in place.
     pub fn process_interleaved_stereo(&mut self, pcm: &mut [f32]) {
-        for frame in pcm.chunks_exact_mut(CHANNELS) {
-            for (ch, slot) in frame.iter_mut().enumerate().take(CHANNELS) {
+        for frame in pcm.as_chunks_mut::<CHANNELS>().0 {
+            for (ch, slot) in frame.iter_mut().enumerate() {
                 let x = if slot.is_finite() { *slot } else { 0.0 };
                 let y = self.alpha * (self.prev_out[ch] + x - self.prev_in[ch]);
                 self.prev_in[ch] = x;

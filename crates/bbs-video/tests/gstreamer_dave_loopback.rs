@@ -184,8 +184,7 @@ fn assert_valid_non_black_smpte_rgba(frame: &VideoFrame, expected_w: u32, expect
     let mut sum_b = 0u64;
     let mut max_channel_delta = 0u8;
 
-    for px in frame.rgba.chunks_exact(4) {
-        let (r, g, b, a) = (px[0], px[1], px[2], px[3]);
+    for &[r, g, b, a] in frame.rgba.as_chunks::<4>().0 {
         assert_eq!(a, 255, "RGBA alpha channel should be opaque");
         if r > 16 || g > 16 || b > 16 {
             non_black_pixels += 1;

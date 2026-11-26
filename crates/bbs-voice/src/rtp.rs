@@ -274,8 +274,8 @@ impl RtpHeader {
         }
 
         let mut csrcs = Vec::with_capacity(usize::from(csrc_count));
-        for chunk in packet[RTP_HEADER_MIN_LEN..csrc_end].chunks_exact(4) {
-            csrcs.push(u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        for &chunk in packet[RTP_HEADER_MIN_LEN..csrc_end].as_chunks::<4>().0 {
+            csrcs.push(u32::from_be_bytes(chunk));
         }
 
         let (aad_len, extension_profile, extension_word_len) = if extension {
