@@ -256,6 +256,14 @@ jobs:
             "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
             "C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           }
+          if ($arch -eq "arm64") {
+            # Native Windows ARM64 (host == target) bypasses boring-sys2's cross-compile guard
+            # while MSVC cannot assemble BoringSSL's GAS .S files; disable BoringSSL ASM cleanly.
+            $tcFile = (Join-Path $env:RUNNER_TEMP "win-arm64-boringssl.cmake") -replace '\\', '/'
+            'set(OPENSSL_NO_ASM ON CACHE BOOL "Disable GAS ASM for MSVC ARM64" FORCE)' |
+              Set-Content -Path $tcFile -Encoding ascii
+            "CMAKE_TOOLCHAIN_FILE=$tcFile" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          }
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -264,7 +272,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: windows-${{ matrix.label }}
+          prefix-key: windows-${{ matrix.label }}${{ matrix.label == 'arm64' && '-noasm' || '' }}
 
       - name: Clippy (strict -D warnings)
         shell: pwsh
