@@ -4,10 +4,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{
     Attachment, CallRingState, Channel, GifItem, GifSearchPage, GifSearchQuery, Guild, GuildFolder,
-    Message, Presence, Reaction, Snowflake, StreamDescriptor, StreamQuality, StreamSourceKind,
-    User, VideoFrame, VideoSinkKind, VoiceChannelStatus, VoicePlaybackState,
+    GuildMemberSummary, Message, MessagePatch, Presence, Reaction, Role, Snowflake,
+    StreamDescriptor, StreamQuality, StreamSourceKind, User, VideoFrame, VideoSinkKind,
+    VoiceChannelStatus, VoiceParticipant, VoicePlaybackState,
 };
 use crate::viewport::ViewportGeometry;
+
+const fn default_true() -> bool {
+    true
+}
 
 /// High-level Gateway transport connection state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
@@ -77,6 +82,46 @@ pub enum BackendEvent {
     MessageCreated(Message),
     /// Existing message content, embeds, or pin state changed.
     MessageUpdated(Message),
+    /// Partial message update (e.g., Discord `MESSAGE_UPDATE` embed unfurl omitting `author` or
+    /// `content`) merged onto an existing cached message without clobbering omitted fields.
+    MessagePatched(MessagePatch),
+    /// Read-state acknowledgement synced from Discord (`MESSAGE_ACK`) or local read receipt.
+    MessageAcked {
+        /// Acknowledged channel Snowflake.
+        channel_id: Snowflake,
+        /// Last message Snowflake marked as read.
+        last_message_id: Snowflake,
+        /// Remaining unread mention count (`0` when fully read).
+        mention_count: u32,
+    },
+    /// User notification/mute settings updated for a guild (or DM overrides when `guild_id` is `None`).
+    GuildSettingsUpdated {
+        /// Target guild Snowflake (`None` for DM/global channel overrides).
+        guild_id: Option<Snowflake>,
+        /// Whether the guild itself is muted.
+        muted: bool,
+        /// Whether `@everyone` / `@here` mentions are suppressed in this guild.
+        suppress_everyone: bool,
+        /// Whether `@role` mentions are suppressed in this guild.
+        suppress_roles: bool,
+        /// Per-channel mute overrides as `(channel_id, muted)` pairs.
+        muted_channels: Vec<(Snowflake, bool)>,
+    },
+    /// Incremental guild member nickname and role updates (from `GUILD_MEMBERS_CHUNK`,
+    /// `GUILD_MEMBER_UPDATE`, or `GUILD_MEMBER_LIST_UPDATE`).
+    GuildMembersUpdated {
+        /// Owning guild Snowflake.
+        guild_id: Snowflake,
+        /// Updated guild member summaries.
+        members: Vec<GuildMemberSummary>,
+    },
+    /// Full guild role list updated (from `READY` or `GUILD_ROLE_*` dispatches).
+    GuildRolesUpdated {
+        /// Owning guild Snowflake.
+        guild_id: Snowflake,
+        /// Current roles belonging to `guild_id`.
+        roles: Vec<Role>,
+    },
     /// Existing message was deleted.
     MessageDeleted {
         /// Channel Snowflake.
@@ -126,8 +171,26 @@ pub enum BackendEvent {
         /// Paginated GIF results.
         page: GifSearchPage,
     },
+    /// Asynchronous GIF search or trending request failed (allows the picker to display an error
+    /// instead of remaining stuck in a loading state).
+    GifSearchFailed {
+        /// Correlation ID issued by the UI picker.
+        request_id: u64,
+        /// Human-readable sanitized error summary.
+        error: String,
+    },
     /// Full snapshot update of the active voice session (Guild voice or DM/Group DM call).
     VoiceStatusUpdated(VoiceChannelStatus),
+    /// Sidebar voice-channel occupant roster synced from Gateway voice state events, strictly
+    /// separate from the local voice engine's [`Self::VoiceStatusUpdated`] snapshot.
+    VoiceRosterUpdated {
+        /// Owning guild Snowflake (`None` for DM/Group DM calls).
+        guild_id: Option<Snowflake>,
+        /// Voice or DM/Group DM channel Snowflake.
+        channel_id: Snowflake,
+        /// Current participants occupying `channel_id` (empty when vacant).
+        participants: Vec<VoiceParticipant>,
+    },
     /// High-frequency RMS dBFS and speaking updates for smooth Braille VU meters.
     VoiceAudioLevels {
         /// Active voice/call channel Snowflake.
@@ -196,8 +259,32 @@ pub enum UiAction {
         content: String,
         /// Optional message Snowflake being replied to.
         reply_to: Option<Snowflake>,
+        /// Whether replying to `reply_to` pings the replied-to author (`allowed_mentions.replied_user`).
+        #[serde(default = "default_true")]
+        mention_replied_user: bool,
         /// Optional local filesystem paths to upload as attachments.
         attachment_paths: Vec<String>,
+    },
+    /// Acknowledge (mark read) messages in `channel_id` up to `message_id`.
+    AckMessage {
+        /// Target channel Snowflake.
+        channel_id: Snowflake,
+        /// Latest read message Snowflake.
+        message_id: Snowflake,
+    },
+    /// Send a typing indicator in `channel_id`.
+    SendTyping {
+        /// Target channel Snowflake.
+        channel_id: Snowflake,
+    },
+    /// Request guild member metadata (Gateway Op 8) for `@` autocomplete or role/nick resolution.
+    RequestGuildMembers {
+        /// Target guild Snowflake.
+        guild_id: Snowflake,
+        /// Optional username/nickname prefix query.
+        query: Option<String>,
+        /// Optional explicit list of user Snowflakes to fetch.
+        user_ids: Vec<Snowflake>,
     },
     /// Edit an existing message authored by the current user.
     EditMessage {

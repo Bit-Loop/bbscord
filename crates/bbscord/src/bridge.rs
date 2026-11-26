@@ -480,6 +480,7 @@ async fn execute_ui_action(
             channel_id,
             content,
             reply_to,
+            mention_replied_user,
             attachment_paths,
         } => {
             if !attachment_paths.is_empty()
@@ -511,10 +512,20 @@ async fn execute_ui_action(
                     .await?;
             } else {
                 let _ = discord
-                    .send_message(channel_id, &content, reply_to)
+                    .send_message_with_mention(channel_id, &content, reply_to, mention_replied_user)
                     .await?;
             }
         }
+        UiAction::AckMessage {
+            channel_id,
+            message_id,
+        } => {
+            discord.ack_message(channel_id, message_id).await?;
+        }
+        UiAction::SendTyping { channel_id } => {
+            discord.send_typing(channel_id).await?;
+        }
+        UiAction::RequestGuildMembers { .. } => {}
         UiAction::EditMessage {
             channel_id,
             message_id,

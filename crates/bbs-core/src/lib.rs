@@ -19,16 +19,18 @@ pub const CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub use error::{CoreError, CoreResult};
 pub use events::{BackendEvent, ConnectionState, UiAction};
 pub use mock::{
-    MockDiscordBackend, MockGifProvider, MockVideoStreamEngine, MockVoiceEngine, mock_ids,
+    MockDiscordBackend, MockGifProvider, MockVideoStreamEngine, MockVoiceEngine, MockVoiceRoster,
+    mock_ids,
 };
 pub use model::{
     Activity, ActivityKind, Attachment, CallRingState, Channel, ChannelKind, DaveSessionState,
     Embed, EmbedAuthor, EmbedField, EmbedFooter, EmbedKind, EmbedMedia, EmbedProvider, GifItem,
-    GifProviderKind, GifSearchPage, GifSearchQuery, Guild, GuildFolder, Message, MessageReference,
-    PollAnswerSummary, PollSummary, Presence, PresenceStatus, Reaction, RefreshedAttachmentUrl,
-    RgbaFrame, Snowflake, StreamDescriptor, StreamQuality, StreamSourceKind, User, VideoFrame,
-    VideoSinkKind, VoiceChannelStatus, VoiceConnectionState, VoiceMessageMeta, VoiceParticipant,
-    VoicePlaybackState,
+    GifProviderKind, GifSearchPage, GifSearchQuery, Guild, GuildFolder, GuildMemberSummary,
+    Message, MessagePatch, MessageReference, PollAnswerSummary, PollSummary, Presence,
+    PresenceStatus, Reaction, RefreshedAttachmentUrl, RgbaFrame, Role, Snowflake, StreamDescriptor,
+    StreamQuality, StreamSourceKind, User, VideoFrame, VideoSinkKind, VoiceChannelStatus,
+    VoiceConnectionState, VoiceMessageMeta, VoiceParticipant, VoicePlaybackState,
+    resize_discord_media_proxy_url,
 };
 pub use secrets::{
     BBSCORD_KEYRING_SERVICE, BBSCORD_KEYRING_USER, DISCORDO_KEYRING_SERVICE,

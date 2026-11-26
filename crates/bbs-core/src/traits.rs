@@ -43,6 +43,31 @@ pub trait DiscordBackend: Send + Sync {
         reply_to: Option<Snowflake>,
     ) -> CoreResult<Message>;
 
+    /// Send a message into `channel_id`, optionally replying to `reply_to` and controlling
+    /// whether the replied-to user is pinged (`allowed_mentions.replied_user`).
+    ///
+    /// Defaults to delegating to [`Self::send_message`].
+    async fn send_message_with_mention(
+        &self,
+        channel_id: Snowflake,
+        content: &str,
+        reply_to: Option<Snowflake>,
+        _mention_replied_user: bool,
+    ) -> CoreResult<Message> {
+        self.send_message(channel_id, content, reply_to).await
+    }
+
+    /// Acknowledge (mark read) messages in `channel_id` up to `message_id`.
+    ///
+    /// Defaults to a no-op so lightweight test doubles remain source-compatible.
+    async fn ack_message(
+        &self,
+        _channel_id: Snowflake,
+        _message_id: Snowflake,
+    ) -> CoreResult<()> {
+        Ok(())
+    }
+
     /// Edit an existing message authored by the signed-in user.
     async fn edit_message(
         &self,

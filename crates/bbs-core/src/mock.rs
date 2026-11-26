@@ -14,11 +14,11 @@ use crate::events::BackendEvent;
 use crate::model::{
     Attachment, CallRingState, Channel, ChannelKind, DaveSessionState, Embed, EmbedAuthor,
     EmbedField, EmbedFooter, EmbedKind, EmbedMedia, EmbedProvider, GifItem, GifProviderKind,
-    GifSearchPage, GifSearchQuery, Guild, GuildFolder, Message, MessageReference,
-    PollAnswerSummary, PollSummary, PresenceStatus, Reaction, RefreshedAttachmentUrl, RgbaFrame,
-    Snowflake, StreamDescriptor, StreamQuality, StreamSourceKind, User, VideoFrame, VideoSinkKind,
-    VoiceChannelStatus, VoiceConnectionState, VoiceMessageMeta, VoiceParticipant,
-    VoicePlaybackState,
+    GifSearchPage, GifSearchQuery, Guild, GuildFolder, GuildMemberSummary, Message,
+    MessageReference, PollAnswerSummary, PollSummary, PresenceStatus, Reaction,
+    RefreshedAttachmentUrl, RgbaFrame, Role, Snowflake, StreamDescriptor, StreamQuality,
+    StreamSourceKind, User, VideoFrame, VideoSinkKind, VoiceChannelStatus, VoiceConnectionState,
+    VoiceMessageMeta, VoiceParticipant, VoicePlaybackState,
 };
 use crate::traits::{DiscordBackend, GifProvider, VideoStreamEngine, VoiceEngine};
 
@@ -36,6 +36,23 @@ pub mod mock_ids {
     pub const USER_CAROL: Snowflake = Snowflake(100_000_000_000_000_004);
     /// Bot mock user (`bbs_daemon`).
     pub const USER_BOT: Snowflake = Snowflake(100_000_000_000_000_005);
+    /// Offline peer mock user (`tape_archivist`).
+    pub const USER_DAVE: Snowflake = Snowflake(100_000_000_000_000_006);
+
+    /// RetroNet role: SysOp (`#38BDF8`).
+    pub const ROLE_SYSOP: Snowflake = Snowflake(600_000_000_000_000_001);
+    /// RetroNet role: Daemon (`#BD93F9`).
+    pub const ROLE_DAEMON: Snowflake = Snowflake(600_000_000_000_000_002);
+    /// RetroNet role: Netrunner (`#50FA7B`).
+    pub const ROLE_NETRUNNER: Snowflake = Snowflake(600_000_000_000_000_003);
+    /// RetroNet role: ANSI Artist (`#FF79C6`).
+    pub const ROLE_ARTIST: Snowflake = Snowflake(600_000_000_000_000_004);
+    /// RetroNet role: Caretaker (`#FFB86C`).
+    pub const ROLE_CARETAKER: Snowflake = Snowflake(600_000_000_000_000_005);
+    /// Rust Lab role: Core Maintainer (`#F97316`).
+    pub const ROLE_RUST_CORE: Snowflake = Snowflake(600_000_000_000_000_010);
+    /// Demoscene role: Shader Coder (`#FACC15`).
+    pub const ROLE_DEMO_CODER: Snowflake = Snowflake(600_000_000_000_000_020);
 
     /// Guild 1: RetroNet BBS.
     pub const GUILD_RETRONET: Snowflake = Snowflake(200_000_000_000_000_001);
@@ -54,14 +71,22 @@ pub mod mock_ids {
     pub const CH_RETRONET_STAGE: Snowflake = Snowflake(300_000_000_000_000_004);
     /// RetroNet public thread: `ANSI Theme Showcase`.
     pub const CH_RETRONET_THREAD: Snowflake = Snowflake(300_000_000_000_000_005);
+    /// RetroNet muted text channel: `#bot-firehose`.
+    pub const CH_RETRONET_MUTED_LOGS: Snowflake = Snowflake(300_000_000_000_000_006);
     /// Rust Lab text channel: `#async-runtime`.
     pub const CH_RUST_ASYNC: Snowflake = Snowflake(300_000_000_000_000_010);
     /// Rust Lab forum channel: `#rfc-board`.
     pub const CH_RUST_FORUM: Snowflake = Snowflake(300_000_000_000_000_011);
     /// Demoscene text channel: `#shaders-and-sixel`.
     pub const CH_DEMO_SHADERS: Snowflake = Snowflake(300_000_000_000_000_020);
-    /// 1:1 Direct Message with `modem_wizard`.
+    /// 1:1 Direct Message with `modem_wizard` (Online).
     pub const CH_DM_ALICE: Snowflake = Snowflake(300_000_000_000_000_100);
+    /// 1:1 Direct Message with `crt_hacker` (Idle).
+    pub const CH_DM_BOB: Snowflake = Snowflake(300_000_000_000_000_101);
+    /// 1:1 Direct Message with `ansi_artist` (Do Not Disturb).
+    pub const CH_DM_CAROL: Snowflake = Snowflake(300_000_000_000_000_102);
+    /// 1:1 Direct Message with `tape_archivist` (Offline).
+    pub const CH_DM_DAVE: Snowflake = Snowflake(300_000_000_000_000_103);
     /// Active Group DM (`type = 3`) `"BBS Ops War Room"` with active call state.
     pub const CH_GROUP_DM_OPS: Snowflake = Snowflake(300_000_000_000_000_200);
 
@@ -72,15 +97,20 @@ pub mod mock_ids {
     pub const STREAM_GROUP_DM: &str = "call:300000000000000200:100000000000000003";
 }
 
+/// Seeded voice channel roster tuple `(guild_id, channel_id, participants)` for `--mock-demo`.
+pub type MockVoiceRoster = (Option<Snowflake>, Snowflake, Vec<VoiceParticipant>);
+
 #[derive(Debug)]
 struct MockDiscordState {
     current_user: User,
     users: HashMap<Snowflake, User>,
     guilds: Vec<Guild>,
     guild_folders: Vec<GuildFolder>,
+    guild_members: HashMap<Snowflake, Vec<GuildMemberSummary>>,
     channels: HashMap<Snowflake, Channel>,
     messages: HashMap<Snowflake, Vec<Message>>,
     call_rings: HashMap<Snowflake, CallRingState>,
+    voice_rosters: Vec<MockVoiceRoster>,
 }
 
 /// Deterministic in-memory [`DiscordBackend`] with rich guilds, Group DMs, embeds, polls, and calls.
@@ -152,11 +182,66 @@ impl MockDiscordBackend {
             accent_color: Some(0xBD93F9),
             presence: PresenceStatus::Online,
         };
+        let user_dave = User {
+            id: mock_ids::USER_DAVE,
+            username: "tape_archivist".to_string(),
+            global_name: Some("Tape Archivist".to_string()),
+            discriminator: None,
+            avatar_hash: None,
+            bot: false,
+            accent_color: Some(0x64748B),
+            presence: PresenceStatus::Offline,
+        };
 
         let mut users = HashMap::new();
-        for u in [&user_self, &user_alice, &user_bob, &user_carol, &user_bot] {
+        for u in [
+            &user_self,
+            &user_alice,
+            &user_bob,
+            &user_carol,
+            &user_bot,
+            &user_dave,
+        ] {
             users.insert(u.id, u.clone());
         }
+
+        let retronet_roles = vec![
+            Role {
+                id: mock_ids::ROLE_SYSOP,
+                name: "SysOp".to_string(),
+                color: 0x38BDF8,
+                position: 30,
+                hoist: true,
+            },
+            Role {
+                id: mock_ids::ROLE_DAEMON,
+                name: "Daemon".to_string(),
+                color: 0xBD93F9,
+                position: 25,
+                hoist: true,
+            },
+            Role {
+                id: mock_ids::ROLE_NETRUNNER,
+                name: "Netrunner".to_string(),
+                color: 0x50FA7B,
+                position: 20,
+                hoist: true,
+            },
+            Role {
+                id: mock_ids::ROLE_ARTIST,
+                name: "ANSI Artist".to_string(),
+                color: 0xFF79C6,
+                position: 15,
+                hoist: true,
+            },
+            Role {
+                id: mock_ids::ROLE_CARETAKER,
+                name: "Caretaker".to_string(),
+                color: 0xFFB86C,
+                position: 10,
+                hoist: false,
+            },
+        ];
 
         let guilds = vec![
             Guild {
@@ -167,6 +252,10 @@ impl MockDiscordBackend {
                 member_count: Some(128),
                 unread: true,
                 mention_count: 2,
+                roles: retronet_roles,
+                muted: false,
+                suppress_everyone: false,
+                suppress_roles: false,
             },
             Guild {
                 id: mock_ids::GUILD_RUST_LAB,
@@ -176,6 +265,16 @@ impl MockDiscordBackend {
                 member_count: Some(512),
                 unread: true,
                 mention_count: 0,
+                roles: vec![Role {
+                    id: mock_ids::ROLE_RUST_CORE,
+                    name: "Core Maintainer".to_string(),
+                    color: 0xF97316,
+                    position: 20,
+                    hoist: true,
+                }],
+                muted: false,
+                suppress_everyone: false,
+                suppress_roles: false,
             },
             Guild {
                 id: mock_ids::GUILD_DEMOSCENE,
@@ -185,8 +284,66 @@ impl MockDiscordBackend {
                 member_count: Some(64),
                 unread: false,
                 mention_count: 0,
+                roles: vec![Role {
+                    id: mock_ids::ROLE_DEMO_CODER,
+                    name: "Shader Coder".to_string(),
+                    color: 0xFACC15,
+                    position: 15,
+                    hoist: true,
+                }],
+                muted: false,
+                suppress_everyone: true,
+                suppress_roles: false,
             },
         ];
+
+        let mut guild_members: HashMap<Snowflake, Vec<GuildMemberSummary>> = HashMap::new();
+        guild_members.insert(
+            mock_ids::GUILD_RETRONET,
+            vec![
+                GuildMemberSummary {
+                    user_id: mock_ids::USER_SELF,
+                    nick: Some("Chief SysOp".to_string()),
+                    role_ids: vec![mock_ids::ROLE_SYSOP],
+                },
+                GuildMemberSummary {
+                    user_id: mock_ids::USER_BOT,
+                    nick: None,
+                    role_ids: vec![mock_ids::ROLE_DAEMON],
+                },
+                GuildMemberSummary {
+                    user_id: mock_ids::USER_ALICE,
+                    nick: Some("Modem Wiz".to_string()),
+                    role_ids: vec![mock_ids::ROLE_NETRUNNER],
+                },
+                GuildMemberSummary {
+                    user_id: mock_ids::USER_CAROL,
+                    nick: Some("ANSI Virtuoso".to_string()),
+                    role_ids: vec![mock_ids::ROLE_ARTIST],
+                },
+                GuildMemberSummary {
+                    user_id: mock_ids::USER_BOB,
+                    nick: None,
+                    role_ids: vec![mock_ids::ROLE_CARETAKER],
+                },
+            ],
+        );
+        guild_members.insert(
+            mock_ids::GUILD_RUST_LAB,
+            vec![GuildMemberSummary {
+                user_id: mock_ids::USER_ALICE,
+                nick: None,
+                role_ids: vec![mock_ids::ROLE_RUST_CORE],
+            }],
+        );
+        guild_members.insert(
+            mock_ids::GUILD_DEMOSCENE,
+            vec![GuildMemberSummary {
+                user_id: mock_ids::USER_BOB,
+                nick: Some("CRT Demomaker".to_string()),
+                role_ids: vec![mock_ids::ROLE_DEMO_CODER],
+            }],
+        );
 
         let guild_folders = vec![
             GuildFolder {
@@ -222,6 +379,8 @@ impl MockDiscordBackend {
                 mention_count: 0,
                 nsfw: false,
                 slowmode_secs: 0,
+                muted: false,
+                last_ack_message_id: None,
             },
             Channel {
                 id: mock_ids::CH_RETRONET_GENERAL,
@@ -242,6 +401,8 @@ impl MockDiscordBackend {
                 mention_count: 2,
                 nsfw: false,
                 slowmode_secs: 0,
+                muted: false,
+                last_ack_message_id: Some(Snowflake(400_000_000_000_000_001)),
             },
             Channel {
                 id: mock_ids::CH_RETRONET_VOICE,
@@ -259,6 +420,8 @@ impl MockDiscordBackend {
                 mention_count: 0,
                 nsfw: false,
                 slowmode_secs: 0,
+                muted: false,
+                last_ack_message_id: None,
             },
             Channel {
                 id: mock_ids::CH_RETRONET_STAGE,
@@ -276,6 +439,8 @@ impl MockDiscordBackend {
                 mention_count: 0,
                 nsfw: false,
                 slowmode_secs: 0,
+                muted: false,
+                last_ack_message_id: None,
             },
             Channel {
                 id: mock_ids::CH_RETRONET_THREAD,
@@ -293,6 +458,27 @@ impl MockDiscordBackend {
                 mention_count: 0,
                 nsfw: false,
                 slowmode_secs: 0,
+                muted: false,
+                last_ack_message_id: None,
+            },
+            Channel {
+                id: mock_ids::CH_RETRONET_MUTED_LOGS,
+                guild_id: Some(mock_ids::GUILD_RETRONET),
+                kind: ChannelKind::GuildText,
+                name: "bot-firehose".to_string(),
+                topic: Some("Automated build & telemetry firehose (muted)".to_string()),
+                parent_id: Some(mock_ids::CH_CAT_LOBBY),
+                position: 5,
+                recipients: Vec::new(),
+                owner_id: None,
+                icon_hash: None,
+                last_message_id: Some(Snowflake(400_000_000_000_000_025)),
+                unread_count: 12,
+                mention_count: 0,
+                nsfw: false,
+                slowmode_secs: 0,
+                muted: true,
+                last_ack_message_id: None,
             },
             Channel {
                 id: mock_ids::CH_RUST_ASYNC,
@@ -310,6 +496,8 @@ impl MockDiscordBackend {
                 mention_count: 0,
                 nsfw: false,
                 slowmode_secs: 5,
+                muted: false,
+                last_ack_message_id: None,
             },
             Channel {
                 id: mock_ids::CH_RUST_FORUM,
@@ -327,6 +515,8 @@ impl MockDiscordBackend {
                 mention_count: 0,
                 nsfw: false,
                 slowmode_secs: 0,
+                muted: false,
+                last_ack_message_id: None,
             },
             Channel {
                 id: mock_ids::CH_DEMO_SHADERS,
@@ -344,6 +534,8 @@ impl MockDiscordBackend {
                 mention_count: 0,
                 nsfw: false,
                 slowmode_secs: 0,
+                muted: false,
+                last_ack_message_id: Some(Snowflake(400_000_000_000_000_040)),
             },
             Channel {
                 id: mock_ids::CH_DM_ALICE,
@@ -361,6 +553,8 @@ impl MockDiscordBackend {
                 mention_count: 1,
                 nsfw: false,
                 slowmode_secs: 0,
+                muted: false,
+                last_ack_message_id: None,
             },
             Channel {
                 id: mock_ids::CH_GROUP_DM_OPS,
@@ -378,6 +572,65 @@ impl MockDiscordBackend {
                 mention_count: 1,
                 nsfw: false,
                 slowmode_secs: 0,
+                muted: false,
+                last_ack_message_id: Some(Snowflake(400_000_000_000_000_200)),
+            },
+            Channel {
+                id: mock_ids::CH_DM_BOB,
+                guild_id: None,
+                kind: ChannelKind::DirectMessage,
+                name: String::new(),
+                topic: None,
+                parent_id: None,
+                position: 2,
+                recipients: vec![user_bob.clone()],
+                owner_id: None,
+                icon_hash: None,
+                last_message_id: Some(Snowflake(400_000_000_000_000_101)),
+                unread_count: 1,
+                mention_count: 0,
+                nsfw: false,
+                slowmode_secs: 0,
+                muted: false,
+                last_ack_message_id: None,
+            },
+            Channel {
+                id: mock_ids::CH_DM_CAROL,
+                guild_id: None,
+                kind: ChannelKind::DirectMessage,
+                name: String::new(),
+                topic: None,
+                parent_id: None,
+                position: 3,
+                recipients: vec![user_carol.clone()],
+                owner_id: None,
+                icon_hash: None,
+                last_message_id: Some(Snowflake(400_000_000_000_000_102)),
+                unread_count: 0,
+                mention_count: 0,
+                nsfw: false,
+                slowmode_secs: 0,
+                muted: false,
+                last_ack_message_id: Some(Snowflake(400_000_000_000_000_102)),
+            },
+            Channel {
+                id: mock_ids::CH_DM_DAVE,
+                guild_id: None,
+                kind: ChannelKind::DirectMessage,
+                name: String::new(),
+                topic: None,
+                parent_id: None,
+                position: 4,
+                recipients: vec![user_dave.clone()],
+                owner_id: None,
+                icon_hash: None,
+                last_message_id: None,
+                unread_count: 0,
+                mention_count: 0,
+                nsfw: false,
+                slowmode_secs: 0,
+                muted: true,
+                last_ack_message_id: None,
             },
         ];
 
@@ -489,6 +742,9 @@ impl MockDiscordBackend {
                     poll: None,
                     flags: 0,
                     nonce: None,
+                    author_nick: None,
+                    author_role_ids: vec![mock_ids::ROLE_DAEMON],
+                    mention_roles: vec![mock_ids::ROLE_SYSOP],
                 },
                 Message {
                     id: Snowflake(400_000_000_000_000_002),
@@ -533,6 +789,9 @@ impl MockDiscordBackend {
                     poll: None,
                     flags: 0,
                     nonce: None,
+                    author_nick: Some("Modem Wiz".to_string()),
+                    author_role_ids: vec![mock_ids::ROLE_NETRUNNER],
+                    mention_roles: Vec::new(),
                 },
                 Message {
                     id: Snowflake(400_000_000_000_000_003),
@@ -573,6 +832,9 @@ impl MockDiscordBackend {
                     poll: None,
                     flags: Message::FLAG_IS_VOICE_MESSAGE,
                     nonce: None,
+                    author_nick: Some("ANSI Virtuoso".to_string()),
+                    author_role_ids: vec![mock_ids::ROLE_ARTIST],
+                    mention_roles: Vec::new(),
                 },
                 Message {
                     id: Snowflake(400_000_000_000_000_004),
@@ -621,6 +883,9 @@ impl MockDiscordBackend {
                     }),
                     flags: 0,
                     nonce: None,
+                    author_nick: None,
+                    author_role_ids: vec![mock_ids::ROLE_CARETAKER],
+                    mention_roles: Vec::new(),
                 },
             ],
         );
@@ -645,6 +910,35 @@ impl MockDiscordBackend {
                 poll: None,
                 flags: 0,
                 nonce: None,
+                author_nick: Some("ANSI Virtuoso".to_string()),
+                author_role_ids: vec![mock_ids::ROLE_ARTIST],
+                mention_roles: Vec::new(),
+            }],
+        );
+
+        messages.insert(
+            mock_ids::CH_RETRONET_MUTED_LOGS,
+            vec![Message {
+                id: Snowflake(400_000_000_000_000_025),
+                channel_id: mock_ids::CH_RETRONET_MUTED_LOGS,
+                guild_id: Some(mock_ids::GUILD_RETRONET),
+                author: user_bot.clone(),
+                content: "[CI] Nightly snapshot build succeeded (142/142 tests passing).".to_string(),
+                timestamp: "2026-11-26T09:13:30Z".to_string(),
+                edited_timestamp: None,
+                pinned: false,
+                mention_everyone: false,
+                mentions: Vec::new(),
+                reply_to: None,
+                attachments: Vec::new(),
+                embeds: Vec::new(),
+                reactions: Vec::new(),
+                poll: None,
+                flags: 0,
+                nonce: None,
+                author_nick: None,
+                author_role_ids: vec![mock_ids::ROLE_DAEMON],
+                mention_roles: Vec::new(),
             }],
         );
 
@@ -668,6 +962,9 @@ impl MockDiscordBackend {
                 poll: None,
                 flags: 0,
                 nonce: None,
+                author_nick: None,
+                author_role_ids: vec![mock_ids::ROLE_RUST_CORE],
+                mention_roles: Vec::new(),
             }],
         );
 
@@ -691,6 +988,9 @@ impl MockDiscordBackend {
                 poll: None,
                 flags: 0,
                 nonce: None,
+                author_nick: Some("CRT Demomaker".to_string()),
+                author_role_ids: vec![mock_ids::ROLE_DEMO_CODER],
+                mention_roles: Vec::new(),
             }],
         );
 
@@ -714,6 +1014,61 @@ impl MockDiscordBackend {
                 poll: None,
                 flags: 0,
                 nonce: None,
+                author_nick: None,
+                author_role_ids: Vec::new(),
+                mention_roles: Vec::new(),
+            }],
+        );
+
+        messages.insert(
+            mock_ids::CH_DM_BOB,
+            vec![Message {
+                id: Snowflake(400_000_000_000_000_101),
+                channel_id: mock_ids::CH_DM_BOB,
+                guild_id: None,
+                author: user_bob.clone(),
+                content: "Stepping away for coffee — ping me if the PipeWire quantum test finishes.".to_string(),
+                timestamp: "2026-11-26T09:21:00Z".to_string(),
+                edited_timestamp: None,
+                pinned: false,
+                mention_everyone: false,
+                mentions: Vec::new(),
+                reply_to: None,
+                attachments: Vec::new(),
+                embeds: Vec::new(),
+                reactions: Vec::new(),
+                poll: None,
+                flags: 0,
+                nonce: None,
+                author_nick: None,
+                author_role_ids: Vec::new(),
+                mention_roles: Vec::new(),
+            }],
+        );
+
+        messages.insert(
+            mock_ids::CH_DM_CAROL,
+            vec![Message {
+                id: Snowflake(400_000_000_000_000_102),
+                channel_id: mock_ids::CH_DM_CAROL,
+                guild_id: None,
+                author: user_carol.clone(),
+                content: "In focus mode rendering ANSI banners — back online shortly.".to_string(),
+                timestamp: "2026-11-26T09:21:30Z".to_string(),
+                edited_timestamp: None,
+                pinned: false,
+                mention_everyone: false,
+                mentions: Vec::new(),
+                reply_to: None,
+                attachments: Vec::new(),
+                embeds: Vec::new(),
+                reactions: Vec::new(),
+                poll: None,
+                flags: 0,
+                nonce: None,
+                author_nick: None,
+                author_role_ids: Vec::new(),
+                mention_roles: Vec::new(),
             }],
         );
 
@@ -738,6 +1093,9 @@ impl MockDiscordBackend {
                     poll: None,
                     flags: 0,
                     nonce: None,
+                    author_nick: None,
+                    author_role_ids: Vec::new(),
+                    mention_roles: Vec::new(),
                 },
                 Message {
                     id: Snowflake(400_000_000_000_000_201),
@@ -757,6 +1115,9 @@ impl MockDiscordBackend {
                     poll: None,
                     flags: 0,
                     nonce: None,
+                    author_nick: None,
+                    author_role_ids: Vec::new(),
+                    mention_roles: Vec::new(),
                 },
             ],
         );
@@ -773,15 +1134,85 @@ impl MockDiscordBackend {
             },
         );
 
+        // Pre-seed visible voice channel occupants so sidebar rosters work in `--mock-demo`.
+        let voice_rosters = vec![
+            (
+                Some(mock_ids::GUILD_RETRONET),
+                mock_ids::CH_RETRONET_VOICE,
+                vec![
+                    VoiceParticipant {
+                        user_id: mock_ids::USER_ALICE,
+                        display_name: "Modem Wiz".to_string(),
+                        speaking: true,
+                        self_mute: false,
+                        self_deaf: false,
+                        server_mute: false,
+                        server_deaf: false,
+                        volume: 100,
+                        rms_db: -20.0,
+                        dave_verified: true,
+                        streaming: true,
+                    },
+                    VoiceParticipant {
+                        user_id: mock_ids::USER_BOB,
+                        display_name: "CRT Hacker".to_string(),
+                        speaking: false,
+                        self_mute: true,
+                        self_deaf: false,
+                        server_mute: false,
+                        server_deaf: false,
+                        volume: 100,
+                        rms_db: VoiceParticipant::MIN_RMS_DB,
+                        dave_verified: true,
+                        streaming: false,
+                    },
+                ],
+            ),
+            (
+                None,
+                mock_ids::CH_GROUP_DM_OPS,
+                vec![
+                    VoiceParticipant {
+                        user_id: mock_ids::USER_ALICE,
+                        display_name: "Modem Wizard".to_string(),
+                        speaking: true,
+                        self_mute: false,
+                        self_deaf: false,
+                        server_mute: false,
+                        server_deaf: false,
+                        volume: 100,
+                        rms_db: -22.0,
+                        dave_verified: true,
+                        streaming: false,
+                    },
+                    VoiceParticipant {
+                        user_id: mock_ids::USER_BOB,
+                        display_name: "CRT Hacker".to_string(),
+                        speaking: false,
+                        self_mute: false,
+                        self_deaf: false,
+                        server_mute: false,
+                        server_deaf: false,
+                        volume: 100,
+                        rms_db: -44.0,
+                        dave_verified: true,
+                        streaming: true,
+                    },
+                ],
+            ),
+        ];
+
         Self {
             state: RwLock::new(MockDiscordState {
                 current_user: user_self,
                 users,
                 guilds,
                 guild_folders,
+                guild_members,
                 channels,
                 messages,
                 call_rings,
+                voice_rosters,
             }),
             next_id: AtomicU64::new(900_000_000_000_000_000),
             events,
@@ -799,6 +1230,28 @@ impl MockDiscordBackend {
             .get(&channel_id)
             .cloned()
             .unwrap_or(CallRingState::Idle))
+    }
+
+    /// Return seeded guild member summaries (nicknames and role IDs) for `guild_id`.
+    pub fn guild_members(&self, guild_id: Snowflake) -> CoreResult<Vec<GuildMemberSummary>> {
+        let guard = self
+            .state
+            .read()
+            .map_err(|_| CoreError::Internal("mock state poisoned".to_string()))?;
+        Ok(guard
+            .guild_members
+            .get(&guild_id)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    /// Return seeded voice channel occupant rosters `(guild_id, channel_id, participants)`.
+    pub fn voice_rosters(&self) -> CoreResult<Vec<MockVoiceRoster>> {
+        let guard = self
+            .state
+            .read()
+            .map_err(|_| CoreError::Internal("mock state poisoned".to_string()))?;
+        Ok(guard.voice_rosters.clone())
     }
 
     fn alloc_snowflake(&self) -> Snowflake {
@@ -892,6 +1345,17 @@ impl DiscordBackend for MockDiscordBackend {
         content: &str,
         reply_to: Option<Snowflake>,
     ) -> CoreResult<Message> {
+        self.send_message_with_mention(channel_id, content, reply_to, true)
+            .await
+    }
+
+    async fn send_message_with_mention(
+        &self,
+        channel_id: Snowflake,
+        content: &str,
+        reply_to: Option<Snowflake>,
+        mention_replied_user: bool,
+    ) -> CoreResult<Message> {
         let msg_id = self.alloc_snowflake();
         let msg = {
             let mut guard = self
@@ -904,11 +1368,18 @@ impl DiscordBackend for MockDiscordBackend {
                 .ok_or_else(|| CoreError::NotFound(format!("channel {channel_id}")))?
                 .guild_id;
 
+            let mut mentions = Vec::new();
             let reply_ref = reply_to.map(|target_id| {
                 let existing = guard
                     .messages
                     .get(&channel_id)
                     .and_then(|list| list.iter().find(|m| m.id == target_id));
+                if mention_replied_user
+                    && let Some(target_msg) = existing
+                    && target_msg.author.id != guard.current_user.id
+                {
+                    mentions.push(target_msg.author.id);
+                }
                 MessageReference {
                     message_id: Some(target_id),
                     channel_id: Some(channel_id),
@@ -917,6 +1388,16 @@ impl DiscordBackend for MockDiscordBackend {
                     snippet: existing.map(|m| m.content.chars().take(64).collect()),
                 }
             });
+
+            let (author_nick, author_role_ids) = guild_id
+                .and_then(|gid| guard.guild_members.get(&gid))
+                .and_then(|members| {
+                    members
+                        .iter()
+                        .find(|m| m.user_id == guard.current_user.id)
+                        .map(|m| (m.nick.clone(), m.role_ids.clone()))
+                })
+                .unwrap_or((None, Vec::new()));
 
             let msg = Message {
                 id: msg_id,
@@ -928,7 +1409,7 @@ impl DiscordBackend for MockDiscordBackend {
                 edited_timestamp: None,
                 pinned: false,
                 mention_everyone: false,
-                mentions: Vec::new(),
+                mentions,
                 reply_to: reply_ref,
                 attachments: Vec::new(),
                 embeds: Vec::new(),
@@ -936,6 +1417,9 @@ impl DiscordBackend for MockDiscordBackend {
                 poll: None,
                 flags: 0,
                 nonce: None,
+                author_nick,
+                author_role_ids,
+                mention_roles: Vec::new(),
             };
 
             guard.messages.entry(channel_id).or_default().push(msg.clone());
@@ -947,6 +1431,44 @@ impl DiscordBackend for MockDiscordBackend {
 
         self.emit(BackendEvent::MessageCreated(msg.clone()));
         Ok(msg)
+    }
+
+    async fn ack_message(&self, channel_id: Snowflake, message_id: Snowflake) -> CoreResult<()> {
+        {
+            let mut guard = self
+                .state
+                .write()
+                .map_err(|_| CoreError::Internal("mock state poisoned".to_string()))?;
+            let guild_id = {
+                let ch = guard
+                    .channels
+                    .get_mut(&channel_id)
+                    .ok_or_else(|| CoreError::NotFound(format!("channel {channel_id}")))?;
+                ch.last_ack_message_id = Some(message_id);
+                ch.unread_count = 0;
+                ch.mention_count = 0;
+                ch.guild_id
+            };
+            if let Some(gid) = guild_id {
+                let (unread, mentions) = guard
+                    .channels
+                    .values()
+                    .filter(|c| c.guild_id == Some(gid) && !c.muted)
+                    .fold((false, 0u32), |(u, m), c| {
+                        (u || c.unread_count > 0, m.saturating_add(c.mention_count))
+                    });
+                if let Some(g) = guard.guilds.iter_mut().find(|g| g.id == gid) {
+                    g.unread = unread;
+                    g.mention_count = mentions;
+                }
+            }
+        }
+        self.emit(BackendEvent::MessageAcked {
+            channel_id,
+            last_message_id: message_id,
+            mention_count: 0,
+        });
+        Ok(())
     }
 
     async fn edit_message(
@@ -1139,6 +1661,8 @@ impl DiscordBackend for MockDiscordBackend {
                 mention_count: 0,
                 nsfw: false,
                 slowmode_secs: 0,
+                muted: false,
+                last_ack_message_id: None,
             };
             guard.channels.insert(channel_id, ch.clone());
             guard.messages.entry(channel_id).or_default();
@@ -2115,6 +2639,111 @@ mod tests {
         // Leave Group DM cleanly.
         backend.leave_group_dm(gdm.id).await.unwrap();
         assert!(rx.try_recv().is_ok());
+    }
+
+    #[tokio::test]
+    async fn mock_discord_backend_seeds_visual_hierarchy_roles_rosters_and_ack() {
+        let backend = MockDiscordBackend::new();
+        let mut rx = backend.subscribe_events();
+
+        let (guilds, folders) = backend.list_guilds().await.unwrap();
+        assert!(folders.iter().any(|f| f.id.is_some() && f.color.is_some()));
+        let retronet = guilds
+            .iter()
+            .find(|g| g.id == mock_ids::GUILD_RETRONET)
+            .unwrap();
+        assert!(retronet.roles.len() >= 4);
+        assert_eq!(
+            retronet.highest_role_color(&[mock_ids::ROLE_NETRUNNER]),
+            Some(0x50FA7B)
+        );
+
+        let channels = backend
+            .list_channels(mock_ids::GUILD_RETRONET)
+            .await
+            .unwrap();
+        assert!(channels.iter().any(|c| c.muted));
+        assert!(channels.iter().any(|c| c.mention_count > 0));
+        assert!(
+            channels
+                .iter()
+                .any(|c| !c.muted && c.unread_count > 0 && c.mention_count == 0)
+        );
+
+        let dms = backend.list_dm_channels().await.unwrap();
+        let dm_statuses: Vec<PresenceStatus> = dms
+            .iter()
+            .filter(|c| c.kind == ChannelKind::DirectMessage)
+            .filter_map(|c| c.recipients.first().map(|u| u.presence))
+            .collect();
+        assert!(dm_statuses.contains(&PresenceStatus::Online));
+        assert!(dm_statuses.contains(&PresenceStatus::Idle));
+        assert!(dm_statuses.contains(&PresenceStatus::DoNotDisturb));
+        assert!(dm_statuses.contains(&PresenceStatus::Offline));
+
+        let rosters = backend.voice_rosters().unwrap();
+        assert!(
+            rosters
+                .iter()
+                .any(|(_, cid, ps)| *cid == mock_ids::CH_RETRONET_VOICE && !ps.is_empty())
+        );
+        let members = backend.guild_members(mock_ids::GUILD_RETRONET).unwrap();
+        assert!(!members.is_empty());
+
+        // Silent vs ping reply mention behavior.
+        let reply_ping = backend
+            .send_message_with_mention(
+                mock_ids::CH_RETRONET_GENERAL,
+                "ping reply",
+                Some(Snowflake(400_000_000_000_000_002)),
+                true,
+            )
+            .await
+            .unwrap();
+        assert!(reply_ping.mentions.contains(&mock_ids::USER_ALICE));
+
+        let reply_silent = backend
+            .send_message_with_mention(
+                mock_ids::CH_RETRONET_GENERAL,
+                "silent reply",
+                Some(Snowflake(400_000_000_000_000_002)),
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(reply_silent.mentions.is_empty());
+
+        // Ack clears unread & mention counters and emits MessageAcked.
+        backend
+            .ack_message(mock_ids::CH_RETRONET_GENERAL, reply_silent.id)
+            .await
+            .unwrap();
+        let updated_channels = backend
+            .list_channels(mock_ids::GUILD_RETRONET)
+            .await
+            .unwrap();
+        let general = updated_channels
+            .iter()
+            .find(|c| c.id == mock_ids::CH_RETRONET_GENERAL)
+            .unwrap();
+        assert_eq!(general.unread_count, 0);
+        assert_eq!(general.mention_count, 0);
+        assert_eq!(general.last_ack_message_id, Some(reply_silent.id));
+
+        let mut saw_ack = false;
+        while let Ok(ev) = rx.try_recv() {
+            if matches!(
+                ev,
+                BackendEvent::MessageAcked {
+                    channel_id,
+                    last_message_id,
+                    mention_count: 0,
+                } if channel_id == mock_ids::CH_RETRONET_GENERAL && last_message_id == reply_silent.id
+            ) {
+                saw_ack = true;
+            }
+        }
+        assert!(saw_ack);
     }
 
     #[tokio::test]

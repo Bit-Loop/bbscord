@@ -236,6 +236,37 @@ impl User {
     }
 }
 
+/// Discord guild role metadata used for nickname color resolution and `@role` mentions.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Role {
+    /// Role Snowflake.
+    pub id: Snowflake,
+    /// Human-readable role name.
+    pub name: String,
+    /// 24-bit RGB role color (`0` means no custom color / inherit default).
+    #[serde(default)]
+    pub color: u32,
+    /// Hierarchy position (higher values take precedence for color resolution).
+    #[serde(default)]
+    pub position: i32,
+    /// Whether members with this role are hoisted into a dedicated member-list group.
+    #[serde(default)]
+    pub hoist: bool,
+}
+
+/// Lightweight guild member profile summary for nickname and role color resolution.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct GuildMemberSummary {
+    /// Member user Snowflake.
+    pub user_id: Snowflake,
+    /// Optional guild-specific nickname overriding the user's global display name.
+    #[serde(default)]
+    pub nick: Option<String>,
+    /// Assigned guild role Snowflakes.
+    #[serde(default)]
+    pub role_ids: Vec<Snowflake>,
+}
+
 /// Discord server (guild) summary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Guild {
@@ -253,6 +284,30 @@ pub struct Guild {
     pub unread: bool,
     /// Aggregated unread mention count across the guild.
     pub mention_count: u32,
+    /// Guild roles used for member nickname coloring and `@role` mention resolution.
+    #[serde(default)]
+    pub roles: Vec<Role>,
+    /// Whether the current user has muted this guild in notification settings.
+    #[serde(default)]
+    pub muted: bool,
+    /// Whether `@everyone` / `@here` mentions are suppressed for this guild.
+    #[serde(default)]
+    pub suppress_everyone: bool,
+    /// Whether `@role` mentions are suppressed for this guild.
+    #[serde(default)]
+    pub suppress_roles: bool,
+}
+
+impl Guild {
+    /// Resolve the highest-position non-zero 24-bit RGB role color for a member's `role_ids`.
+    #[must_use]
+    pub fn highest_role_color(&self, role_ids: &[Snowflake]) -> Option<u32> {
+        self.roles
+            .iter()
+            .filter(|r| r.color != 0 && role_ids.contains(&r.id))
+            .max_by_key(|r| (r.position, r.id))
+            .map(|r| r.color)
+    }
 }
 
 /// Sidebar guild folder grouping matching Discord user settings.
@@ -432,6 +487,12 @@ pub struct Channel {
     pub nsfw: bool,
     /// Per-user slowmode rate limit in seconds.
     pub slowmode_secs: u32,
+    /// Whether this channel (or its category) is muted in user notification settings.
+    #[serde(default)]
+    pub muted: bool,
+    /// Last message Snowflake acknowledged (marked read) by the current user.
+    #[serde(default)]
+    pub last_ack_message_id: Option<Snowflake>,
 }
 
 impl Channel {
@@ -785,6 +846,43 @@ pub struct Message {
     pub flags: u64,
     /// Optional client-generated nonce for optimistic send reconciliation.
     pub nonce: Option<String>,
+    /// Optional guild-specific nickname of the author when supplied in the message payload.
+    #[serde(default)]
+    pub author_nick: Option<String>,
+    /// Author's guild role Snowflakes when supplied in the message's `member` object.
+    #[serde(default)]
+    pub author_role_ids: Vec<Snowflake>,
+    /// Role Snowflakes explicitly mentioned in this message (`<@&role_id>`).
+    #[serde(default)]
+    pub mention_roles: Vec<Snowflake>,
+}
+
+/// Partial update to an existing [`Message`] (e.g., Discord `MESSAGE_UPDATE` embed unfurls where
+/// `author`, `content`, or `attachments` are omitted and must be preserved).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct MessagePatch {
+    /// Target message Snowflake.
+    pub id: Snowflake,
+    /// Channel Snowflake where this message lives.
+    pub channel_id: Snowflake,
+    /// Replacement message content, if present in the partial update.
+    #[serde(default)]
+    pub content: Option<String>,
+    /// Updated ISO-8601 edited timestamp, if present in the partial update.
+    #[serde(default)]
+    pub edited_timestamp: Option<String>,
+    /// Replacement embeds (e.g. newly unfurled links/GIFVs), if present in the partial update.
+    #[serde(default)]
+    pub embeds: Option<Vec<Embed>>,
+    /// Replacement attachments, if present in the partial update.
+    #[serde(default)]
+    pub attachments: Option<Vec<Attachment>>,
+    /// Updated pinned flag, if present in the partial update.
+    #[serde(default)]
+    pub pinned: Option<bool>,
+    /// Replacement reactions, if present in the partial update.
+    #[serde(default)]
+    pub reactions: Option<Vec<Reaction>>,
 }
 
 impl Message {
@@ -798,6 +896,28 @@ impl Message {
     pub fn is_voice_message(&self) -> bool {
         (self.flags & Self::FLAG_IS_VOICE_MESSAGE) != 0
             || self.attachments.iter().any(Attachment::is_voice_message)
+    }
+
+    /// Merge a partial [`MessagePatch`] into this message in place, preserving omitted fields.
+    pub fn apply_patch(&mut self, patch: MessagePatch) {
+        if let Some(content) = patch.content {
+            self.content = content;
+        }
+        if let Some(edited_timestamp) = patch.edited_timestamp {
+            self.edited_timestamp = Some(edited_timestamp);
+        }
+        if let Some(embeds) = patch.embeds {
+            self.embeds = embeds;
+        }
+        if let Some(attachments) = patch.attachments {
+            self.attachments = attachments;
+        }
+        if let Some(pinned) = patch.pinned {
+            self.pinned = pinned;
+        }
+        if let Some(reactions) = patch.reactions {
+            self.reactions = reactions;
+        }
     }
 }
 
@@ -875,7 +995,7 @@ impl Default for GifSearchQuery {
     fn default() -> Self {
         Self {
             query: String::new(),
-            limit: 12,
+            limit: 20,
             cursor: None,
             trending: true,
             locale: Some("en-US".to_string()),
@@ -1250,6 +1370,137 @@ pub struct VideoFrame {
     pub rgba: Vec<u8>,
 }
 
+/// Rewrite a Discord media proxy URL (`media.discordapp.net` or `images-ext-*.discordapp.net`)
+/// to request a downscaled image (`width` × `height`) and optionally WebP format (`format=webp`),
+/// while preserving signed CDN query parameters (`ex`, `is`, `hm`) and any URL fragment.
+///
+/// When `prefer_webp` is `true` and the path ends with `.gif` without an explicit `animated` query
+/// parameter, `animated=true` is also appended so Discord serves an animated WebP instead of a
+/// static first frame. Non-proxy URLs and requests with zero `width` or `height` are returned
+/// unchanged.
+#[must_use]
+pub fn resize_discord_media_proxy_url(
+    url: &str,
+    width: u32,
+    height: u32,
+    prefer_webp: bool,
+) -> String {
+    if width == 0 || height == 0 {
+        return url.to_owned();
+    }
+
+    let (before_frag, frag) = match url.find('#') {
+        Some(idx) => (&url[..idx], Some(&url[idx..])),
+        None => (url, None),
+    };
+    let (base, query) = match before_frag.find('?') {
+        Some(idx) => (&before_frag[..idx], Some(&before_frag[idx + 1..])),
+        None => (before_frag, None),
+    };
+
+    let Some(after_scheme) = base
+        .strip_prefix("https://")
+        .or_else(|| base.strip_prefix("http://"))
+        .or_else(|| {
+            if base
+                .get(..8)
+                .is_some_and(|s| s.eq_ignore_ascii_case("https://"))
+            {
+                Some(&base[8..])
+            } else if base
+                .get(..7)
+                .is_some_and(|s| s.eq_ignore_ascii_case("http://"))
+            {
+                Some(&base[7..])
+            } else {
+                None
+            }
+        })
+    else {
+        return url.to_owned();
+    };
+
+    let (authority, path) = match after_scheme.find('/') {
+        Some(idx) => (&after_scheme[..idx], &after_scheme[idx..]),
+        None => (after_scheme, ""),
+    };
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+    let host = host_port.split(':').next().unwrap_or(host_port);
+    let host_lower = host.to_ascii_lowercase();
+
+    let is_proxy = host_lower == "media.discordapp.net"
+        || host_lower
+            .strip_prefix("images-ext-")
+            .and_then(|rest| rest.strip_suffix(".discordapp.net"))
+            .is_some_and(|num| !num.is_empty() && num.bytes().all(|b| b.is_ascii_digit()));
+
+    if !is_proxy {
+        return url.to_owned();
+    }
+
+    let path_is_gif = path.to_ascii_lowercase().ends_with(".gif");
+
+    let mut params: Vec<String> = Vec::new();
+    let mut saw_width = false;
+    let mut saw_height = false;
+    let mut saw_format = false;
+    let mut saw_animated = false;
+
+    if let Some(q) = query {
+        for pair in q.split('&') {
+            if pair.is_empty() {
+                continue;
+            }
+            let key = pair.split('=').next().unwrap_or(pair);
+            if key.eq_ignore_ascii_case("width") {
+                if !saw_width {
+                    params.push(format!("width={width}"));
+                    saw_width = true;
+                }
+            } else if key.eq_ignore_ascii_case("height") {
+                if !saw_height {
+                    params.push(format!("height={height}"));
+                    saw_height = true;
+                }
+            } else if prefer_webp && key.eq_ignore_ascii_case("format") {
+                if !saw_format {
+                    params.push("format=webp".to_owned());
+                    saw_format = true;
+                }
+            } else if key.eq_ignore_ascii_case("animated") {
+                if !saw_animated {
+                    params.push(pair.to_owned());
+                    saw_animated = true;
+                }
+            } else {
+                params.push(pair.to_owned());
+            }
+        }
+    }
+
+    if !saw_width {
+        params.push(format!("width={width}"));
+    }
+    if !saw_height {
+        params.push(format!("height={height}"));
+    }
+    if prefer_webp && !saw_format {
+        params.push("format=webp".to_owned());
+    }
+    if prefer_webp && !saw_animated && path_is_gif {
+        params.push("animated=true".to_owned());
+    }
+
+    let mut out = String::with_capacity(url.len() + 32);
+    out.push_str(base);
+    out.push('?');
+    out.push_str(&params.join("&"));
+    if let Some(f) = frag {
+        out.push_str(f);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1424,5 +1675,160 @@ mod tests {
             VideoSinkKind::inline_video_box(64, 12, 1920, 1080, (8, 16)),
             Some((62, 8))
         );
+    }
+
+    #[test]
+    fn gif_search_query_default_limit_satisfies_discord_min() {
+        let q = GifSearchQuery::default();
+        assert_eq!(q.limit, 20);
+        assert!(q.trending);
+    }
+
+    #[test]
+    fn guild_highest_role_color_and_message_patch_preserve_omitted_fields() {
+        let guild = Guild {
+            id: Snowflake(1),
+            name: "Guild".into(),
+            icon_hash: None,
+            owner_id: None,
+            member_count: None,
+            unread: false,
+            mention_count: 0,
+            roles: vec![
+                Role {
+                    id: Snowflake(10),
+                    name: "ZeroColor".into(),
+                    color: 0,
+                    position: 99,
+                    hoist: false,
+                },
+                Role {
+                    id: Snowflake(11),
+                    name: "Member".into(),
+                    color: 0x50FA7B,
+                    position: 5,
+                    hoist: false,
+                },
+                Role {
+                    id: Snowflake(12),
+                    name: "Admin".into(),
+                    color: 0x38BDF8,
+                    position: 20,
+                    hoist: true,
+                },
+            ],
+            muted: false,
+            suppress_everyone: false,
+            suppress_roles: false,
+        };
+        assert_eq!(
+            guild.highest_role_color(&[Snowflake(10), Snowflake(11), Snowflake(12)]),
+            Some(0x38BDF8)
+        );
+        assert_eq!(guild.highest_role_color(&[Snowflake(10)]), None);
+
+        let mut msg = Message {
+            id: Snowflake(42),
+            channel_id: Snowflake(9),
+            guild_id: Some(Snowflake(1)),
+            author: User {
+                id: Snowflake(7),
+                username: "sysop".into(),
+                global_name: Some("SysOp".into()),
+                discriminator: None,
+                avatar_hash: None,
+                bot: false,
+                accent_color: None,
+                presence: PresenceStatus::Online,
+            },
+            content: "https://example.invalid/clip".into(),
+            timestamp: "2026-11-26T09:00:00Z".into(),
+            edited_timestamp: None,
+            pinned: false,
+            mention_everyone: false,
+            mentions: Vec::new(),
+            reply_to: None,
+            attachments: Vec::new(),
+            embeds: Vec::new(),
+            reactions: vec![Reaction {
+                emoji_id: None,
+                emoji_name: "🔥".into(),
+                animated: false,
+                count: 1,
+                me: true,
+            }],
+            poll: None,
+            flags: 0,
+            nonce: None,
+            author_nick: Some("Chief SysOp".into()),
+            author_role_ids: vec![Snowflake(12)],
+            mention_roles: Vec::new(),
+        };
+
+        // Simulate partial MESSAGE_UPDATE embed unfurl omitting content, author, and reactions.
+        let unfurl = MessagePatch {
+            id: Snowflake(42),
+            channel_id: Snowflake(9),
+            embeds: Some(vec![Embed {
+                kind: EmbedKind::Gifv,
+                title: Some("Demo GIF".into()),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        msg.apply_patch(unfurl);
+        assert_eq!(msg.author.username, "sysop");
+        assert_eq!(msg.content, "https://example.invalid/clip");
+        assert_eq!(msg.reactions.len(), 1);
+        assert_eq!(msg.embeds.len(), 1);
+        assert_eq!(msg.embeds[0].kind, EmbedKind::Gifv);
+        assert!(msg.edited_timestamp.is_none());
+    }
+
+    #[test]
+    fn resize_discord_media_proxy_url_preserves_signatures_and_guards_hosts() {
+        let signed = "https://media.discordapp.net/attachments/1/2/photo.png?ex=abc&is=def&hm=999";
+        assert_eq!(
+            resize_discord_media_proxy_url(signed, 320, 240, true),
+            "https://media.discordapp.net/attachments/1/2/photo.png?ex=abc&is=def&hm=999&width=320&height=240&format=webp"
+        );
+        assert_eq!(
+            resize_discord_media_proxy_url(signed, 320, 240, false),
+            "https://media.discordapp.net/attachments/1/2/photo.png?ex=abc&is=def&hm=999&width=320&height=240"
+        );
+
+        let existing =
+            "https://images-ext-1.discordapp.net/external/hash/https/example.invalid/pic.jpg?width=1920&height=1080&format=png&width=999#top";
+        assert_eq!(
+            resize_discord_media_proxy_url(existing, 480, 270, true),
+            "https://images-ext-1.discordapp.net/external/hash/https/example.invalid/pic.jpg?width=480&height=270&format=webp#top"
+        );
+
+        let gif = "https://media.discordapp.net/attachments/1/2/party.gif?ex=1&is=2&hm=3";
+        assert_eq!(
+            resize_discord_media_proxy_url(gif, 256, 256, true),
+            "https://media.discordapp.net/attachments/1/2/party.gif?ex=1&is=2&hm=3&width=256&height=256&format=webp&animated=true"
+        );
+        let gif_static =
+            "https://media.discordapp.net/attachments/1/2/party.gif?ex=1&animated=false";
+        assert_eq!(
+            resize_discord_media_proxy_url(gif_static, 256, 256, true),
+            "https://media.discordapp.net/attachments/1/2/party.gif?ex=1&animated=false&width=256&height=256&format=webp"
+        );
+
+        // Non-proxy hosts and zero dims stay untouched.
+        let cdn = "https://cdn.discordapp.com/attachments/1/2/photo.png?ex=abc";
+        assert_eq!(resize_discord_media_proxy_url(cdn, 320, 240, true), cdn);
+        let third_party = "https://static.klipy.com/demo/anim.webp";
+        assert_eq!(
+            resize_discord_media_proxy_url(third_party, 320, 240, true),
+            third_party
+        );
+        let spoofed = "https://images-ext-evil.discordapp.net/a.png";
+        assert_eq!(
+            resize_discord_media_proxy_url(spoofed, 320, 240, true),
+            spoofed
+        );
+        assert_eq!(resize_discord_media_proxy_url(signed, 0, 240, true), signed);
     }
 }

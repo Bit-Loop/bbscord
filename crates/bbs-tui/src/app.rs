@@ -1119,6 +1119,7 @@ impl App {
                     channel_id: ch,
                     content,
                     reply_to: Some(message_id),
+                    mention_replied_user: true,
                     attachment_paths: attachments,
                 }));
             }
@@ -1127,6 +1128,7 @@ impl App {
                     channel_id: ch,
                     content,
                     reply_to: None,
+                    mention_replied_user: true,
                     attachment_paths: attachments,
                 }));
             }
@@ -1157,6 +1159,7 @@ impl App {
                     channel_id: ch,
                     content: std::mem::take(&mut chunk),
                     reply_to: if first { reply } else { None },
+                    mention_replied_user: true,
                     attachment_paths: Vec::new(),
                 }));
                 first = false;
@@ -1168,6 +1171,7 @@ impl App {
                             channel_id: ch,
                             content: std::mem::take(&mut chunk),
                             reply_to: if first { reply } else { None },
+                            mention_replied_user: true,
                             attachment_paths: Vec::new(),
                         }));
                         first = false;
@@ -1183,6 +1187,7 @@ impl App {
                 channel_id: ch,
                 content: chunk,
                 reply_to: if first { reply } else { None },
+                mention_replied_user: true,
                 attachment_paths: Vec::new(),
             }));
         }

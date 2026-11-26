@@ -189,6 +189,10 @@ impl WireGuild {
             member_count,
             unread: false,
             mention_count: 0,
+            roles: Vec::new(),
+            muted: false,
+            suppress_everyone: false,
+            suppress_roles: false,
         }
     }
 }
@@ -320,6 +324,8 @@ impl WireChannel {
             mention_count: 0,
             nsfw: self.nsfw,
             slowmode_secs: self.rate_limit_per_user,
+            muted: false,
+            last_ack_message_id: None,
         }
     }
 }
@@ -867,6 +873,9 @@ impl From<WireMessage> for Message {
             poll: wire.poll.map(PollSummary::from),
             flags: wire.flags,
             nonce: wire.nonce,
+            author_nick: None,
+            author_role_ids: Vec::new(),
+            mention_roles: Vec::new(),
         }
     }
 }

@@ -367,6 +367,19 @@ impl Store {
                     entry.messages[i] = m;
                 }
             }
+            BackendEvent::MessagePatched(patch) => {
+                if let Some(entry) = self.messages.get_mut(&patch.channel_id)
+                    && let Some(i) = entry.index_of(patch.id)
+                {
+                    entry.messages[i].apply_patch(patch);
+                }
+            }
+            BackendEvent::MessageAcked { .. }
+            | BackendEvent::GuildSettingsUpdated { .. }
+            | BackendEvent::GuildMembersUpdated { .. }
+            | BackendEvent::GuildRolesUpdated { .. }
+            | BackendEvent::GifSearchFailed { .. }
+            | BackendEvent::VoiceRosterUpdated { .. } => {}
             BackendEvent::MessageDeleted {
                 channel_id,
                 message_id,
