@@ -45,8 +45,8 @@ struct MediaCoordinator {
     players: HashMap<String, GifAnimationPlayer>,
     encoded: HashMap<(String, usize, u16, u16, bool), RenderedMedia>,
     in_flight: HashSet<String>,
-    decoded_tx: mpsc::UnboundedSender<(String, Arc<DecodedMedia>)>,
-    decoded_rx: mpsc::UnboundedReceiver<(String, Arc<DecodedMedia>)>,
+    decoded_tx: mpsc::UnboundedSender<(String, Option<Arc<DecodedMedia>>)>,
+    decoded_rx: mpsc::UnboundedReceiver<(String, Option<Arc<DecodedMedia>>)>,
     last_slots: Vec<ImageSlot>,
     dirty: bool,
 }
@@ -72,6 +72,7 @@ impl MediaCoordinator {
 
     fn clear_encoded(&mut self) {
         self.encoded.clear();
+        self.in_flight.clear();
         self.dirty = true;
     }
 
@@ -82,7 +83,8 @@ impl MediaCoordinator {
             delay_ms: 100,
             pixels: frame.rgba.clone(),
         };
-        let key = format!("stream:{}", frame.stream_key);
+        // Key MUST match raw `frame.stream_key` emitted by `bbs-tui/src/panes.rs` Stage `ImageSlot`.
+        let key = frame.stream_key.clone();
         app.images.insert(key.clone(), rgba.clone());
         let decoded = DecodedMedia::from_rgba_frames(
             key.clone(),
@@ -98,8 +100,11 @@ impl MediaCoordinator {
 
     fn ingest_decoded(&mut self, app: &mut App) -> bool {
         let mut changed = false;
-        while let Ok((key, media)) = self.decoded_rx.try_recv() {
+        while let Ok((key, maybe_media)) = self.decoded_rx.try_recv() {
             self.in_flight.remove(&key);
+            let Some(media) = maybe_media else {
+                continue;
+            };
             if let Some(first) = media.frame(0) {
                 app.images.insert(key.clone(), first.clone());
             }
@@ -148,6 +153,11 @@ impl MediaCoordinator {
         app: &mut App,
     ) {
         for slot in slots {
+            // Inline video stream keys (e.g. `guild:...` / `call:...`) are populated directly by
+            // `ingest_video_frame` and must never be HTTP-fetched or replaced with mock previews.
+            if !slot.url.starts_with("http://") && !slot.url.starts_with("https://") {
+                continue;
+            }
             if self.pool.get_cached(&slot.url).is_some() || self.in_flight.contains(&slot.url) {
                 continue;
             }
@@ -159,6 +169,7 @@ impl MediaCoordinator {
                 let tx = self.decoded_tx.clone();
                 let url = slot.url.clone();
                 tokio::spawn(async move {
+                    let mut result: Option<Arc<DecodedMedia>> = None;
                     if let Ok((bytes, _)) = rest.fetch_attachment_bytes(&url).await {
                         let name = url
                             .rsplit('/')
@@ -171,9 +182,11 @@ impl MediaCoordinator {
                         if let Ok((decoded, _evicted)) =
                             pool.decode_and_cache(url.clone(), bytes, Some(name)).await
                         {
-                            let _ = tx.send((url, decoded));
+                            result = Some(decoded);
                         }
                     }
+                    // Always notify completion so failed fetches release `in_flight` cleanly.
+                    let _ = tx.send((url, result));
                 });
             } else {
                 // Offline mock mode: synthesize a crisp deterministic preview frame so pixel tiers render offline.
@@ -970,6 +983,7 @@ pub struct SmokeSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bbs_core::{MockVideoStreamEngine, VideoFrame};
     use clap::Parser as _;
 
     #[tokio::test]
@@ -980,5 +994,78 @@ mod tests {
             .unwrap();
         assert_eq!(summary.frames_rendered, 10);
         assert!(summary.themes_discovered >= 10);
+    }
+
+    #[tokio::test]
+    async fn video_frame_key_matches_stream_slot_and_skips_http_fetch() {
+        let env = TerminalEnv::default();
+        let opts = ProbeOptions::default();
+        let report = negotiate_capabilities(
+            &env,
+            ViewportGeometry::new(80, 24),
+            bbs_runtime_term::GeometrySource::CliOverride,
+            &bbs_runtime_term::ProbeResponse::default(),
+            &opts,
+            false,
+            true,
+        );
+        let mut media = MediaCoordinator::new(&report);
+        let mut app = App::new(TuiConfig::default());
+        let (mut services, _rx) = RuntimeServices::build_mock();
+
+        // Non-HTTP stream key slot before any frame arrives MUST NOT populate a fake preview or stick in_flight.
+        let slot = ImageSlot {
+            url: mock_ids::STREAM_GROUP_DM.to_string(),
+            rect: Rect::new(0, 0, 20, 10),
+            visible: Rect::new(0, 0, 20, 10),
+            clip_top: 0,
+            animated: true,
+            focused: true,
+        };
+        media.request_missing_slots(std::slice::from_ref(&slot), &services, &mut app);
+        assert!(media.pool.get_cached(mock_ids::STREAM_GROUP_DM).is_none());
+        assert!(!media.in_flight.contains(mock_ids::STREAM_GROUP_DM));
+
+        // Real VideoFrame ingested under raw `frame.stream_key` matches `ImageSlot.url`.
+        let frame: VideoFrame =
+            MockVideoStreamEngine::generate_test_card_frame(mock_ids::STREAM_GROUP_DM, 1, 32, 18);
+        media.ingest_video_frame(&frame, &mut app);
+        assert!(media.pool.get_cached(mock_ids::STREAM_GROUP_DM).is_some());
+        assert!(app.images.contains_key(mock_ids::STREAM_GROUP_DM));
+
+        // Failed async decode notifies `(url, None)` and clears `in_flight`.
+        let failed_url = "https://example.invalid/broken.png".to_string();
+        media.in_flight.insert(failed_url.clone());
+        media.decoded_tx.send((failed_url.clone(), None)).unwrap();
+        assert!(!media.ingest_decoded(&mut app));
+        assert!(!media.in_flight.contains(&failed_url));
+
+        services.shutdown().await;
+    }
+
+    #[test]
+    fn f2_theme_commit_updates_cfg_theme_for_persistence() {
+        let mut app = App::new(TuiConfig::default());
+        let initial = app.theme().name().to_string();
+        assert_eq!(app.cfg.theme, initial);
+
+        // Open theme switcher via F2, move down one entry, commit with Enter.
+        let _ = app.handle_key(crossterm::event::KeyEvent::new(
+            KeyCode::F(2),
+            KeyModifiers::NONE,
+        ));
+        let _ = app.handle_key(crossterm::event::KeyEvent::new(
+            KeyCode::Down,
+            KeyModifiers::NONE,
+        ));
+        // Hover preview MUST NOT mutate cfg.theme before Enter commit.
+        assert_eq!(app.cfg.theme, initial);
+
+        let _ = app.handle_key(crossterm::event::KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ));
+        assert_ne!(app.theme().name(), initial);
+        assert_eq!(app.cfg.theme, app.theme().name());
     }
 }

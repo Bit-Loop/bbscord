@@ -160,7 +160,7 @@ pub async fn run_interactive_login(
     keyring_store: &OsKeyringStore,
 ) -> Result<Option<ResolvedAuth>> {
     let (ra_tx, mut ra_rx) = mpsc::unbounded_channel::<RemoteAuthEvent>();
-    let ra_client = RemoteAuthClient::new(fingerprint);
+    let ra_client = RemoteAuthClient::new(fingerprint.clone());
     let mut ra_task = tokio::spawn(async move { ra_client.authenticate(ra_tx).await });
 
     let mut state = LoginUiState {
@@ -254,6 +254,20 @@ pub async fn run_interactive_login(
                             }
                             KeyCode::Char('s' | 'S') if state.tab == LoginTab::Qr => {
                                 state.save_to_keyring = !state.save_to_keyring;
+                            }
+                            KeyCode::Char('r' | 'R') if state.tab == LoginTab::Qr => {
+                                ra_task.abort();
+                                let (new_tx, new_rx) = mpsc::unbounded_channel::<RemoteAuthEvent>();
+                                ra_rx = new_rx;
+                                let retry_client = RemoteAuthClient::new(fingerprint.clone());
+                                ra_task = tokio::spawn(async move {
+                                    retry_client.authenticate(new_tx).await
+                                });
+                                state.qr_url = None;
+                                state.qr_lines.clear();
+                                state.error_msg = None;
+                                state.qr_status =
+                                    "Reconnecting to Discord Remote-Auth Gateway v2...".to_string();
                             }
                             KeyCode::Char('s') if k.modifiers.contains(KeyModifiers::CONTROL) => {
                                 state.save_to_keyring = !state.save_to_keyring;

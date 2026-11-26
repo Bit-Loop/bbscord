@@ -811,6 +811,7 @@ pub fn handle_key(app: &mut App, k: KeyEvent) {
                     app.micro.theme = (app.micro.theme + 1).min(n.saturating_sub(1))
                 }
                 KeyCode::Enter => {
+                    app.cfg.theme = app.theme().name().to_string();
                     app.micro.theme_prev = None;
                     app.micro.theme_spec_prev = None;
                     app.micro.mode = MicroMode::Read;

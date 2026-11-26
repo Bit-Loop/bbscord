@@ -571,6 +571,7 @@ impl App {
                 }
             }
             ModalOutcome::CloseCommit => {
+                self.cfg.theme = self.theme.name().to_string();
                 self.theme_before_preview = None;
             }
             ModalOutcome::Replace(n) => {
