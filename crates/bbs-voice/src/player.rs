@@ -7,13 +7,19 @@ use audiopus::coder::Decoder as OpusDecoder;
 use audiopus::{Channels as OpusChannels, SampleRate as OpusSampleRate};
 use bbs_core::events::BackendEvent;
 use bbs_core::model::{Attachment, Snowflake, VoicePlaybackState};
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{Notify, broadcast, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
 use crate::audio_io::{AudioBackendMode, AudioIoHandle, PlaybackQueue};
 use crate::error::{VoiceError, VoiceResult};
 use crate::mixer::{CHANNELS, FRAME_SAMPLES_PER_CHANNEL, SAMPLE_RATE};
+
+/// Maximum permitted raw Ogg/Opus voice-message payload size (`25 MiB`) to guard against OOM bombs.
+pub const MAX_VOICE_MESSAGE_BYTES: usize = 25 * 1024 * 1024;
+/// Maximum permitted decoded voice-message duration (`20 minutes` @ 48 kHz) to guard against OOM bombs.
+pub const MAX_VOICE_MESSAGE_DURATION_SECS: usize = 20 * 60;
+const MAX_VOICE_MESSAGE_FRAMES: usize = MAX_VOICE_MESSAGE_DURATION_SECS * (SAMPLE_RATE as usize);
 
 const OGG_CAPTURE_PATTERN: &[u8; 4] = b"OggS";
 const OGG_HEADER_MIN_LEN: usize = 27;
@@ -208,6 +214,12 @@ fn parse_ogg_packets(data: &[u8]) -> VoiceResult<OggPacketStream> {
 
 /// Decode an Ogg/Opus voice message byte buffer into 48 kHz interleaved stereo `f32` PCM.
 pub fn decode_ogg_opus(data: &[u8]) -> VoiceResult<DecodedVoiceMessage> {
+    if data.len() > MAX_VOICE_MESSAGE_BYTES {
+        return Err(VoiceError::Ogg(format!(
+            "voice message exceeds maximum size ({} > {MAX_VOICE_MESSAGE_BYTES} bytes)",
+            data.len()
+        )));
+    }
     let stream = parse_ogg_packets(data)?;
     if stream.packets.len() < 2 {
         return Err(VoiceError::Ogg(
@@ -252,6 +264,14 @@ pub fn decode_ogg_opus(data: &[u8]) -> VoiceResult<DecodedVoiceMessage> {
 
         let start_frame = pre_skip_remaining.min(decoded_per_ch);
         pre_skip_remaining = pre_skip_remaining.saturating_sub(start_frame);
+
+        let appended_frames = decoded_per_ch.saturating_sub(start_frame);
+        let current_frames = pcm_stereo.len() / CHANNELS;
+        if current_frames.saturating_add(appended_frames) > MAX_VOICE_MESSAGE_FRAMES {
+            return Err(VoiceError::Ogg(format!(
+                "voice message exceeds maximum decoded duration ({MAX_VOICE_MESSAGE_DURATION_SECS} s)"
+            )));
+        }
 
         for frame_idx in start_frame..decoded_per_ch {
             if ch_count == 1 {
@@ -493,6 +513,7 @@ impl ActiveTrack {
 /// Asynchronous inline Discord voice-message player supporting play/pause/seek/stop and waveforms.
 pub struct VoiceMessagePlayer {
     track: Arc<Mutex<Option<ActiveTrack>>>,
+    wake: Arc<Notify>,
     queue: Arc<PlaybackQueue>,
     audio_io: Arc<AudioIoHandle>,
     events: broadcast::Sender<BackendEvent>,
@@ -516,6 +537,7 @@ impl VoiceMessagePlayer {
         let audio_io = Arc::new(AudioIoHandle::spawn(audio_mode)?);
         Ok(Self {
             track: Arc::new(Mutex::new(None)),
+            wake: Arc::new(Notify::new()),
             queue: Arc::new(PlaybackQueue::new()),
             audio_io,
             events,
@@ -558,6 +580,9 @@ impl VoiceMessagePlayer {
     }
 
     /// Decode an in-memory Ogg/Opus voice message and start playback immediately.
+    ///
+    /// CPU-heavy Opus decoding and waveform generation run on `tokio::task::spawn_blocking`
+    /// so Tokio async workers are never stalled.
     pub async fn play_bytes(
         &self,
         message_id: Snowflake,
@@ -565,15 +590,29 @@ impl VoiceMessagePlayer {
         ogg_bytes: &[u8],
         fallback_duration_secs: Option<f32>,
     ) -> VoiceResult<VoicePlaybackState> {
+        if ogg_bytes.len() > MAX_VOICE_MESSAGE_BYTES {
+            return Err(VoiceError::Ogg(format!(
+                "voice message exceeds maximum size ({} > {MAX_VOICE_MESSAGE_BYTES} bytes)",
+                ogg_bytes.len()
+            )));
+        }
+
         self.stop_internal().await;
 
-        let decoded = decode_ogg_opus(ogg_bytes)?;
+        let owned_bytes = ogg_bytes.to_vec();
+        let (decoded, waveform_64) = tokio::task::spawn_blocking(move || -> VoiceResult<_> {
+            let decoded = decode_ogg_opus(&owned_bytes)?;
+            let waveform = generate_waveform_buckets(&decoded.pcm_stereo, CHANNELS, 64);
+            Ok((decoded, waveform))
+        })
+        .await
+        .map_err(|e| VoiceError::Internal(format!("voice message decode task failed: {e}")))??;
+
         let duration_secs = if decoded.duration_secs > 0.0 {
             decoded.duration_secs
         } else {
             fallback_duration_secs.unwrap_or(0.0).max(0.0)
         };
-        let waveform_64 = generate_waveform_buckets(&decoded.pcm_stereo, CHANNELS, 64);
 
         let track = ActiveTrack {
             message_id,
@@ -602,66 +641,105 @@ impl VoiceMessagePlayer {
 
         let (stop_tx, mut stop_rx) = watch::channel(false);
         let track_arc = Arc::clone(&self.track);
+        let wake_arc = Arc::clone(&self.wake);
         let queue_arc = Arc::clone(&self.queue);
         let events = self.events.clone();
 
         let handle = tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_millis(20));
             let mut tick_count = 0u32;
 
             loop {
-                tokio::select! {
-                    _ = stop_rx.changed() => {
-                        if *stop_rx.borrow() {
-                            break;
-                        }
-                    }
-                    _ = ticker.tick() => {
-                        let (chunk_to_push, maybe_emit, finished) = {
-                            let Ok(mut guard) = track_arc.lock() else {
-                                break;
-                            };
-                            let Some(track) = guard.as_mut() else {
-                                break;
-                            };
-                            if !track.playing {
-                                (None, None, false)
-                            } else {
-                                let total_frames = track.total_frames();
-                                if track.frame_cursor >= total_frames {
-                                    track.playing = false;
-                                    (None, Some(track.playback_state()), true)
-                                } else {
-                                    let next_cursor = (track.frame_cursor + FRAME_SAMPLES_PER_CHANNEL)
-                                        .min(total_frames);
-                                    let start_sample = track.frame_cursor * CHANNELS;
-                                    let end_sample = next_cursor * CHANNELS;
-                                    let chunk = track.pcm_stereo[start_sample..end_sample].to_vec();
-                                    track.frame_cursor = next_cursor;
-                                    let done = track.frame_cursor >= total_frames;
-                                    if done {
-                                        track.playing = false;
-                                    }
-                                    tick_count = tick_count.wrapping_add(1);
-                                    // Emit progress every 5 ticks (~100 ms) or upon completion.
-                                    let emit = if done || tick_count.is_multiple_of(5) {
-                                        Some(track.playback_state())
-                                    } else {
-                                        None
-                                    };
-                                    (Some(chunk), emit, done)
-                                }
-                            }
-                        };
+                if *stop_rx.borrow() {
+                    break;
+                }
 
-                        if let Some(chunk) = chunk_to_push {
-                            queue_arc.push_samples(&chunk);
+                // Park cleanly on `Notify` when paused or at EOF — zero idle 20 ms spinning,
+                // and instant wake on `resume()` or `seek()` even after reaching EOF.
+                let notified = wake_arc.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+
+                let is_playing = {
+                    let Ok(guard) = track_arc.lock() else {
+                        break;
+                    };
+                    match guard.as_ref() {
+                        Some(t) => t.playing,
+                        None => break,
+                    }
+                };
+
+                if !is_playing {
+                    tokio::select! {
+                        _ = stop_rx.changed() => {
+                            if *stop_rx.borrow() {
+                                break;
+                            }
                         }
-                        if let Some(state) = maybe_emit {
-                            let _ = events.send(BackendEvent::VoicePlaybackUpdated(state));
+                        () = notified => {}
+                    }
+                    continue;
+                }
+
+                // Actively playing: stream 20 ms chunks until paused, EOF, or stop.
+                let mut ticker = tokio::time::interval(Duration::from_millis(20));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+                loop {
+                    tokio::select! {
+                        _ = stop_rx.changed() => {
+                            if *stop_rx.borrow() {
+                                return;
+                            }
                         }
-                        if finished {
-                            break;
+                        _ = ticker.tick() => {
+                            let (chunk_to_push, maybe_emit, still_playing) = {
+                                let Ok(mut guard) = track_arc.lock() else {
+                                    return;
+                                };
+                                let Some(track) = guard.as_mut() else {
+                                    return;
+                                };
+                                if !track.playing {
+                                    (None, None, false)
+                                } else {
+                                    let total_frames = track.total_frames();
+                                    if track.frame_cursor >= total_frames {
+                                        track.playing = false;
+                                        (None, Some(track.playback_state()), false)
+                                    } else {
+                                        let next_cursor = (track.frame_cursor + FRAME_SAMPLES_PER_CHANNEL)
+                                            .min(total_frames);
+                                        let start_sample = track.frame_cursor * CHANNELS;
+                                        let end_sample = next_cursor * CHANNELS;
+                                        let chunk = track.pcm_stereo[start_sample..end_sample].to_vec();
+                                        track.frame_cursor = next_cursor;
+                                        let done = track.frame_cursor >= total_frames;
+                                        if done {
+                                            track.playing = false;
+                                        }
+                                        tick_count = tick_count.wrapping_add(1);
+                                        // Emit progress every 5 ticks (~100 ms) or upon completion.
+                                        let emit = if done || tick_count.is_multiple_of(5) {
+                                            Some(track.playback_state())
+                                        } else {
+                                            None
+                                        };
+                                        (Some(chunk), emit, !done)
+                                    }
+                                }
+                            };
+
+                            if let Some(chunk) = chunk_to_push {
+                                queue_arc.push_samples(&chunk);
+                            }
+                            if let Some(state) = maybe_emit {
+                                let _ = events.send(BackendEvent::VoicePlaybackUpdated(state));
+                            }
+                            if !still_playing {
+                                // Break inner tick loop and return to parked Notify wait.
+                                break;
+                            }
                         }
                     }
                 }
@@ -695,7 +773,7 @@ impl VoiceMessagePlayer {
         Ok(state)
     }
 
-    /// Resume playback from the current playhead position.
+    /// Resume playback from the current playhead position (restarts from `0.0` if at EOF).
     pub fn resume(&self) -> VoiceResult<VoicePlaybackState> {
         let state = {
             let mut guard = self
@@ -711,6 +789,7 @@ impl VoiceMessagePlayer {
             track.playing = true;
             track.playback_state()
         };
+        self.wake.notify_one();
         let _ = self
             .events
             .send(BackendEvent::VoicePlaybackUpdated(state.clone()));
@@ -748,6 +827,7 @@ impl VoiceMessagePlayer {
             track.playback_state()
         };
         self.queue.clear();
+        self.wake.notify_one();
         let _ = self
             .events
             .send(BackendEvent::VoicePlaybackUpdated(state.clone()));
@@ -777,6 +857,7 @@ impl VoiceMessagePlayer {
         let prev = self.task.lock().ok().and_then(|mut g| g.take());
         if let Some((stop_tx, handle)) = prev {
             let _ = stop_tx.send(true);
+            self.wake.notify_one();
             let _ = handle.await;
         }
         self.queue.clear();
@@ -790,6 +871,7 @@ impl Drop for VoiceMessagePlayer {
             && let Some((stop_tx, handle)) = guard.take()
         {
             let _ = stop_tx.send(true);
+            self.wake.notify_one();
             handle.abort();
         }
         self.queue.clear();
@@ -799,6 +881,15 @@ impl Drop for VoiceMessagePlayer {
 async fn fetch_attachment_bytes(url: &str) -> VoiceResult<Vec<u8>> {
     if let Some(path) = url.strip_prefix("file://") {
         debug!("reading local voice message file");
+        let meta = tokio::fs::metadata(path)
+            .await
+            .map_err(|e| VoiceError::Ogg(format!("failed to stat local voice message: {e}")))?;
+        if meta.len() > MAX_VOICE_MESSAGE_BYTES as u64 {
+            return Err(VoiceError::Ogg(format!(
+                "local voice message exceeds maximum size ({} > {MAX_VOICE_MESSAGE_BYTES} bytes)",
+                meta.len()
+            )));
+        }
         return tokio::fs::read(path)
             .await
             .map_err(|e| VoiceError::Ogg(format!("failed to read local voice message: {e}")));
@@ -814,7 +905,7 @@ async fn fetch_attachment_bytes(url: &str) -> VoiceResult<Vec<u8>> {
         .timeout(Duration::from_secs(15))
         .build()
         .map_err(|e| VoiceError::Ogg(format!("HTTP client build failed: {e}")))?;
-    let resp = client
+    let mut resp = client
         .get(url)
         .send()
         .await
@@ -828,11 +919,28 @@ async fn fetch_attachment_bytes(url: &str) -> VoiceResult<Vec<u8>> {
         )));
     }
 
-    let bytes = resp
-        .bytes()
+    if let Some(content_len) = resp.content_length()
+        && content_len > MAX_VOICE_MESSAGE_BYTES as u64
+    {
+        return Err(VoiceError::Ogg(format!(
+            "remote voice message Content-Length exceeds maximum ({content_len} > {MAX_VOICE_MESSAGE_BYTES} bytes)"
+        )));
+    }
+
+    let mut body = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
         .await
-        .map_err(|e| VoiceError::Ogg(format!("failed reading voice message body: {e}")))?;
-    Ok(bytes.to_vec())
+        .map_err(|e| VoiceError::Ogg(format!("failed reading voice message chunk: {e}")))?
+    {
+        if body.len().saturating_add(chunk.len()) > MAX_VOICE_MESSAGE_BYTES {
+            return Err(VoiceError::Ogg(format!(
+                "remote voice message body exceeds maximum size ({MAX_VOICE_MESSAGE_BYTES} bytes)"
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 #[cfg(test)]
@@ -935,5 +1043,77 @@ mod tests {
 
         player.stop().await.expect("stop");
         assert!(player.state().is_none());
+    }
+
+    #[tokio::test]
+    async fn player_replay_and_seek_after_eof() {
+        let (tx, _rx) = broadcast::channel(64);
+        let player = VoiceMessagePlayer::new(tx, AudioBackendMode::Headless).expect("player");
+        // Short 4-frame (~80 ms) clip that reaches EOF quickly.
+        let ogg = build_synthetic_ogg_opus_voice_message(4);
+
+        player
+            .play_bytes(Snowflake(30), Snowflake(40), &ogg, None)
+            .await
+            .expect("play");
+
+        // Wait for EOF.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let st = player.state().expect("loaded");
+            if !st.playing && (st.position_secs - st.duration_secs).abs() < 0.01 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for initial EOF: {st:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+
+        // Resume after EOF must restart from 0.0 and actually advance to EOF again (task stayed alive).
+        let restarted = player.resume().expect("resume after EOF");
+        assert!(restarted.playing);
+        assert!(restarted.position_secs < 0.01);
+
+        let deadline2 = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let st = player.state().expect("loaded");
+            if !st.playing && (st.position_secs - st.duration_secs).abs() < 0.01 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline2,
+                "timed out waiting for replay EOF after resume(): {st:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+
+        // Seek after EOF and resume must play from the sought position to EOF.
+        let sought = player.seek(0.02).expect("seek after EOF");
+        assert!((sought.position_secs - 0.02).abs() < 0.005);
+        let resumed2 = player.resume().expect("resume after seek");
+        assert!(resumed2.playing);
+
+        let deadline3 = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let st = player.state().expect("loaded");
+            if !st.playing && (st.position_secs - st.duration_secs).abs() < 0.01 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline3,
+                "timed out waiting for EOF after seek()+resume(): {st:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+
+        player.stop().await.expect("stop");
+    }
+
+    #[test]
+    fn oversized_voice_message_is_rejected() {
+        let huge = vec![0u8; MAX_VOICE_MESSAGE_BYTES + 1];
+        assert!(decode_ogg_opus(&huge).is_err());
     }
 }

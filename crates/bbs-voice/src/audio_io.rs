@@ -1,18 +1,20 @@
 //! Real-time `cpal` audio capture & playback bridge with graceful headless/CI fallback.
 //!
 //! All `cpal` host/device probing and stream ownership run on a dedicated OS thread rather than
-//! Tokio async workers, keeping blocking ALSA/PipeWire/PulseAudio calls off the async runtime
-//! and ensuring real-time audio callbacks never block on locks or channels.
+//! Tokio async workers, keeping blocking ALSA/PipeWire/PulseAudio calls off the async runtime.
+//! Both capture and playback callbacks operate on pre-allocated scratch buffers and non-blocking
+//! `try_lock` bounded queues so steady-state real-time audio callbacks perform zero heap
+//! allocations and never block.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc as std_mpsc};
-use std::thread::{self, JoinHandle};
+use std::thread;
 use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{BufferSize, Sample, SampleFormat, Stream, StreamConfig, SupportedStreamConfig};
-use tokio::sync::mpsc as tokio_mpsc;
+use tokio::sync::Notify;
 use tracing::{debug, warn};
 
 use crate::error::{VoiceError, VoiceResult};
@@ -20,6 +22,10 @@ use crate::mixer::{CHANNELS, FRAME_SAMPLES, SAMPLE_RATE};
 
 /// Maximum buffered playback samples (~200 ms of stereo 48 kHz audio = 10 frames).
 const MAX_PLAYBACK_QUEUE_SAMPLES: usize = FRAME_SAMPLES * 10;
+/// Maximum buffered capture samples (~160 ms of stereo 48 kHz audio = 8 frames).
+const MAX_CAPTURE_QUEUE_SAMPLES: usize = FRAME_SAMPLES * 8;
+/// Initial scratch capacity hoisted outside real-time `cpal` callbacks (~80 ms stereo).
+const RT_CALLBACK_SCRATCH_CAPACITY: usize = FRAME_SAMPLES * 4;
 
 /// Policy selecting whether to probe live hardware devices or force headless mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -40,6 +46,114 @@ pub enum AudioBackendKind {
     Headless,
 }
 
+/// Non-blocking stereo 48 kHz PCM capture queue shared between `cpal` input callback and TX worker.
+#[derive(Debug)]
+pub struct CaptureQueue {
+    buf: Mutex<VecDeque<f32>>,
+    notify: Notify,
+}
+
+impl Default for CaptureQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CaptureQueue {
+    /// Construct an empty pre-allocated bounded capture queue.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            buf: Mutex::new(VecDeque::with_capacity(MAX_CAPTURE_QUEUE_SAMPLES)),
+            notify: Notify::new(),
+        }
+    }
+
+    /// Non-blocking push used inside real-time `cpal` input callbacks (`try_lock`, zero allocs).
+    ///
+    /// Drops oldest samples if the consumer falls behind so live voice never accumulates lag.
+    pub fn push_samples_nonblocking(&self, samples: &[f32]) {
+        let Ok(mut guard) = self.buf.try_lock() else {
+            return;
+        };
+        let total = guard.len().saturating_add(samples.len());
+        if total > MAX_CAPTURE_QUEUE_SAMPLES {
+            let overflow = total - MAX_CAPTURE_QUEUE_SAMPLES;
+            let drop_count = overflow.min(guard.len());
+            guard.drain(..drop_count);
+        }
+        let available = MAX_CAPTURE_QUEUE_SAMPLES.saturating_sub(guard.len());
+        let start = samples.len().saturating_sub(available);
+        guard.extend(samples[start..].iter().copied());
+        let has_frame = guard.len() >= FRAME_SAMPLES;
+        drop(guard);
+        if has_frame {
+            self.notify.notify_one();
+        }
+    }
+
+    /// Push a synthetic 20 ms stereo frame from async/test code and wake the consumer.
+    pub fn push_samples(&self, samples: &[f32]) {
+        let Ok(mut guard) = self.buf.lock() else {
+            return;
+        };
+        let total = guard.len().saturating_add(samples.len());
+        if total > MAX_CAPTURE_QUEUE_SAMPLES {
+            let overflow = total - MAX_CAPTURE_QUEUE_SAMPLES;
+            let drop_count = overflow.min(guard.len());
+            guard.drain(..drop_count);
+        }
+        let available = MAX_CAPTURE_QUEUE_SAMPLES.saturating_sub(guard.len());
+        let start = samples.len().saturating_sub(available);
+        guard.extend(samples[start..].iter().copied());
+        let has_frame = guard.len() >= FRAME_SAMPLES;
+        drop(guard);
+        if has_frame {
+            self.notify.notify_one();
+        }
+    }
+
+    /// Try to pop one exact 20 ms stereo frame (`1920` samples) into `dst`.
+    pub fn try_pop_frame(&self, dst: &mut [f32; FRAME_SAMPLES]) -> bool {
+        let Ok(mut guard) = self.buf.lock() else {
+            return false;
+        };
+        if guard.len() < FRAME_SAMPLES {
+            return false;
+        }
+        for slot in dst.iter_mut() {
+            *slot = guard.pop_front().unwrap_or(0.0);
+        }
+        true
+    }
+
+    /// Wait asynchronously until one full 20 ms stereo frame (`1920` samples) is available.
+    pub async fn recv_frame(&self, dst: &mut [f32; FRAME_SAMPLES]) {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.try_pop_frame(dst) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Clear all queued capture samples.
+    pub fn clear(&self) {
+        if let Ok(mut guard) = self.buf.lock() {
+            guard.clear();
+        }
+    }
+
+    /// Current number of buffered interleaved samples.
+    #[must_use]
+    pub fn buffered_samples(&self) -> usize {
+        self.buf.lock().map_or(0, |g| g.len())
+    }
+}
+
 /// Non-blocking stereo 48 kHz PCM playback queue shared between mixer producer and `cpal` output callback.
 #[derive(Debug)]
 pub struct PlaybackQueue {
@@ -53,7 +167,7 @@ impl Default for PlaybackQueue {
 }
 
 impl PlaybackQueue {
-    /// Construct an empty bounded playback queue.
+    /// Construct an empty pre-allocated bounded playback queue.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -74,7 +188,9 @@ impl PlaybackQueue {
             let drop_count = overflow.min(guard.len());
             guard.drain(..drop_count);
         }
-        guard.extend(samples.iter().copied());
+        let available = MAX_PLAYBACK_QUEUE_SAMPLES.saturating_sub(guard.len());
+        let start = samples.len().saturating_sub(available);
+        guard.extend(samples[start..].iter().copied());
     }
 
     /// Clear all queued playback samples (e.g. on mute/deafen/stop).
@@ -113,7 +229,7 @@ impl PlaybackQueue {
 
 enum WorkerCommand {
     StartCapture {
-        tx: tokio_mpsc::Sender<Vec<f32>>,
+        queue: Arc<CaptureQueue>,
         reply: std_mpsc::Sender<AudioBackendKind>,
     },
     StopCapture {
@@ -126,15 +242,19 @@ enum WorkerCommand {
     StopPlayback {
         reply: std_mpsc::Sender<()>,
     },
-    Shutdown,
+    Shutdown {
+        reply: Option<std_mpsc::Sender<()>>,
+    },
 }
 
 /// Thread-safe handle controlling capture and playback streams on a dedicated audio thread.
+///
+/// Dropping [`AudioIoHandle`] sends a non-blocking shutdown command so teardown never blocks
+/// a Tokio async executor thread; callers may also await [`Self::shutdown`] explicitly.
 pub struct AudioIoHandle {
     cmd_tx: std_mpsc::Sender<WorkerCommand>,
     capture_active: Arc<AtomicBool>,
     playback_active: Arc<AtomicBool>,
-    worker: Option<JoinHandle<()>>,
 }
 
 impl std::fmt::Debug for AudioIoHandle {
@@ -159,7 +279,7 @@ impl AudioIoHandle {
         let cap_flag = Arc::clone(&capture_active);
         let play_flag = Arc::clone(&playback_active);
 
-        let worker = thread::Builder::new()
+        thread::Builder::new()
             .name("bbs-voice-audio-io".to_string())
             .spawn(move || run_audio_worker(mode, cmd_rx, cap_flag, play_flag))
             .map_err(|e| VoiceError::AudioDevice(format!("failed to spawn audio thread: {e}")))?;
@@ -168,23 +288,19 @@ impl AudioIoHandle {
             cmd_tx,
             capture_active,
             playback_active,
-            worker: Some(worker),
         })
     }
 
-    /// Start microphone capture, streaming 20 ms 48 kHz stereo frames (`1920` `f32` samples) to `tx`.
+    /// Start microphone capture, writing 20 ms 48 kHz stereo frames into `queue`.
     ///
     /// Gracefully returns [`AudioBackendKind::Headless`] if no input device is available.
-    pub async fn start_capture(
-        &self,
-        tx: tokio_mpsc::Sender<Vec<f32>>,
-    ) -> VoiceResult<AudioBackendKind> {
+    pub async fn start_capture(&self, queue: Arc<CaptureQueue>) -> VoiceResult<AudioBackendKind> {
         let cmd_tx = self.cmd_tx.clone();
         tokio::task::spawn_blocking(move || {
             let (reply_tx, reply_rx) = std_mpsc::channel();
             cmd_tx
                 .send(WorkerCommand::StartCapture {
-                    tx,
+                    queue,
                     reply: reply_tx,
                 })
                 .map_err(|_| VoiceError::AudioDevice("audio I/O thread stopped".to_string()))?;
@@ -243,6 +359,24 @@ impl AudioIoHandle {
         Ok(())
     }
 
+    /// Asynchronously shut down the dedicated audio worker and wait for stream teardown
+    /// without blocking any Tokio executor thread.
+    pub async fn shutdown(&self) {
+        let cmd_tx = self.cmd_tx.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            let (reply_tx, reply_rx) = std_mpsc::channel();
+            if cmd_tx
+                .send(WorkerCommand::Shutdown {
+                    reply: Some(reply_tx),
+                })
+                .is_ok()
+            {
+                let _ = reply_rx.recv_timeout(Duration::from_secs(5));
+            }
+        })
+        .await;
+    }
+
     /// Returns `true` if live hardware capture is currently running.
     #[must_use]
     pub fn is_capture_live(&self) -> bool {
@@ -258,10 +392,9 @@ impl AudioIoHandle {
 
 impl Drop for AudioIoHandle {
     fn drop(&mut self) {
-        let _ = self.cmd_tx.send(WorkerCommand::Shutdown);
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
+        // Non-blocking shutdown signal: the dedicated audio thread tears down any open cpal
+        // streams and exits on its own without ever blocking a Tokio worker thread.
+        let _ = self.cmd_tx.send(WorkerCommand::Shutdown { reply: None });
     }
 }
 
@@ -276,13 +409,13 @@ fn run_audio_worker(
 
     while let Ok(cmd) = cmd_rx.recv() {
         match cmd {
-            WorkerCommand::StartCapture { tx, reply } => {
+            WorkerCommand::StartCapture { queue, reply } => {
                 capture_stream = None;
                 capture_active.store(false, Ordering::Relaxed);
                 let kind = if mode == AudioBackendMode::Headless {
                     AudioBackendKind::Headless
                 } else {
-                    match open_cpal_capture(tx) {
+                    match open_cpal_capture(queue) {
                         Ok(stream) => {
                             capture_stream = Some(stream);
                             capture_active.store(true, Ordering::Relaxed);
@@ -326,11 +459,14 @@ fn run_audio_worker(
                 playback_active.store(false, Ordering::Relaxed);
                 let _ = reply.send(());
             }
-            WorkerCommand::Shutdown => {
+            WorkerCommand::Shutdown { reply } => {
                 drop(capture_stream.take());
                 drop(playback_stream.take());
                 capture_active.store(false, Ordering::Relaxed);
                 playback_active.store(false, Ordering::Relaxed);
+                if let Some(tx) = reply {
+                    let _ = tx.send(());
+                }
                 break;
             }
         }
@@ -369,7 +505,7 @@ where
     best.unwrap_or(fallback)
 }
 
-fn open_cpal_capture(tx: tokio_mpsc::Sender<Vec<f32>>) -> VoiceResult<Stream> {
+fn open_cpal_capture(queue: Arc<CaptureQueue>) -> VoiceResult<Stream> {
     let host = cpal::default_host();
     let device = host
         .default_input_device()
@@ -396,13 +532,15 @@ fn open_cpal_capture(tx: tokio_mpsc::Sender<Vec<f32>>) -> VoiceResult<Stream> {
     );
 
     let err_fn = |err| warn!("cpal capture stream error: {err}");
-    let mut pending = Vec::<f32>::with_capacity(FRAME_SAMPLES * 2);
+    // Pre-allocate scratch buffers OUTSIDE the real-time callbacks to avoid steady-state allocs.
+    let mut pending = Vec::<f32>::with_capacity(RT_CALLBACK_SCRATCH_CAPACITY);
+    let mut converted = Vec::<f32>::with_capacity(RT_CALLBACK_SCRATCH_CAPACITY);
 
     let stream = match sample_format {
         SampleFormat::F32 => device.build_input_stream(
             stream_cfg,
             move |data: &[f32], _| {
-                ingest_captured_samples(data, dev_channels, dev_rate, &mut pending, &tx);
+                ingest_captured_samples(data, dev_channels, dev_rate, &mut pending, &queue);
             },
             err_fn,
             Some(Duration::from_secs(2)),
@@ -410,8 +548,9 @@ fn open_cpal_capture(tx: tokio_mpsc::Sender<Vec<f32>>) -> VoiceResult<Stream> {
         SampleFormat::I16 => device.build_input_stream(
             stream_cfg,
             move |data: &[i16], _| {
-                let converted: Vec<f32> = data.iter().map(|&s| f32::from_sample(s)).collect();
-                ingest_captured_samples(&converted, dev_channels, dev_rate, &mut pending, &tx);
+                converted.clear();
+                converted.extend(data.iter().map(|&s| f32::from_sample(s)));
+                ingest_captured_samples(&converted, dev_channels, dev_rate, &mut pending, &queue);
             },
             err_fn,
             Some(Duration::from_secs(2)),
@@ -419,8 +558,9 @@ fn open_cpal_capture(tx: tokio_mpsc::Sender<Vec<f32>>) -> VoiceResult<Stream> {
         SampleFormat::U16 => device.build_input_stream(
             stream_cfg,
             move |data: &[u16], _| {
-                let converted: Vec<f32> = data.iter().map(|&s| f32::from_sample(s)).collect();
-                ingest_captured_samples(&converted, dev_channels, dev_rate, &mut pending, &tx);
+                converted.clear();
+                converted.extend(data.iter().map(|&s| f32::from_sample(s)));
+                ingest_captured_samples(&converted, dev_channels, dev_rate, &mut pending, &queue);
             },
             err_fn,
             Some(Duration::from_secs(2)),
@@ -466,7 +606,9 @@ fn open_cpal_playback(queue: Arc<PlaybackQueue>) -> VoiceResult<Stream> {
     );
 
     let err_fn = |err| warn!("cpal playback stream error: {err}");
-    let mut scratch = Vec::<f32>::new();
+    // Pre-allocate scratch buffers OUTSIDE the real-time callbacks to avoid steady-state allocs.
+    let mut scratch = Vec::<f32>::with_capacity(RT_CALLBACK_SCRATCH_CAPACITY);
+    let mut f32_out = Vec::<f32>::with_capacity(RT_CALLBACK_SCRATCH_CAPACITY);
 
     let stream = match sample_format {
         SampleFormat::F32 => device.build_output_stream(
@@ -480,9 +622,9 @@ fn open_cpal_playback(queue: Arc<PlaybackQueue>) -> VoiceResult<Stream> {
         SampleFormat::I16 => device.build_output_stream(
             stream_cfg,
             move |out: &mut [i16], _| {
-                let mut f32_out = vec![0.0f32; out.len()];
+                f32_out.resize(out.len(), 0.0);
                 render_playback_samples(&queue, &mut f32_out, dev_channels, dev_rate, &mut scratch);
-                for (dst, src) in out.iter_mut().zip(f32_out) {
+                for (dst, &src) in out.iter_mut().zip(f32_out.iter()) {
                     *dst = i16::from_sample(src.clamp(-1.0, 1.0));
                 }
             },
@@ -492,9 +634,9 @@ fn open_cpal_playback(queue: Arc<PlaybackQueue>) -> VoiceResult<Stream> {
         SampleFormat::U16 => device.build_output_stream(
             stream_cfg,
             move |out: &mut [u16], _| {
-                let mut f32_out = vec![0.0f32; out.len()];
+                f32_out.resize(out.len(), 0.0);
                 render_playback_samples(&queue, &mut f32_out, dev_channels, dev_rate, &mut scratch);
-                for (dst, src) in out.iter_mut().zip(f32_out) {
+                for (dst, &src) in out.iter_mut().zip(f32_out.iter()) {
                     *dst = u16::from_sample(src.clamp(-1.0, 1.0));
                 }
             },
@@ -515,13 +657,14 @@ fn open_cpal_playback(queue: Arc<PlaybackQueue>) -> VoiceResult<Stream> {
     Ok(stream)
 }
 
-/// Convert arbitrary device-rate/channel-count capture PCM into 48 kHz interleaved stereo 20 ms frames.
+/// Convert arbitrary device-rate/channel-count capture PCM into 48 kHz interleaved stereo samples
+/// and push non-blockingly into `queue` without steady-state heap allocations.
 pub(crate) fn ingest_captured_samples(
     input: &[f32],
     src_channels: usize,
     src_rate: u32,
     pending_48k_stereo: &mut Vec<f32>,
-    tx: &tokio_mpsc::Sender<Vec<f32>>,
+    queue: &CaptureQueue,
 ) {
     if input.is_empty() || src_channels == 0 || src_rate == 0 {
         return;
@@ -532,6 +675,7 @@ pub(crate) fn ingest_captured_samples(
         return;
     }
 
+    pending_48k_stereo.clear();
     if src_rate == SAMPLE_RATE {
         for f in 0..src_frames {
             let base = f * src_channels;
@@ -570,11 +714,7 @@ pub(crate) fn ingest_captured_samples(
         }
     }
 
-    while pending_48k_stereo.len() >= FRAME_SAMPLES {
-        let frame: Vec<f32> = pending_48k_stereo.drain(..FRAME_SAMPLES).collect();
-        // Non-blocking send: drop if consumer stalled rather than blocking the RT audio callback.
-        let _ = tx.try_send(frame);
-    }
+    queue.push_samples_nonblocking(pending_48k_stereo);
 }
 
 /// Drain 48 kHz interleaved stereo samples from `queue` and adapt to device channels & rate.
@@ -633,16 +773,19 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn headless_audio_io_handle_starts_and_stops_cleanly() {
+    async fn headless_audio_io_handle_starts_stops_and_shuts_down_nonblockingly() {
         let handle = AudioIoHandle::spawn(AudioBackendMode::Headless).expect("spawn headless");
-        let (tx, _rx) = tokio_mpsc::channel(4);
-        let cap_kind = handle.start_capture(tx).await.expect("start capture");
+        let cap_queue = Arc::new(CaptureQueue::new());
+        let cap_kind = handle
+            .start_capture(Arc::clone(&cap_queue))
+            .await
+            .expect("start capture");
         assert_eq!(cap_kind, AudioBackendKind::Headless);
         assert!(!handle.is_capture_live());
 
-        let queue = Arc::new(PlaybackQueue::new());
+        let play_queue = Arc::new(PlaybackQueue::new());
         let play_kind = handle
-            .start_playback(Arc::clone(&queue))
+            .start_playback(Arc::clone(&play_queue))
             .await
             .expect("start playback");
         assert_eq!(play_kind, AudioBackendKind::Headless);
@@ -650,10 +793,11 @@ mod tests {
 
         handle.stop_capture().await.expect("stop capture");
         handle.stop_playback().await.expect("stop playback");
+        handle.shutdown().await;
     }
 
     #[test]
-    fn playback_queue_and_mono_resample_bridge_work() {
+    fn playback_and_capture_queues_handle_mono_upmix_without_panics() {
         let queue = PlaybackQueue::new();
         let src: Vec<f32> = (0..FRAME_SAMPLES).map(|i| (i as f32) / 2000.0).collect();
         queue.push_samples(&src);
@@ -665,13 +809,13 @@ mod tests {
         assert_eq!(out, src);
         assert_eq!(queue.buffered_samples(), 0);
 
-        // Mono 48 kHz capture -> stereo 48 kHz 20 ms frame
-        let (tx, mut rx) = tokio_mpsc::channel(4);
-        let mut pending = Vec::new();
+        // Mono 48 kHz capture -> stereo 48 kHz 20 ms frame via CaptureQueue.
+        let cap_queue = CaptureQueue::new();
+        let mut pending = Vec::with_capacity(RT_CALLBACK_SCRATCH_CAPACITY);
         let mono_in = vec![0.25f32; 960];
-        ingest_captured_samples(&mono_in, 1, SAMPLE_RATE, &mut pending, &tx);
-        let frame = rx.try_recv().expect("frame produced");
-        assert_eq!(frame.len(), FRAME_SAMPLES);
+        ingest_captured_samples(&mono_in, 1, SAMPLE_RATE, &mut pending, &cap_queue);
+        let mut frame = [0.0f32; FRAME_SAMPLES];
+        assert!(cap_queue.try_pop_frame(&mut frame));
         assert!((frame[0] - 0.25).abs() < f32::EPSILON);
         assert!((frame[1] - 0.25).abs() < f32::EPSILON);
     }

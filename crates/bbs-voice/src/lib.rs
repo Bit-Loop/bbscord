@@ -12,7 +12,7 @@ pub mod player;
 pub mod rtp;
 pub mod session;
 
-pub use audio_io::{AudioBackendKind, AudioBackendMode, AudioIoHandle, PlaybackQueue};
+pub use audio_io::{AudioBackendKind, AudioBackendMode, AudioIoHandle, CaptureQueue, PlaybackQueue};
 pub use dave::{
     DaveController, DaveInboundMessage, DaveOutboundMessage, DaveWireFrame,
     MAX_DAVE_PROTOCOL_VERSION, format_verification_code, parse_binary_dave_frame,
@@ -27,8 +27,9 @@ pub use mixer::{
     compute_rms_db, smooth_rms_db, soft_clip_tanh,
 };
 pub use player::{
-    DecodedVoiceMessage, OpusHead, VoiceMessagePlayer, decode_ogg_opus, generate_waveform_buckets,
-    mux_ogg_opus, resample_waveform,
+    DecodedVoiceMessage, MAX_VOICE_MESSAGE_BYTES, MAX_VOICE_MESSAGE_DURATION_SECS, OpusHead,
+    VoiceMessagePlayer, decode_ogg_opus, generate_waveform_buckets, mux_ogg_opus,
+    resample_waveform,
 };
 pub use rtp::{
     AEAD_NONCE_SUFFIX_LEN, AEAD_TAG_LEN, DISCOVERY_PACKET_LEN, DISCOVERY_PAYLOAD_LEN,

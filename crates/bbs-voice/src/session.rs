@@ -24,7 +24,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing::{debug, info, warn};
 use zeroize::Zeroizing;
 
-use crate::audio_io::{AudioBackendMode, AudioIoHandle, PlaybackQueue};
+use crate::audio_io::{AudioBackendMode, AudioIoHandle, CaptureQueue, PlaybackQueue};
 use crate::dave::{
     DaveController, DaveOutboundMessage, DaveWireFrame, MAX_DAVE_PROTOCOL_VERSION,
     parse_binary_dave_frame, parse_json_dave_frame,
@@ -312,17 +312,18 @@ pub fn build_select_protocol_payload(
 }
 
 /// Build the Voice Gateway v8 `HEARTBEAT` (Op 3) JSON payload.
+///
+/// Per Discord Voice Gateway v8 (`?v=8`), `seq_ack` MUST be `-1` before any sequenced
+/// event has been received.
 #[must_use]
 pub fn build_heartbeat_payload(nonce_ms: u64, seq_ack: Option<u64>) -> Value {
-    let mut data = json!({ "t": nonce_ms });
-    if let Some(seq) = seq_ack
-        && let Some(obj) = data.as_object_mut()
-    {
-        obj.insert("seq_ack".to_string(), json!(seq));
-    }
+    let ack = seq_ack.map_or(-1i64, |s| i64::try_from(s).unwrap_or(i64::MAX));
     json!({
         "op": VOICE_OP_HEARTBEAT,
-        "d": data,
+        "d": {
+            "t": nonce_ms,
+            "seq_ack": ack,
+        }
     })
 }
 
@@ -891,17 +892,30 @@ impl DiscordVoiceEngine {
         let events = self.events.clone();
 
         let task = tokio::spawn(async move {
-            if let Err(err) = run_voice_gateway_session(
+            let result = run_voice_gateway_session(
                 creds,
-                state,
-                audio_io,
-                playback_queue,
+                Arc::clone(&state),
+                Arc::clone(&audio_io),
+                Arc::clone(&playback_queue),
                 events.clone(),
                 stop_rx,
                 ctrl_rx,
             )
-            .await
+            .await;
+
+            // Guaranteed cleanup on both clean exit and error/zombie termination.
+            let _ = audio_io.stop_capture().await;
+            let _ = audio_io.stop_playback().await;
+            playback_queue.clear();
+
+            if let Ok(mut guard) = state.lock()
+                && let Some(st) = guard.status.as_mut()
             {
+                st.connection_state = VoiceConnectionState::Disconnected;
+                let _ = events.send(BackendEvent::VoiceStatusUpdated(st.clone()));
+            }
+
+            if let Err(err) = result {
                 warn!("voice gateway session ended with error: {err}");
                 let _ = events.send(BackendEvent::ErrorBanner {
                     scope: "voice".to_string(),
@@ -1328,7 +1342,8 @@ async fn run_voice_gateway_session(
         .map_err(|e| VoiceError::Gateway(format!("WebSocket connect failed: {e}")))?;
     let (mut ws_tx, mut ws_rx) = ws_stream.split();
 
-    let (mic_tx, mut mic_rx) = mpsc::channel::<Vec<f32>>(16);
+    let capture_queue = Arc::new(CaptureQueue::new());
+    let mut mic_frame_buf = [0.0f32; FRAME_SAMPLES];
     let mut mic_processor = {
         let mode = state
             .lock()
@@ -1365,6 +1380,13 @@ async fn run_voice_gateway_session(
                     std::future::pending::<()>().await;
                 }
             } => {
+                if pending_heartbeat.is_some() {
+                    warn!("voice gateway missed HEARTBEAT_ACK; closing zombie connection");
+                    let _ = ws_tx.close().await;
+                    return Err(VoiceError::Gateway(
+                        "voice gateway heartbeat ACK timeout (zombie connection)".to_string(),
+                    ));
+                }
                 let nonce = current_unix_ms();
                 pending_heartbeat = Some((nonce, Instant::now()));
                 let hb = build_heartbeat_payload(nonce, last_seq_ack);
@@ -1403,7 +1425,11 @@ async fn run_voice_gateway_session(
                                     .and_then(Value::as_u64)
                                     .unwrap_or(13_750)
                                     .max(100);
-                                let mut iv = tokio::time::interval(Duration::from_millis(interval_ms));
+                                let period = Duration::from_millis(interval_ms);
+                                let mut iv = tokio::time::interval_at(
+                                    tokio::time::Instant::now() + period,
+                                    period,
+                                );
                                 iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                                 heartbeat_interval = Some(iv);
 
@@ -1524,7 +1550,7 @@ async fn run_voice_gateway_session(
 
                                 let _ = audio_io.start_playback(Arc::clone(&playback_queue)).await;
                                 if !self_muted {
-                                    let _ = audio_io.start_capture(mic_tx.clone()).await;
+                                    let _ = audio_io.start_capture(Arc::clone(&capture_queue)).await;
                                 }
                             }
 
@@ -1621,24 +1647,36 @@ async fn run_voice_gateway_session(
                             }
 
                             other => {
-                                // Check DAVE JSON opcodes (21, 22, 24).
-                                if let Some(dave_msg) = parse_json_dave_frame(other, data)? {
-                                    let outbound = {
-                                        let mut guard = state.lock().map_err(|_| {
-                                            VoiceError::Internal("voice state lock poisoned".to_string())
-                                        })?;
-                                        let out = if let Some(dave) = guard.dave.as_mut() {
-                                            dave.handle_gateway_message(dave_msg)?
-                                        } else {
-                                            Vec::new()
+                                // Check DAVE JSON opcodes (21, 22, 24) without dropping the voice
+                                // call on transient DAVE parsing or state errors.
+                                match parse_json_dave_frame(other, data) {
+                                    Ok(Some(dave_msg)) => {
+                                        let outbound = {
+                                            let mut guard = state.lock().map_err(|_| {
+                                                VoiceError::Internal("voice state lock poisoned".to_string())
+                                            })?;
+                                            let out = match guard.dave.as_mut() {
+                                                Some(dave) => match dave.handle_gateway_message(dave_msg) {
+                                                    Ok(msgs) => msgs,
+                                                    Err(err) => {
+                                                        warn!("transient DAVE JSON opcode error (staying connected): {err}");
+                                                        Vec::new()
+                                                    }
+                                                },
+                                                None => Vec::new(),
+                                            };
+                                            guard.sync_dave_into_status();
+                                            if let Some(st) = guard.status.as_ref() {
+                                                let _ = events.send(BackendEvent::VoiceStatusUpdated(st.clone()));
+                                            }
+                                            out
                                         };
-                                        guard.sync_dave_into_status();
-                                        if let Some(st) = guard.status.as_ref() {
-                                            let _ = events.send(BackendEvent::VoiceStatusUpdated(st.clone()));
-                                        }
-                                        out
-                                    };
-                                    send_dave_outbound(&mut ws_tx, outbound).await?;
+                                        send_dave_outbound(&mut ws_tx, outbound).await?;
+                                    }
+                                    Ok(None) => {}
+                                    Err(err) => {
+                                        warn!("ignoring malformed JSON DAVE opcode {other}: {err}");
+                                    }
                                 }
                             }
                         }
@@ -1660,10 +1698,18 @@ async fn run_voice_gateway_session(
                                     let mut guard = state.lock().map_err(|_| {
                                         VoiceError::Internal("voice state lock poisoned".to_string())
                                     })?;
-                                    let out = if let Some(dave) = guard.dave.as_mut() {
-                                        dave.handle_gateway_message(dave_msg)?
-                                    } else {
-                                        Vec::new()
+                                    let out = match guard.dave.as_mut() {
+                                        Some(dave) => match dave.handle_gateway_message(dave_msg) {
+                                            Ok(msgs) => msgs,
+                                            Err(err) => {
+                                                // Transient MLS errors (e.g. Op 27 proposal racing ahead
+                                                // of CLIENTS_CONNECT) degrade DAVE status rather than
+                                                // tearing down the entire voice call.
+                                                warn!("transient DAVE binary opcode error (staying connected): {err}");
+                                                Vec::new()
+                                            }
+                                        },
+                                        None => Vec::new(),
                                     };
                                     guard.sync_dave_into_status();
                                     if let Some(st) = guard.status.as_ref() {
@@ -1720,7 +1766,7 @@ async fn run_voice_gateway_session(
                                 last_speaking_sent = false;
                             }
                         } else {
-                            let _ = audio_io.start_capture(mic_tx.clone()).await;
+                            let _ = audio_io.start_capture(Arc::clone(&capture_queue)).await;
                         }
                     }
                     RuntimeControl::SetDeaf(deaf) => {
@@ -1741,16 +1787,18 @@ async fn run_voice_gateway_session(
                         mic_processor.set_high_pass_enabled(enabled);
                     }
                     RuntimeControl::InjectMicFrame(frame) => {
-                        let _ = mic_tx.try_send(frame);
+                        if frame.len() == FRAME_SAMPLES {
+                            capture_queue.push_samples(&frame);
+                        }
                     }
                 }
             }
 
-            Some(pcm_frame) = mic_rx.recv() => {
-                if self_muted || pcm_frame.len() != FRAME_SAMPLES {
+            () = capture_queue.recv_frame(&mut mic_frame_buf) => {
+                if self_muted {
                     continue;
                 }
-                let Ok(mic_res) = mic_processor.process_frame(&pcm_frame) else {
+                let Ok(mic_res) = mic_processor.process_frame(&mic_frame_buf) else {
                     continue;
                 };
 
@@ -1883,16 +1931,6 @@ async fn run_voice_gateway_session(
         }
     }
 
-    let _ = audio_io.stop_capture().await;
-    let _ = audio_io.stop_playback().await;
-    playback_queue.clear();
-
-    if let Ok(mut guard) = state.lock()
-        && let Some(st) = guard.status.as_mut()
-    {
-        st.connection_state = VoiceConnectionState::Disconnected;
-        let _ = events.send(BackendEvent::VoiceStatusUpdated(st.clone()));
-    }
     Ok(())
 }
 
@@ -2095,5 +2133,117 @@ mod tests {
             e.status().await.expect("status").expect("still joined").channel_id,
             channel_id
         );
+    }
+
+    #[test]
+    fn heartbeat_payload_uses_minus_one_seq_ack_before_events() {
+        let initial = build_heartbeat_payload(12345, None);
+        assert_eq!(initial["op"], VOICE_OP_HEARTBEAT);
+        assert_eq!(initial["d"]["t"], 12345);
+        assert_eq!(initial["d"]["seq_ack"], -1);
+
+        let sequenced = build_heartbeat_payload(67890, Some(42));
+        assert_eq!(sequenced["d"]["seq_ack"], 42);
+    }
+
+    #[tokio::test]
+    async fn zombie_heartbeat_ack_timeout_and_transient_dave_op27_resilience() {
+        use crate::dave::OP_DAVE_MLS_PROPOSALS;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        let observed_first_seq_ack = Arc::new(Mutex::new(None::<i64>));
+        let observed_clone = Arc::clone(&observed_first_seq_ack);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let ws = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("ws accept");
+            let (mut tx, mut rx) = ws.split();
+
+            // Send HELLO with 100 ms heartbeat interval.
+            let _ = tx
+                .send(WsMessage::Text(
+                    json!({
+                        "op": VOICE_OP_HELLO,
+                        "d": { "heartbeat_interval": 100, "v": 8 }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await;
+
+            // Expect IDENTIFY first (heartbeat must NOT fire before first interval).
+            if let Some(Ok(WsMessage::Text(first_msg))) = rx.next().await {
+                let v: Value = serde_json::from_str(first_msg.as_str()).expect("json");
+                assert_eq!(v["op"], VOICE_OP_IDENTIFY);
+            }
+
+            // Inject a malformed/premature Op 27 binary proposal (`seq=1, op=27, APPEND, garbage`)
+            // BEFORE any DAVE session exists; client MUST degrade non-fatally and stay connected!
+            let bad_op27 = vec![0x00, 0x01, OP_DAVE_MLS_PROPOSALS, 0x00, 0xFF, 0xEE];
+            let _ = tx.send(WsMessage::Binary(bad_op27.into())).await;
+
+            // Wait for the first heartbeat (never reply with HEARTBEAT_ACK so zombie detection fires).
+            while let Some(Ok(msg)) = rx.next().await {
+                if let WsMessage::Text(txt) = msg {
+                    let v: Value = serde_json::from_str(txt.as_str()).expect("json");
+                    if v["op"] == VOICE_OP_HEARTBEAT {
+                        *observed_clone.lock().expect("lock") = v["d"]["seq_ack"].as_i64();
+                        // Intentionally withhold HEARTBEAT_ACK so the next tick detects zombie!
+                    }
+                }
+            }
+        });
+
+        let cfg = VoiceEngineConfig {
+            audio_mode: AudioBackendMode::Headless,
+            ..VoiceEngineConfig::new(Snowflake(77), "SysOp")
+        };
+        let engine = DiscordVoiceEngine::new(cfg, None).expect("engine");
+        let mut events = engine.subscribe_voice_events();
+
+        engine
+            .connect_voice_gateway(VoiceGatewayCredentials {
+                guild_id: Some(Snowflake(10)),
+                channel_id: Snowflake(20),
+                channel_name: Some("Test".into()),
+                user_id: Snowflake(77),
+                session_id: Zeroizing::new("s".into()),
+                token: Zeroizing::new("t".into()),
+                endpoint: format!("ws://{addr}"),
+            })
+            .await
+            .expect("connect");
+
+        // Wait for zombie heartbeat error banner + clean Disconnected state.
+        let mut saw_zombie_error = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            if let Ok(Ok(BackendEvent::ErrorBanner { scope, message, .. })) =
+                tokio::time::timeout(Duration::from_millis(200), events.recv()).await
+                && scope == "voice"
+                && message.contains("zombie")
+            {
+                saw_zombie_error = true;
+                break;
+            }
+        }
+        assert!(
+            saw_zombie_error,
+            "session must survive transient Op 27 error and cleanly detect missed HEARTBEAT_ACK zombie"
+        );
+        // First heartbeat occurred AFTER Op 27 (seq=1), proving session stayed alive past Op 27!
+        assert_eq!(*observed_first_seq_ack.lock().expect("lock"), Some(1));
+
+        let st = engine.status().await.expect("status").expect("status");
+        assert_eq!(st.connection_state, VoiceConnectionState::Disconnected);
+
+        engine.leave_voice().await.expect("leave");
+        server.abort();
     }
 }
