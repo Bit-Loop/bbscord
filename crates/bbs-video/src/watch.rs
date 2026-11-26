@@ -1229,18 +1229,26 @@ mod tests {
 
     #[tokio::test]
     async fn popout_pipe_sink_streams_frames_and_cleans_up_child() {
-        // Use `/bin/cat` (or `sh -c "cat >/dev/null"`) to verify anonymous pipe I/O & kill_on_drop
+        // Use a cross-platform stdin-draining child (`sh -c "cat >/dev/null"` on Unix,
+        // `cmd /C "more >NUL"` on Windows) to verify anonymous pipe I/O & kill_on_drop
         // cleanly in 100% headless CI without opening any GUI window.
-        let mut sink = MpvPopoutSink::spawn_with_args(
-            "sh",
-            &["-c".to_string(), "cat >/dev/null".to_string()],
-        )
-        .expect("spawn headless pipe sink");
+        #[cfg(windows)]
+        let (prog, args) = ("cmd", vec!["/C".to_string(), "more >NUL".to_string()]);
+        #[cfg(not(windows))]
+        let (prog, args) = ("sh", vec!["-c".to_string(), "cat >/dev/null".to_string()]);
+
+        let mut sink =
+            MpvPopoutSink::spawn_with_args(prog, &args).expect("spawn headless pipe sink");
 
         assert!(sink.is_alive());
         let frame = vec![0x7Fu8; 32 * 32 * 4];
         assert!(sink.try_push_rgba(frame));
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        for _ in 0..100 {
+            if sink.frames_written() >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         assert!(sink.frames_written() >= 1);
 
         sink.stop().await;

@@ -4,6 +4,7 @@
 //! UART links, hardware `16×2` HD44780 LCD bridges, and unresponsive PTYs never hang.
 
 use std::env;
+#[cfg(unix)]
 use std::io;
 use std::time::Duration;
 #[cfg(unix)]

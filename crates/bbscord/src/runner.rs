@@ -11,16 +11,14 @@ use bbs_core::{
     BackendEvent, CharsetMode, GraphicsTier, OsKeyringStore, ResolvedCharset, RgbaFrame, UiAction,
     VideoSinkKind, ViewportGeometry, mock_ids,
 };
-#[cfg(unix)]
-use bbs_runtime_term::TerminalSignal;
 use bbs_runtime_term::{
     DEFAULT_DECODE_CONCURRENCY, DEFAULT_ENCODE_CONCURRENCY, DEFAULT_MEDIA_CACHE_BYTES,
     DecodeLimits, DecodedMedia, FramePacer, GifAnimationPlayer, MediaDecoderPool,
     MediaEncodeRequest, MediaEncoderPool, MediaFitMode, MediaRenderer, MediaWidget, ProbeOptions,
     ProbeReport, PtyBandwidthGovernor, RenderedMedia, RenderedMediaFrame, ResizeDebouncer,
-    ScrollProxyDebouncer, TerminalEnv, TtyGuard, TtyGuardConfig, install_panic_hook,
-    kitty_delete_image_data_seq_for, negotiate_capabilities, normalize_key_event,
-    probe_terminal_async, query_stdout_winsize,
+    ScrollProxyDebouncer, TerminalEnv, TerminalSignal, TtyGuard, TtyGuardConfig,
+    install_panic_hook, kitty_delete_image_data_seq_for, negotiate_capabilities,
+    normalize_key_event, probe_terminal_async, query_stdout_winsize,
 };
 use bbs_tui::theme::{ThemeCatalog, ThemeDirs};
 use bbs_tui::{App, Effect, ImageSlot, Mode, TuiConfig};
@@ -1084,10 +1082,20 @@ pub async fn run_interactive(
             }
         };
 
-        #[cfg(unix)]
+        let sig_recv = async {
+            #[cfg(unix)]
+            {
+                signal_rx.recv().await
+            }
+            #[cfg(not(unix))]
+            {
+                std::future::pending::<Option<TerminalSignal>>().await
+            }
+        };
+
         tokio::select! {
             biased;
-            maybe_sig = signal_rx.recv() => {
+            maybe_sig = sig_recv => {
                 match maybe_sig {
                     Some(TerminalSignal::Resize(geom)) => {
                         if let Some(px) = geom.cell_pixels() {
@@ -1210,86 +1218,6 @@ pub async fn run_interactive(
                         }
                     }
                 }
-            }
-        }
-
-        #[cfg(not(unix))]
-        tokio::select! {
-            biased;
-            maybe_term = term_events.next() => {
-                match maybe_term {
-                    Some(Ok(Event::Key(raw_key))) => {
-                        handle_interactive_key(
-                            raw_key,
-                            &mut app,
-                            &app_cfg,
-                            &services,
-                            &mut ptt_held,
-                            osc52,
-                            &mut effects,
-                        );
-                    }
-                    Some(Ok(Event::Mouse(mouse_ev))) => {
-                        effects.extend(app.handle_mouse(mouse_ev));
-                    }
-                    Some(Ok(Event::Paste(text))) => {
-                        handle_terminal_paste(&mut app, &text, &mut effects);
-                    }
-                    Some(Ok(Event::FocusLost)) => {
-                        if ptt_held {
-                            ptt_held = false;
-                            services.set_ptt_active(false);
-                        }
-                    }
-                    Some(Ok(Event::Resize(cols, rows))) => {
-                        let geom = query_stdout_winsize()
-                            .unwrap_or_else(|| ViewportGeometry::new(cols, rows));
-                        debouncer.on_resize_now(geom);
-                        effects.extend(app.handle_resize(cols, rows));
-                    }
-                    Some(Ok(_)) => {}
-                    Some(Err(_)) | None => {
-                        should_quit = true;
-                    }
-                }
-            }
-            maybe_ev = backend_rx.recv() => {
-                if let Some(ev) = maybe_ev {
-                    match &ev {
-                        BackendEvent::VideoFrameReceived(frame) => {
-                            media.ingest_video_frame(frame, &mut app);
-                        }
-                        BackendEvent::GifSearchResults { page, .. } => {
-                            media.sync_mock_gif_frames(page, &mut app);
-                        }
-                        _ => {}
-                    }
-                    effects.extend(app.handle_event(ev));
-                }
-            }
-            maybe_decoded = media.decoded_rx.recv() => {
-                if let Some(outcome) = maybe_decoded {
-                    let _ = media.apply_decoded_outcome(outcome, &mut app);
-                }
-            }
-            maybe_encoded = media.encoded_rx.recv() => {
-                if let Some(frame) = maybe_encoded {
-                    media.apply_encoded_frame(frame);
-                }
-            }
-            () = debounce_sleep => {
-                if debouncer.poll_settled_now().is_some() {
-                    media.clear_encoded();
-                }
-            }
-            () = scroll_settle_sleep => {}
-            () = governor_retry_sleep => {}
-            _ = tick_interval.tick() => {
-                tick_count = tick_count.saturating_add(1);
-                let now_tick = Instant::now();
-                effects.extend(app.tick(current_unix_ms()));
-                let slots = app.image_slots().to_vec();
-                let _ = media.tick_animations(&slots, &mut app, now_tick);
             }
         }
 

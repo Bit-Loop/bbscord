@@ -283,7 +283,12 @@ impl AttachState {
     /// Recompute [`Self::filtered`] for [`Self::input`].
     pub fn refilter(&mut self) {
         let q = self.input.trim();
-        if q.is_empty() || q.contains('/') || q.starts_with('~') || q.starts_with("file://") {
+        if q.is_empty()
+            || q.contains('/')
+            || q.contains('\\')
+            || q.starts_with('~')
+            || q.starts_with("file://")
+        {
             self.filtered = (0..self.entries.len()).collect();
         } else {
             let m = SkimMatcherV2::default();
@@ -368,12 +373,34 @@ pub fn expand_user_path(raw: &str, base_dir: &Path) -> PathBuf {
     {
         s = &s[1..s.len() - 1];
     }
-    let unescaped: String = if let Some(rest) = s.strip_prefix("file://localhost") {
-        percent_decode_uri_path(rest)
-    } else if let Some(rest) = s.strip_prefix("file://") {
-        percent_decode_uri_path(rest)
+    let unescaped: String = if let Some(rest) = s
+        .strip_prefix("file://localhost")
+        .or_else(|| s.strip_prefix("file://"))
+    {
+        let decoded = percent_decode_uri_path(rest);
+        // Strip the leading `/` from RFC 8089 Windows URIs (`file:///C:/...` -> `C:/...`).
+        let b = decoded.as_bytes();
+        if b.len() >= 4
+            && b[0] == b'/'
+            && b[1].is_ascii_alphabetic()
+            && b[2] == b':'
+            && matches!(b[3], b'/' | b'\\')
+        {
+            decoded[1..].to_owned()
+        } else {
+            decoded
+        }
+    } else if cfg!(windows)
+        || s.starts_with("\\\\")
+        || (s.len() >= 3
+            && s.as_bytes()[0].is_ascii_alphabetic()
+            && s.as_bytes()[1] == b':'
+            && s.as_bytes()[2] == b'\\')
+    {
+        // Preserve Windows path separators verbatim (`C:\...`, `\\server\share\...`).
+        s.to_owned()
     } else {
-        // Unescape shell backslash-escaped spaces/chars when pasted from terminal drag-and-drop.
+        // Unescape POSIX shell backslash-escaped spaces/chars when pasted from terminal drag-and-drop.
         let mut out = String::with_capacity(s.len());
         let mut chars = s.chars();
         while let Some(c) = chars.next() {
@@ -1442,6 +1469,7 @@ pub fn handle_key(app: &mut App, m: &mut Modal, k: KeyEvent) -> ModalOutcome {
                     let trimmed = a.input.trim();
                     if !trimmed.is_empty()
                         && (trimmed.contains('/')
+                            || trimmed.contains('\\')
                             || trimmed.starts_with('~')
                             || trimmed.starts_with("file://"))
                     {

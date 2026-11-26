@@ -101,7 +101,7 @@ pub fn open_external_url(url: &str) -> Result<()> {
             .stderr(Stdio::null())
             .spawn()
             .context("failed to launch Windows URL handler")?;
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(target_os = "macos")]
@@ -113,7 +113,7 @@ pub fn open_external_url(url: &str) -> Result<()> {
             .stderr(Stdio::null())
             .spawn()
             .context("failed to launch `open`")?;
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -395,6 +395,18 @@ pub fn read_clipboard_payload() -> Result<Option<ClipboardPayload>> {
                 write_clipboard_temp_image(&img, "png")?,
             )));
         }
+        if let Some(file_bytes) = run_capture(
+            "osascript",
+            &["-e", "POSIX path of (the clipboard as «class furl»)"],
+        ) {
+            let trimmed = String::from_utf8_lossy(&file_bytes).trim().to_owned();
+            if !trimmed.is_empty() {
+                let path = PathBuf::from(trimmed);
+                if path.is_file() {
+                    return Ok(Some(ClipboardPayload::Files(vec![path])));
+                }
+            }
+        }
         if let Some(txt) = run_capture("pbpaste", &[]) {
             let s = String::from_utf8_lossy(&txt).into_owned();
             if !s.is_empty() {
@@ -542,6 +554,7 @@ fn split_shell_drop_tokens(raw: &str) -> Vec<String> {
             Some(_) => cur.push(c),
             None => match c {
                 '\'' | '"' => quote = Some(c),
+                #[cfg(not(windows))]
                 '\\' => {
                     if let Some(next) = chars.next() {
                         cur.push(next);
@@ -667,10 +680,19 @@ mod tests {
         assert_eq!(extract_dropped_file_paths(&single_quoted), vec![f1.clone()]);
 
         // file:// URI with %20 space encoding.
+        #[cfg(windows)]
+        let uri = format!(
+            "file:///{}",
+            f1.to_string_lossy().replace('\\', "/").replace(' ', "%20")
+        );
+        #[cfg(not(windows))]
         let uri = format!("file://{}", f1.to_string_lossy().replace(' ', "%20"));
         assert_eq!(extract_dropped_file_paths(&uri), vec![f1.clone()]);
 
-        // Multi-file drop with backslash-escaped space + second file.
+        // Multi-file drop with platform-native escaping/quoting + second file.
+        #[cfg(windows)]
+        let multi = format!("\"{}\" '{}'", f1.display(), f2.display());
+        #[cfg(not(windows))]
         let multi = format!(
             "{} '{}'",
             f1.to_string_lossy().replace(' ', "\\ "),
