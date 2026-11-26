@@ -380,3 +380,312 @@ fn group_dm_and_voice_actions() {
         "{fx:?}"
     );
 }
+
+#[test]
+fn i4_modal_right_border_over_cjk_has_zero_orphans() {
+    let mut app = demo_app(ResolvedCharset::Utf8, false);
+    // Fill active channel with CJK lines at every column parity so a boxed modal cuts them.
+    for offset in 0..4u64 {
+        let mut msg = app
+            .active_messages()
+            .and_then(|ms| ms.back())
+            .cloned()
+            .expect("msg");
+        msg.id = bbs_core::Snowflake::new(msg.id.as_u64() + 100 + offset);
+        msg.content = format!(
+            "{}{}",
+            " ".repeat(usize::try_from(offset).unwrap_or(0)),
+            "日本語テスト终端自适应布局".repeat(6)
+        );
+        let _ = app.handle_event(bbs_core::BackendEvent::MessageCreated(msg));
+    }
+    let _ = app.handle_key(key(KeyCode::F(2)));
+    for cols in [80u16, 81, 82, 83, 120, 121] {
+        let buf = render(&mut app, cols, 24);
+        check_wide_cells(&buf).unwrap_or_else(|e| panic!("modal CJK cut at {cols}x24: {e}"));
+    }
+}
+
+#[test]
+fn autocomplete_multibyte_casefold_and_empty_top_scroll() {
+    let mut app = demo_app(ResolvedCharset::Utf8, false);
+    app.store.users.insert(
+        bbs_core::Snowflake::new(999_001),
+        bbs_core::User {
+            id: bbs_core::Snowflake::new(999_001),
+            username: "İü".to_string(),
+            global_name: None,
+            discriminator: None,
+            avatar_hash: None,
+            bot: false,
+            accent_color: None,
+            presence: bbs_core::PresenceStatus::Online,
+        },
+    );
+    let _ = render(&mut app, 80, 24);
+    let _ = app.handle_key(ch('i'));
+    let _ = app.handle_paste("@i\u{0307}");
+    // Must not panic when slicing `İü` with multi-byte lowered prefix.
+    let _ = app.handle_key(key(KeyCode::Tab));
+
+    // Empty Timeline::top_scroll must never panic.
+    let empty_msgs = std::collections::VecDeque::new();
+    let (params, pkey, height) = bbs_tui::render::messages_view_params(&app).expect("params");
+    let res = |_, _| None;
+    let ment = |_: &bbs_core::Message| false;
+    let tl = bbs_tui::scroll::Timeline {
+        msgs: &empty_msgs,
+        params,
+        pkey,
+        res: &res,
+        mentions: &ment,
+        playback: None,
+    };
+    let mut cache = bbs_tui::scroll::LayoutCache::default();
+    assert_eq!(
+        tl.top_scroll(&mut cache, height).state,
+        ScrollState::FollowTail
+    );
+}
+
+#[test]
+fn image_slots_for_inline_video_gif_tiles_and_modal_culling() {
+    let mut app = demo_app(ResolvedCharset::Utf8, true);
+    app.cfg.graphics = bbs_core::GraphicsTier::KittyPlaceholder;
+    let _ = render(&mut app, 269, 45);
+    assert!(
+        !app.image_slots().is_empty(),
+        "chat embeds should emit ImageSlots"
+    );
+
+    // Default watch sink is PopoutWindow (§6.5).
+    let fx = app.handle_key(ch('w'));
+    assert!(
+        actions(&fx).iter().any(|a| matches!(
+            a,
+            UiAction::WatchStream {
+                sink: bbs_core::VideoSinkKind::PopoutWindow,
+                ..
+            }
+        )),
+        "default sink must be PopoutWindow: {fx:?}"
+    );
+    // Toggle sink (`W`) switches to InlineTerminal on 269x45 KittyPlaceholder.
+    let fx = app.handle_key(ch('W'));
+    assert!(
+        actions(&fx).iter().any(|a| matches!(
+            a,
+            UiAction::WatchStream {
+                sink: bbs_core::VideoSinkKind::InlineTerminal,
+                ..
+            }
+        )),
+        "W toggle must switch to InlineTerminal: {fx:?}"
+    );
+    let _ = render(&mut app, 269, 45);
+    assert!(
+        app.image_slots()
+            .iter()
+            .any(|s| s.url == mock_ids::STREAM_RETRONET && s.animated && s.focused),
+        "inline video must emit focused animated ImageSlot: {:?}",
+        app.image_slots()
+    );
+
+    // Opening GIF picker culls underlying overlapping chat slots and emits GIF tile slots.
+    let fx = app.handle_key(ch('G'));
+    let req = actions(&fx)
+        .iter()
+        .find_map(|a| {
+            if let UiAction::SearchGifs { request_id, .. } = a {
+                Some(*request_id)
+            } else {
+                None
+            }
+        })
+        .expect("gif search");
+    let page = common::mock_events(false)
+        .into_iter()
+        .find_map(|e| {
+            if let bbs_core::BackendEvent::GifSearchResults { page, .. } = e {
+                Some(page)
+            } else {
+                None
+            }
+        })
+        .expect("gifs");
+    let _ = app.handle_event(bbs_core::BackendEvent::GifSearchResults {
+        request_id: req,
+        page,
+    });
+    let _ = render(&mut app, 120, 40);
+    let modal = geometry::modal_rect(ratatui::layout::Rect::new(0, 0, 120, 40), 86, 24);
+    let gif_slots: Vec<_> = app
+        .image_slots()
+        .iter()
+        .filter(|s| s.animated && !s.visible.intersection(modal.rect).is_empty())
+        .collect();
+    assert!(!gif_slots.is_empty(), "GIF tiles must emit ImageSlots");
+    assert_eq!(
+        gif_slots.iter().filter(|s| s.focused).count(),
+        1,
+        "only the selected GIF tile should be focused"
+    );
+    // Switching to Help modal culls all underlying overlapping slots.
+    let _ = app.handle_key(key(KeyCode::Esc));
+    let _ = app.handle_key(ch('?'));
+    let _ = render(&mut app, 120, 40);
+    let help_mr = geometry::modal_rect(ratatui::layout::Rect::new(0, 0, 120, 40), 78, 30);
+    assert!(
+        app.image_slots()
+            .iter()
+            .all(|s| s.visible.intersection(help_mr.rect).is_empty()),
+        "no chat ImageSlot may overlap an open modal"
+    );
+}
+
+#[test]
+fn dave_verification_truthfulness_epoch_reset_and_degraded_banner() {
+    let mut app = demo_app(ResolvedCharset::Utf8, true);
+    // Mark one participant unverified -> must show DAVE~ (not DAVE✓).
+    let mut voice = app.store.voice.clone().expect("voice");
+    voice.participants[1].dave_verified = false;
+    let _ = app.handle_event(bbs_core::BackendEvent::VoiceStatusUpdated(voice.clone()));
+    let buf = render(&mut app, 269, 45);
+    let d = common::dump(&buf);
+    assert!(
+        d.contains("DAVE~"),
+        "unverified session must show DAVE~: {d}"
+    );
+    assert!(
+        !d.contains("DAVE✓"),
+        "unverified session must not show DAVE✓"
+    );
+
+    // Verify locally via DAVE modal -> DAVE✓ returns.
+    let _ = app.handle_key(ch('D'));
+    let _ = app.handle_key(key(KeyCode::Down));
+    let _ = app.handle_key(ch('v'));
+    let _ = app.handle_key(key(KeyCode::Esc));
+    assert!(app.is_dave_all_verified());
+    let buf = render(&mut app, 269, 45);
+    assert!(common::dump(&buf).contains("DAVE✓"));
+
+    // Epoch change resets local verification -> back to DAVE~.
+    if let bbs_core::DaveSessionState::Active { epoch, .. } = &mut voice.dave {
+        *epoch += 1;
+    }
+    let _ = app.handle_event(bbs_core::BackendEvent::VoiceStatusUpdated(voice.clone()));
+    assert!(!app.is_dave_all_verified());
+    let buf = render(&mut app, 269, 45);
+    assert!(common::dump(&buf).contains("DAVE~"));
+
+    // Degraded DAVE shows a 1-row banner even on StandardBbs 80x24 without a Stage deck.
+    voice.dave = bbs_core::DaveSessionState::Degraded {
+        reason: "legacy client joined".to_string(),
+    };
+    let _ = app.handle_event(bbs_core::BackendEvent::VoiceStatusUpdated(voice));
+    let buf = render(&mut app, 80, 24);
+    let d = common::dump(&buf);
+    assert!(
+        d.contains("DAVE!"),
+        "80x24 must display DAVE! downgrade alert: {d}"
+    );
+    assert!(d.contains("legacy client joined"), "{d}");
+}
+
+#[test]
+fn title_closing_bracket_short_ring_dedupe_oversized_paste_and_cache_refresh() {
+    let mut app = demo_app(ResolvedCharset::Utf8, false);
+    // 1. Truncated 80x24 frame title preserves closing ╞.
+    let buf = render(&mut app, 80, 24);
+    let row0 = common::dump(&buf).lines().next().unwrap_or("").to_string();
+    assert!(
+        row0.contains("…╞"),
+        "truncated title must close with …╞: {row0}"
+    );
+
+    // 2. Short-mode (80x8) & tall-narrow (48x14) incoming call ring appears only once.
+    let _ = app.handle_event(bbs_core::BackendEvent::CallRingUpdated(
+        bbs_core::CallRingState::IncomingRinging {
+            channel_id: mock_ids::CH_DM_ALICE,
+            caller_id: mock_ids::USER_ALICE,
+            caller_name: "Modem Wizard".to_string(),
+            is_group_dm: false,
+        },
+    ));
+    for (c, r) in [(80, 8), (48, 14)] {
+        let buf = render(&mut app, c, r);
+        let d = common::dump(&buf);
+        assert_eq!(
+            d.matches("is calling").count(),
+            1,
+            "ring banner duplicated at {c}x{r}:\n{d}"
+        );
+    }
+
+    // 3. Oversized paste opens Modal::too_long immediately (§9.4).
+    let _ = app.handle_event(bbs_core::BackendEvent::CallRingUpdated(
+        bbs_core::CallRingState::Idle,
+    ));
+    let _ = render(&mut app, 80, 24);
+    let huge = "x".repeat(2500);
+    let fx = app.handle_paste(&huge);
+    assert!(actions(&fx).is_empty());
+    let buf = render(&mut app, 80, 24);
+    assert!(
+        common::dump(&buf).contains("message.txt"),
+        "oversized paste must open too-long modal: {}",
+        common::dump(&buf)
+    );
+    let _ = app.handle_key(key(KeyCode::Esc));
+
+    // 4. LayoutCache invalidates on same-length edit and voice playback progress.
+    let mut last = app
+        .active_messages()
+        .and_then(|ms| ms.back())
+        .cloned()
+        .expect("last msg");
+    let orig_len = last.content.len();
+    let replacement = "Z".repeat(orig_len.max(4));
+    last.content = replacement.clone();
+    if let Some(poll) = last.poll.as_mut() {
+        poll.total_votes += 50;
+        if let Some(ans) = poll.answers.first_mut() {
+            ans.votes += 50;
+        }
+    }
+    let _ = app.handle_event(bbs_core::BackendEvent::MessageUpdated(last));
+    let buf = render(&mut app, 120, 40);
+    assert!(
+        common::dump(&buf).contains("ZZZZ"),
+        "same-length MessageUpdated must invalidate LayoutCache"
+    );
+
+    // Voice playback progress updates the waveform/time readout.
+    let vm = app
+        .active_messages()
+        .and_then(|ms| ms.iter().find(|m| m.is_voice_message()))
+        .cloned()
+        .expect("voice msg");
+    let att_id = vm
+        .attachments
+        .iter()
+        .find(|a| a.is_voice_message())
+        .expect("att")
+        .id;
+    let _ = app.handle_event(bbs_core::BackendEvent::VoicePlaybackUpdated(
+        bbs_core::VoicePlaybackState {
+            message_id: vm.id,
+            attachment_id: att_id,
+            playing: true,
+            position_secs: 3.0,
+            duration_secs: 6.0,
+        },
+    ));
+    let buf = render(&mut app, 120, 40);
+    let d = common::dump(&buf);
+    assert!(
+        d.contains("⏸") && d.contains("0:03/0:06"),
+        "voice playback progress must render pause glyph and position: {d}"
+    );
+}

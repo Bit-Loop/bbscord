@@ -67,6 +67,7 @@ impl LayoutCache {
     }
 
     /// Lines for a message.
+    #[allow(clippy::too_many_arguments)]
     pub fn lines(
         &mut self,
         m: &Message,
@@ -75,11 +76,27 @@ impl LayoutCache {
         p: &LayoutParams,
         pkey: u64,
         res: &dyn Resolve,
+        playback: Option<&bbs_core::VoicePlaybackState>,
     ) -> Arc<Vec<VLine>> {
+        let playback = playback.filter(|pb| pb.message_id == m.id);
         let mut h = std::collections::hash_map::DefaultHasher::new();
         m.id.hash(&mut h);
         m.edited_timestamp.hash(&mut h);
-        m.content.len().hash(&mut h);
+        m.content.hash(&mut h);
+        m.pinned.hash(&mut h);
+        if let Some(poll) = &m.poll {
+            poll.total_votes.hash(&mut h);
+            for a in &poll.answers {
+                a.votes.hash(&mut h);
+                a.me_voted.hash(&mut h);
+            }
+        }
+        if let Some(pb) = playback {
+            pb.attachment_id.hash(&mut h);
+            pb.playing.hash(&mut h);
+            ((pb.position_secs.max(0.0) * 4.0) as u64).hash(&mut h);
+            (pb.duration_secs.max(0.0) as u64).hash(&mut h);
+        }
         m.reactions.len().hash(&mut h);
         for r in &m.reactions {
             r.count.hash(&mut h);
@@ -98,7 +115,7 @@ impl LayoutCache {
             return Arc::clone(v);
         }
         self.misses += 1;
-        let v = Arc::new(layout_message(m, grouped, mentions_me, p, res));
+        let v = Arc::new(layout_message(m, grouped, mentions_me, p, res, playback));
         self.lru.put(key, Arc::clone(&v));
         v
     }
@@ -151,6 +168,8 @@ pub struct Timeline<'a> {
     pub res: &'a dyn Resolve,
     /// Mentions-me predicate.
     pub mentions: &'a dyn Fn(&Message) -> bool,
+    /// Active voice-message playback (progress rendering).
+    pub playback: Option<&'a bbs_core::VoicePlaybackState>,
 }
 
 /// Position of a line: (message index, line index).
@@ -193,6 +212,7 @@ impl Timeline<'_> {
             &self.params,
             self.pkey,
             self.res,
+            self.playback,
         )
     }
 
@@ -386,6 +406,9 @@ impl Timeline<'_> {
 
     /// Scroll showing the very first loaded line at the top of a `height`-row viewport.
     pub fn top_scroll(&self, cache: &mut LayoutCache, height: u16) -> Scroll {
+        if self.msgs.is_empty() {
+            return Scroll::default();
+        }
         let mut remaining = usize::from(height.max(1)) - 1;
         let (mut mi, mut li) = (0usize, 0usize);
         loop {
@@ -406,6 +429,9 @@ impl Timeline<'_> {
 
     /// Scroll that anchors the bottom at `(mi, li)`.
     pub fn anchor_at(&self, cache: &mut LayoutCache, mi: usize, li: usize) -> Scroll {
+        if mi >= self.msgs.len() {
+            return Scroll::default();
+        }
         let lines = self.lines(cache, mi);
         let part = lines.get(li).map_or(AnchorPart::Header, |l| l.part);
         Scroll {

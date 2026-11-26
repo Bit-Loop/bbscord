@@ -980,6 +980,7 @@ pub fn handle_key(app: &mut App, m: &mut Modal, k: KeyEvent) -> ModalOutcome {
                 KeyCode::Char('m') => app.toggle_mute(),
                 KeyCode::Char('d') => app.toggle_deaf(),
                 KeyCode::Char('w') => app.toggle_watch(),
+                KeyCode::Char('W') => app.toggle_video_sink(),
                 KeyCode::Char('s') => app.screenshare(),
                 KeyCode::Char('h') => {
                     app.decline();
@@ -1036,7 +1037,7 @@ pub const KEYMAP: &[(&str, &str, &str, &str)] = &[
     ("Next / prev unread", "] / [", "", "Ctrl+N / Ctrl+P"),
     ("Mute / deafen", "m / d", "F7 / F8", "Ctrl+O"),
     ("Join voice / call / hang up", "v / a / h", "F9", ""),
-    ("Screenshare / watch", "s / w", "", ""),
+    ("Screenshare / watch / sink", "s / w / W", "", ""),
     ("Members / voice deck", "M / V", "F3 / F4", ""),
     ("DAVE verify", "D (v in Stage)", "", ""),
     ("Volume -/+ / reset / local mute", "- + 0 x (Stage)", "", ""),
@@ -1053,7 +1054,7 @@ pub const KEYMAP: &[(&str, &str, &str, &str)] = &[
 
 /// Draw the top modal. Returns the text-cursor position for input modals.
 pub fn render(
-    app: &App,
+    app: &mut App,
     m: &Modal,
     area: Rect,
     buf: &mut Buffer,
@@ -1071,6 +1072,9 @@ pub fn render(
         Modal::Dave => (64, 18, "DAVE verification".to_string()),
     };
     let mr = modal_rect(area, want_w, want_h);
+    // Prevent underlying chat/deck images from painting over the modal.
+    app.image_slots
+        .retain(|s| s.visible.intersection(mr.rect).is_empty());
     let inner = if mr.sheet {
         draw::fill(buf, mr.rect, ctx.base());
         mr.rect
@@ -1223,7 +1227,7 @@ fn render_picker(
 }
 
 fn render_gif(
-    app: &App,
+    app: &mut App,
     g: &GifState,
     inner: Rect,
     sheet: bool,
@@ -1242,13 +1246,13 @@ fn render_gif(
         ctx.s(Role::Hotkey),
     );
     let cursor = Some((inner.x + w.min(inner.width.saturating_sub(1)), inner.y));
-    let items = app
+    let items: Vec<bbs_core::GifItem> = app
         .store
         .gif_results
         .as_ref()
         .filter(|(id, _, _)| *id == g.request_id)
-        .map(|(_, v, _)| v.as_slice())
-        .unwrap_or(&[]);
+        .map(|(_, v, _)| v.clone())
+        .unwrap_or_default();
     let body = Rect::new(
         inner.x,
         inner.y + 1,
@@ -1316,6 +1320,17 @@ fn render_gif(
                     &format!("[{}]", sanitize_single_line(&it.title)),
                     it.preview_rgba_frames.as_ref().and_then(|f| f.first()),
                 );
+                let visible = tile.intersection(body).intersection(buf.area);
+                if visible.width > 0 && visible.height > 0 {
+                    app.image_slots.push(crate::app::ImageSlot {
+                        url: it.preview_url.clone(),
+                        rect: tile,
+                        visible,
+                        clip_top: visible.y.saturating_sub(tile.y),
+                        animated: true,
+                        focused: selected,
+                    });
+                }
                 let cap = text::truncate(
                     &ctx.n(&sanitize_single_line(&it.title)),
                     usize::from(tw),

@@ -72,7 +72,9 @@ impl App {
         input.show_sidebar = self.show_sidebar;
         input.show_members = self.show_members;
         input.max_decks = self.cfg.max_decks;
-        input.banners = self.banner_count();
+        let h_probe = geometry::HProfile::classify(area.width, self.mem.h);
+        let v_probe = geometry::VProfile::classify(area.height, self.mem.v);
+        input.banners = self.banner_count(h_probe, v_probe);
         let mut mem = self.mem;
         let probe = geometry::solve(&input, &mut mem);
         let (lines, _, _) = self.composer.layout(probe.composer.width.max(2));
@@ -96,7 +98,9 @@ impl App {
             return None;
         }
         if layout.micro {
-            return crate::micro::render(self, area, buf, &ctx);
+            let cursor = crate::micro::render(self, area, buf, &ctx);
+            text::repair_wide_cells(buf);
+            return cursor;
         }
 
         let bordered = layout.top_border.is_some();
@@ -121,14 +125,21 @@ impl App {
             let c = crate::modals::render(self, &m, area, buf, &ctx);
             cursor = if m.has_input() { c } else { None };
         }
+        text::repair_wide_cells(buf);
         cursor
     }
 
-    fn banner_count(&self) -> u16 {
-        u16::from(matches!(
-            self.store.ring,
-            CallRingState::IncomingRinging { .. }
-        )) + u16::from(!self.composer.attachments.is_empty())
+    fn banner_count(&self, h: geometry::HProfile, v: geometry::VProfile) -> u16 {
+        let bordered = v == geometry::VProfile::Tall && h >= geometry::HProfile::Standard;
+        let ring = bordered && matches!(self.store.ring, CallRingState::IncomingRinging { .. });
+        let dave_degraded = self
+            .store
+            .voice
+            .as_ref()
+            .is_some_and(|vc| matches!(vc.dave, bbs_core::DaveSessionState::Degraded { .. }));
+        u16::from(ring)
+            + u16::from(dave_degraded)
+            + u16::from(!self.composer.attachments.is_empty())
     }
 
     fn pane_title(&self, kind: PaneKind, idx: u8, ctx: &Ctx<'_>) -> String {
@@ -216,13 +227,16 @@ impl App {
                 (PaneKind::Deck(a), Focus::Deck(b)) => a == b,
                 _ => false,
             };
-            let s = format!("{}{}{}", g.title_l, ctx.n(&t), g.title_r);
-            let st = if focused {
-                ctx.s(Role::Hotkey).add_modifier(Modifier::BOLD)
-            } else {
-                title_style
-            };
             if p.rect.width > 4 {
+                let max_w = usize::from(p.rect.width - 2);
+                let chrome_w = str_width(g.title_l) + str_width(g.title_r);
+                let inner = text::truncate(&ctx.n(&t), max_w.saturating_sub(chrome_w), g.ellipsis);
+                let s = format!("{}{inner}{}", g.title_l, g.title_r);
+                let st = if focused {
+                    ctx.s(Role::Hotkey).add_modifier(Modifier::BOLD)
+                } else {
+                    title_style
+                };
                 draw::put(buf, p.rect.x + 1, top, &s, p.rect.width - 2, st);
             }
         }
@@ -348,27 +362,32 @@ impl App {
         segs.push((pieces, 1));
         // Voice.
         if let Some(v) = &self.store.voice {
-            let dave = match &v.dave {
-                bbs_core::DaveSessionState::Active { .. } => format!(" DAVE{}", g.check),
-                bbs_core::DaveSessionState::Handshaking => format!(" DAVE{}", g.unverified),
-                bbs_core::DaveSessionState::Degraded { .. } => " DAVE!".to_string(),
-                bbs_core::DaveSessionState::Disabled => String::new(),
-            };
-            let s = format!(
-                "{} {} {}{}{}{}",
+            let (dave, dave_role) =
+                crate::panes::dave_badge(ctx, &v.dave, self.is_dave_all_verified());
+            let head = format!(
+                "{} {} {}",
                 g.speaking,
                 sanitize_single_line(&v.channel_name),
                 v.participants.len(),
-                dave,
-                if v.self_mute { " M" } else { "" },
-                if v.self_deaf { " D" } else { "" }
             );
-            let st = if matches!(v.dave, bbs_core::DaveSessionState::Degraded { .. }) {
+            let head_st = if matches!(v.dave, bbs_core::DaveSessionState::Degraded { .. }) {
                 ctx.s(Role::Mention)
             } else {
                 ctx.s(Role::Hotkey)
             };
-            segs.push((vec![(s, st)], 0));
+            let mut vpieces = vec![(head, head_st)];
+            if !dave.is_empty() {
+                vpieces.push((dave, ctx.s(dave_role)));
+            }
+            let flags = format!(
+                "{}{}",
+                if v.self_mute { " M" } else { "" },
+                if v.self_deaf { " D" } else { "" }
+            );
+            if !flags.is_empty() {
+                vpieces.push((flags, ctx.s(Role::Mention)));
+            }
+            segs.push((vpieces, 0));
         }
         // Unread.
         let (mut u, mut m) = self.store.dm_unread();
@@ -566,6 +585,7 @@ impl App {
             pkey,
             res: &res,
             mentions: &ment,
+            playback: store.playback.as_ref(),
         };
         let view = tl.view(&mut self.cache, &scroll, height);
         let at_top = view.at_top;
@@ -700,11 +720,12 @@ impl App {
 
     fn draw_banners(&self, l: &Layout, buf: &mut Buffer, ctx: &Ctx<'_>) {
         let mut rows = l.banners.iter();
-        if let CallRingState::IncomingRinging {
-            caller_name,
-            is_group_dm,
-            ..
-        } = &self.store.ring
+        if l.header.is_none()
+            && let CallRingState::IncomingRinging {
+                caller_name,
+                is_group_dm,
+                ..
+            } = &self.store.ring
             && let Some(r) = rows.next()
         {
             let s = format!(
@@ -713,6 +734,17 @@ impl App {
                 sanitize_single_line(caller_name),
                 if *is_group_dm { " (group)" } else { "" }
             );
+            let st = ctx
+                .s(Role::Mention)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED);
+            draw::fill(buf, *r, st);
+            draw::put(buf, r.x, r.y, &ctx.n(&s), r.width, st);
+        }
+        if let Some(vc) = &self.store.voice
+            && let bbs_core::DaveSessionState::Degraded { reason } = &vc.dave
+            && let Some(r) = rows.next()
+        {
+            let s = format!("! DAVE! E2EE degraded: {}", sanitize_single_line(reason));
             let st = ctx
                 .s(Role::Mention)
                 .add_modifier(Modifier::BOLD | Modifier::REVERSED);

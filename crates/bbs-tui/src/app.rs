@@ -307,6 +307,18 @@ impl App {
         self.mode = Mode::Insert;
     }
 
+    /// Whether every participant in the active voice session is DAVE-verified (§10).
+    #[must_use]
+    pub fn is_dave_all_verified(&self) -> bool {
+        let Some(v) = &self.store.voice else {
+            return false;
+        };
+        !v.participants.is_empty()
+            && v.participants
+                .iter()
+                .all(|p| p.dave_verified || self.dave_verified.contains(&p.user_id))
+    }
+
     /// Apply a backend event.
     pub fn handle_event(&mut self, ev: BackendEvent) -> Vec<Effect> {
         // Re-anchor before a delete removes the anchored message (§5).
@@ -317,9 +329,26 @@ impl App {
         {
             self.reanchor_on_delete(*channel_id, *message_id);
         }
+        let prev_voice = self.store.voice.as_ref().map(|v| {
+            let epoch = match v.dave {
+                bbs_core::DaveSessionState::Active { epoch, .. } => Some(epoch),
+                _ => None,
+            };
+            (v.channel_id, epoch)
+        });
         let auto_select = matches!(ev, BackendEvent::Ready { .. }) && self.active_channel.is_none();
         let ring_before = self.store.ring.clone();
         self.store.apply(ev, self.active_channel);
+        let next_voice = self.store.voice.as_ref().map(|v| {
+            let epoch = match v.dave {
+                bbs_core::DaveSessionState::Active { epoch, .. } => Some(epoch),
+                _ => None,
+            };
+            (v.channel_id, epoch)
+        });
+        if prev_voice != next_voice {
+            self.dave_verified.clear();
+        }
         if auto_select {
             let first_dm = self.store.dms_by_recency().first().map(|c| c.id);
             if let Some(id) = first_dm {
@@ -410,6 +439,9 @@ impl App {
         } else {
             self.mode = Mode::Insert;
             self.composer.insert_str(&clean);
+            if self.composer.char_len() > self.cfg.max_message_len() {
+                self.open(Modal::too_long(self.cfg.max_message_len()));
+            }
         }
         std::mem::take(&mut self.pending)
     }
@@ -741,7 +773,10 @@ impl App {
         }));
     }
 
-    fn preferred_sink(&self) -> VideoSinkKind {
+    pub(crate) fn preferred_sink(&self) -> VideoSinkKind {
+        if !self.cfg.prefer_inline_video {
+            return VideoSinkKind::PopoutWindow;
+        }
         let deck = self
             .layout
             .as_ref()
@@ -755,6 +790,18 @@ impl App {
             self.cfg.inline_video_low_tier,
             self.cfg.inline_video_ssh,
         )
+    }
+
+    /// Toggle between `PopoutWindow` (default) and `InlineTerminal` when Stage deck allows it (§6.5).
+    pub(crate) fn toggle_video_sink(&mut self) {
+        self.cfg.prefer_inline_video = !self.cfg.prefer_inline_video;
+        if let Some(key) = self.watching.clone() {
+            let sink = self.preferred_sink();
+            self.pending.push(Effect::Action(UiAction::WatchStream {
+                stream_key: key,
+                sink,
+            }));
+        }
     }
 
     pub(crate) fn cycle_focus(&mut self, dir: i8) {
@@ -947,6 +994,7 @@ impl App {
             pkey,
             res: &res,
             mentions: &ment,
+            playback: store.playback.as_ref(),
         };
         let cur = self.scrolls.get(&ch).copied().unwrap_or_default();
         let v = tl.view(&mut self.cache, &cur, height);
@@ -980,6 +1028,7 @@ impl App {
             pkey,
             res: &res,
             mentions: &ment,
+            playback: store.playback.as_ref(),
         };
         let cur = self.scrolls.get(&ch).copied().unwrap_or_default();
         let s = tl.scroll_by(&mut self.cache, &cur, delta, height);
@@ -1245,7 +1294,8 @@ impl App {
             .collect();
         names.sort();
         if let Some(n) = names.first() {
-            let rest = n[prefix.len().min(n.len())..].to_string();
+            // Char-based skip: case folding can change byte lengths (e.g. `İ`).
+            let rest: String = n.chars().skip(prefix.chars().count()).collect();
             self.composer.insert_str(&format!("{rest} "));
         }
     }
@@ -1309,6 +1359,7 @@ impl App {
                                 pkey,
                                 res: &res,
                                 mentions: &ment,
+                                playback: store.playback.as_ref(),
                             };
                             let s = tl.top_scroll(&mut self.cache, height);
                             self.scrolls.insert(ch, s);
@@ -1398,6 +1449,7 @@ impl App {
             'h' => self.decline(),
             's' => self.screenshare(),
             'w' => self.toggle_watch(),
+            'W' => self.toggle_video_sink(),
             'M' => self.toggle_members(),
             'V' => self.open(Modal::Voice),
             'D' => self.open(Modal::Dave),

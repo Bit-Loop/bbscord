@@ -107,7 +107,10 @@ pub fn boxed(buf: &mut Buffer, ctx: &Ctx<'_>, area: Rect, title: &str, role: Rol
     cell(buf, l, b, g.bl, bs);
     cell(buf, r, b, g.br, bs);
     if !title.is_empty() && area.width > 6 {
-        let tt = format!("{}{}{}", g.title_l, ctx.n(title), g.title_r);
+        let max_w = usize::from(area.width - 4);
+        let chrome_w = str_width(g.title_l) + str_width(g.title_r);
+        let inner = text::truncate(&ctx.n(title), max_w.saturating_sub(chrome_w), g.ellipsis);
+        let tt = format!("{}{inner}{}", g.title_l, g.title_r);
         put(
             buf,
             l + 2,

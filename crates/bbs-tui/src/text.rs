@@ -990,9 +990,58 @@ pub fn blank_orphans(buf: &mut Buffer, area: Rect) {
             }
         }
         let rx = area.right() - 1;
-        let cell = &mut buf[(rx, y)];
-        if grapheme_width(cell.symbol()) >= 2 {
-            cell.set_symbol(" ");
+        if grapheme_width(buf[(rx, y)].symbol()) >= 2 {
+            buf[(rx, y)].set_symbol(" ");
+            if rx + 1 < buf.area.right() && buf[(rx + 1, y)].symbol().is_empty() {
+                buf[(rx + 1, y)].set_symbol(" ");
+            }
+        }
+        // Continuation cell just outside the right edge whose leader was overwritten.
+        if area.right() < buf.area.right() && buf[(area.right(), y)].symbol().is_empty() {
+            buf[(area.right(), y)].set_symbol(" ");
+        }
+        // Continuation cell at the left edge whose leader lies outside.
+        if buf[(area.x, y)].symbol().is_empty()
+            && (area.x == buf.area.x || grapheme_width(buf[(area.x - 1, y)].symbol()) < 2)
+        {
+            buf[(area.x, y)].set_symbol(" ");
+        }
+    }
+}
+
+/// Whole-buffer I4 repair pass, run once per frame after every widget has drawn:
+/// - an empty continuation symbol not preceded by a wide glyph becomes `' '` (an orphan `""`
+///   would desynchronise the backend's cursor tracking);
+/// - a wide glyph in the last column, or whose continuation cell was overwritten by another
+///   visible glyph, becomes `' '` (it would otherwise paint over / swallow its neighbour).
+pub fn repair_wide_cells(buf: &mut Buffer) {
+    let a = buf.area;
+    if a.width == 0 {
+        return;
+    }
+    for y in a.top()..a.bottom() {
+        let mut x = a.left();
+        while x < a.right() {
+            let w = grapheme_width(buf[(x, y)].symbol());
+            if buf[(x, y)].symbol().is_empty() {
+                buf[(x, y)].set_symbol(" ");
+                x += 1;
+                continue;
+            }
+            if w >= 2 {
+                if x + 1 >= a.right() {
+                    buf[(x, y)].set_symbol(" ");
+                    x += 1;
+                    continue;
+                }
+                let next = buf[(x + 1, y)].symbol();
+                if next.is_empty() || next == " " {
+                    x += 2;
+                    continue;
+                }
+                buf[(x, y)].set_symbol(" ");
+            }
+            x += 1;
         }
     }
 }
@@ -1246,5 +1295,27 @@ mod tests {
         assert_eq!(buf[(6, 0)].symbol(), " ");
         assert_eq!(buf[(3, 0)].symbol(), "b");
         blank_orphans(&mut buf, Rect::new(50, 50, 5, 5));
+    }
+
+    #[test]
+    fn orphan_after_modal_border_overwrite() {
+        // A modal whose right border lands on the leader of a wide glyph (with an empty continuation cell).
+        let mut buf = Buffer::empty(Rect::new(0, 0, 10, 1));
+        put_str_clipped(&mut buf, 0, 0, "abcdef中", 10, Style::default());
+        buf[(7, 0)].set_symbol("");
+        buf[(6, 0)].set_symbol("║");
+        blank_orphans(&mut buf, Rect::new(2, 0, 5, 1));
+        assert_eq!(buf[(7, 0)].symbol(), " ");
+        // Global repair: orphan continuation and a wide glyph whose continuation was overwritten.
+        let mut buf = Buffer::empty(Rect::new(0, 0, 6, 1));
+        put_str_clipped(&mut buf, 0, 0, "中中", 6, Style::default());
+        buf[(1, 0)].set_symbol("x");
+        buf[(2, 0)].set_symbol("");
+        buf[(5, 0)].set_symbol("中");
+        repair_wide_cells(&mut buf);
+        assert_eq!(buf[(0, 0)].symbol(), " ");
+        assert_eq!(buf[(1, 0)].symbol(), "x");
+        assert_eq!(buf[(2, 0)].symbol(), " ");
+        assert_eq!(buf[(5, 0)].symbol(), " ");
     }
 }

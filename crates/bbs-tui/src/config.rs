@@ -59,6 +59,8 @@ pub struct TuiConfig {
     pub nitro: bool,
     /// Initial theme name.
     pub theme: String,
+    /// Prefer inline terminal video in the Stage deck over a pop-out window (§6.5; default `false`).
+    pub prefer_inline_video: bool,
     /// Allow inline video on low tiers (Sixel/HalfBlock).
     pub inline_video_low_tier: bool,
     /// Allow inline video over SSH.
@@ -85,6 +87,7 @@ impl Default for TuiConfig {
             max_decks: 3,
             nitro: false,
             theme: "ANSI-BBS Royal".to_string(),
+            prefer_inline_video: false,
             inline_video_low_tier: false,
             inline_video_ssh: false,
         }

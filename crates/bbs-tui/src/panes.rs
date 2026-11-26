@@ -245,11 +245,11 @@ pub fn render_members(app: &App, area: Rect, buf: &mut Buffer, ctx: &Ctx<'_>, ov
 }
 
 /// Stage deck: voice header, streams/video, participants with Braille VU, DAVE line.
-pub fn render_stage(app: &App, area: Rect, buf: &mut Buffer, ctx: &Ctx<'_>, overlay: bool) {
+pub fn render_stage(app: &mut App, area: Rect, buf: &mut Buffer, ctx: &Ctx<'_>, overlay: bool) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let Some(v) = &app.store.voice else {
+    let Some(v) = app.store.voice.clone() else {
         let lines = [
             "Not in voice.".to_string(),
             "[v] join selected voice channel".to_string(),
@@ -276,32 +276,49 @@ pub fn render_stage(app: &App, area: Rect, buf: &mut Buffer, ctx: &Ctx<'_>, over
         VoiceConnectionState::Reconnecting => " reconnecting…",
         VoiceConnectionState::Disconnected => " disconnected",
     };
-    let dave = dave_badge(ctx, &v.dave);
+    let all_verified = app.is_dave_all_verified();
+    let (dave_txt, dave_role) = dave_badge(ctx, &v.dave, all_verified);
     let ping = v
         .ping_ms
         .map(|p| format!(" {} {p}ms", ctx.g.dot))
         .unwrap_or_default();
-    let head = format!(
-        "{} {} {} {}{}{}{}",
+    let head_prefix = format!(
+        "{} {} {} {}",
         ctx.g.speaking,
         sanitize_single_line(&v.channel_name),
         ctx.g.dot,
         v.participants.len(),
-        dave.0,
-        ping,
-        state
     );
-    draw::put(
+    let head_tail = format!("{ping}{state}");
+    let title_st = ctx.s(Role::Title).add_modifier(Modifier::BOLD);
+    let mut hx = area.x;
+    hx += draw::put(
         buf,
-        area.x,
+        hx,
         y,
-        &ctx.n(&head),
-        area.width,
-        ctx.s(Role::Title).add_modifier(Modifier::BOLD),
+        &ctx.n(&head_prefix),
+        area.right().saturating_sub(hx),
+        title_st,
     );
-    if !dave.0.is_empty() {
-        // Re-colour the DAVE badge.
-        let _ = dave.1;
+    if !dave_txt.is_empty() {
+        hx += draw::put(
+            buf,
+            hx,
+            y,
+            &ctx.n(&dave_txt),
+            area.right().saturating_sub(hx),
+            ctx.s(dave_role).add_modifier(Modifier::BOLD),
+        );
+    }
+    if !head_tail.is_empty() {
+        draw::put(
+            buf,
+            hx,
+            y,
+            &ctx.n(&head_tail),
+            area.right().saturating_sub(hx),
+            title_st,
+        );
     }
     y += 1;
     let flags = format!(
@@ -353,17 +370,18 @@ pub fn render_stage(app: &App, area: Rect, buf: &mut Buffer, ctx: &Ctx<'_>, over
         ctx.cfg.inline_video_low_tier,
         ctx.cfg.inline_video_ssh,
     );
-    if let (Some(key), true) = (&app.watching, inline_ok) {
+    let inline_active = app.cfg.prefer_inline_video && inline_ok;
+    if let (Some(key), true) = (app.watching.clone(), inline_active) {
         let (fw, fh) = app
             .store
             .video_frame
             .as_ref()
-            .filter(|f| &f.stream_key == key)
+            .filter(|f| f.stream_key == key)
             .map(|f| (f.width, f.height))
             .or_else(|| {
                 streams
                     .iter()
-                    .find(|s| &s.stream_key == key)
+                    .find(|s| s.stream_key == key)
                     .map(|s| s.resolution)
             })
             .unwrap_or((16, 9));
@@ -379,14 +397,25 @@ pub fn render_stage(app: &App, area: Rect, buf: &mut Buffer, ctx: &Ctx<'_>, over
                     .store
                     .video_frame
                     .as_ref()
-                    .filter(|f| &f.stream_key == key)
+                    .filter(|f| f.stream_key == key)
                     .map(|f| RgbaFrame {
                         width: f.width,
                         height: f.height,
                         delay_ms: 0,
                         pixels: f.rgba.clone(),
                     });
-                render_image_box(app, buf, ctx, rect, key, "[stream]", frame.as_ref());
+                render_image_box(app, buf, ctx, rect, &key, "[stream]", frame.as_ref());
+                let visible = rect.intersection(buf.area);
+                if visible.width > 0 && visible.height > 0 {
+                    app.image_slots.push(crate::app::ImageSlot {
+                        url: key,
+                        rect,
+                        visible,
+                        clip_top: visible.y.saturating_sub(rect.y),
+                        animated: true,
+                        focused: true,
+                    });
+                }
                 y += bh;
             }
         }
@@ -537,9 +566,9 @@ pub fn render_stage(app: &App, area: Rect, buf: &mut Buffer, ctx: &Ctx<'_>, over
     }
     if area.height > 6 {
         let hint = if overlay {
-            "-/+ vol 0 reset x mute v verify w watch s share h hang up"
+            "-/+ vol 0 reset x mute v verify w watch W sink s share h hang up"
         } else {
-            "v verify  -/+ volume  w watch"
+            "v verify  -/+ vol  w watch  W sink"
         };
         draw::put(
             buf,
@@ -552,11 +581,19 @@ pub fn render_stage(app: &App, area: Rect, buf: &mut Buffer, ctx: &Ctx<'_>, over
     }
 }
 
-/// `(badge text, colour role)` for DAVE state.
-fn dave_badge(ctx: &Ctx<'_>, d: &DaveSessionState) -> (String, Role) {
+/// `(badge text, colour role)` for DAVE state (§10: `DAVE✓` only when all participants verified).
+pub(crate) fn dave_badge(
+    ctx: &Ctx<'_>,
+    d: &DaveSessionState,
+    all_verified: bool,
+) -> (String, Role) {
     match d {
-        DaveSessionState::Active { .. } => (format!(" DAVE{}", ctx.g.check), Role::Hotkey),
-        DaveSessionState::Handshaking => (format!(" DAVE{}", ctx.g.unverified), Role::Inactive),
+        DaveSessionState::Active { .. } if all_verified => {
+            (format!(" DAVE{}", ctx.g.check), Role::Hotkey)
+        }
+        DaveSessionState::Active { .. } | DaveSessionState::Handshaking => {
+            (format!(" DAVE{}", ctx.g.unverified), Role::Inactive)
+        }
         DaveSessionState::Degraded { .. } => (" DAVE!".to_string(), Role::Mention),
         DaveSessionState::Disabled => (String::new(), Role::Inactive),
     }

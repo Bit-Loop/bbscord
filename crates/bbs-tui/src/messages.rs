@@ -261,6 +261,7 @@ pub fn layout_message(
     mentions_me: bool,
     p: &LayoutParams,
     res: &dyn Resolve,
+    playback: Option<&bbs_core::VoicePlaybackState>,
 ) -> Vec<VLine> {
     let g = p.glyphs;
     let usable = p.width.saturating_sub(1).max(1); // scrollbar column
@@ -342,26 +343,51 @@ pub fn layout_message(
         let name = b.norm1(&a.filename);
         if let Some(vm) = &a.voice_message {
             let w = usize::from(t).saturating_sub(14).min(48);
-            let dur = fmt_dur(vm.duration_secs);
+            let pb = playback.filter(|pb| pb.message_id == m.id && pb.attachment_id == a.id);
+            let total = pb.map_or(vm.duration_secs, |pb| {
+                if pb.duration_secs > 0.0 {
+                    pb.duration_secs
+                } else {
+                    vm.duration_secs
+                }
+            });
+            let pos = pb.map_or(0.0, |pb| pb.position_secs.clamp(0.0, total.max(0.0)));
+            let dur = format!("{}/{}", fmt_dur(pos), fmt_dur(total));
+            let glyph = if pb.is_some_and(|pb| pb.playing) {
+                g.pause
+            } else {
+                g.play
+            };
             if w < 4 {
                 b.push(
                     AnchorPart::Attachment {
                         index: idx,
                         permille: 0,
                     },
-                    vec![Seg::new(format!("[{} 0:00/{dur}]", g.play), Sem::Tag)],
+                    vec![Seg::new(format!("[{glyph} {dur}]"), Sem::Tag)],
                 );
             } else {
                 let wave = crate::meters::waveform(&vm.waveform, w, p.ctx.charset);
+                let frac = if total > 0.0 {
+                    (pos / total).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let played = ((w as f32) * frac).floor() as usize;
+                let split = wave
+                    .char_indices()
+                    .nth(played)
+                    .map_or(wave.len(), |(i, _)| i);
                 b.push(
                     AnchorPart::Attachment {
                         index: idx,
                         permille: 0,
                     },
                     vec![
-                        Seg::new(format!("{} ", g.play), Sem::Accent),
-                        Seg::new(wave, Sem::Wave(false)),
-                        Seg::new(format!(" 0:00/{dur}"), Sem::Dim),
+                        Seg::new(format!("{glyph} "), Sem::Accent),
+                        Seg::new(wave[..split].to_string(), Sem::Wave(true)),
+                        Seg::new(wave[split..].to_string(), Sem::Wave(false)),
+                        Seg::new(format!(" {dur}"), Sem::Dim),
                     ],
                 );
             }
