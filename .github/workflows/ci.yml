@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  secret-firewall:
+    name: Secret Firewall (Full History)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Scan entire git history for secrets
+        run: ./scripts/secret-scan.sh --all-commits
+
+  build-and-test:
+    name: Clippy, Workspace Tests & Release Smoke
+    runs-on: ubuntu-24.04
+    needs: [secret-firewall]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install native audio, Opus, and GStreamer WebRTC dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            cmake \
+            libclang-dev \
+            libopus-dev \
+            libasound2-dev \
+            libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev \
+            libgstreamer-plugins-bad1.0-dev \
+            gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad \
+            gstreamer1.0-plugins-ugly \
+            gstreamer1.0-libav
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy (strict -D warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Workspace Unit & Integration Tests
+        run: cargo test --workspace
+
+      - name: Release Build
+        run: cargo build --release -p bbscord
+
+      - name: Binary CLI & Headless Smoke E2E
+        run: |
+          ./target/release/bbscord --version
+          ./target/release/bbscord --help
+          ./target/release/bbscord --headless-smoke

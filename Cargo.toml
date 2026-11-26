@@ -44,6 +44,7 @@ fuzzy-matcher = "0.3"
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 dirs = "6"
+qrcode = { version = "0.14", default-features = false }
 unicode-width = "0.2"
 unicode-segmentation = "1.12"
 

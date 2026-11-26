@@ -674,6 +674,8 @@ name = "bbscord"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "base64",
  "bbs-core",
  "bbs-protocol",
  "bbs-runtime-term",
@@ -681,9 +683,18 @@ dependencies = [
  "bbs-video",
  "bbs-voice",
  "clap",
+ "crossterm",
+ "dirs",
+ "futures",
+ "qrcode",
+ "ratatui",
+ "serde",
+ "serde_json",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]
@@ -4742,6 +4753,12 @@ checksum = "7f6d64c71eb498fe9eae14ce4ec935c555749aef511cca85b5568910d6e48001"
 dependencies = [
  "bytemuck",
 ]
+
+[[package]]
+name = "qrcode"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
 
 [[package]]
 name = "quantette"
