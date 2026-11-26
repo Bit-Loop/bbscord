@@ -10,8 +10,23 @@ description = "Discord REST, Gateway, GIF provider, and CDN protocol implementat
 [dependencies]
 bbs-core.workspace = true
 async-trait.workspace = true
-tokio.workspace = true
+base64.workspace = true
+futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 tracing.workspace = true
+zeroize.workspace = true
+wreq = { workspace = true, features = ["cookies", "websocket"] }
+tokio-tungstenite.workspace = true
+boring2 = "4.15"
+bytes = "1"
+flate2 = "1.1"
+http = "1"
+percent-encoding = "2.3"
+rand = "0.9"
+rsa = { version = "0.9", features = ["sha2"] }
+sha2 = "0.10"
+url = "2.5"
+uuid = { version = "1", features = ["v4"] }
