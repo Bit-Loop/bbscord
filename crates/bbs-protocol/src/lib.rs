@@ -35,5 +35,6 @@ pub use remote_auth::{
 };
 pub use rest::{
     DISCORD_API_BASE_URL, DiscordRestClient, RateLimitConfig, RateLimiter, TokenValidationCheck,
-    UploadAttachment, encode_reaction_emoji, validate_discord_token,
+    UploadAttachment, encode_reaction_emoji, is_discord_cdn_url, preserve_cdn_resize_params,
+    validate_discord_token,
 };

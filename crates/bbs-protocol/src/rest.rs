@@ -17,6 +17,7 @@ use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, broadcast};
 use tracing::{debug, warn};
+use url::Url;
 use wreq::multipart::{Form, Part};
 
 use crate::fingerprint::DiscordFingerprint;
@@ -51,6 +52,81 @@ const REACTION_EMOJI_ENCODE_SET: &AsciiSet = &CONTROLS
 pub fn encode_reaction_emoji(emoji: &str) -> String {
     let trimmed = emoji.trim().trim_matches(':');
     utf8_percent_encode(trimmed, REACTION_EMOJI_ENCODE_SET).to_string()
+}
+
+/// Returns `true` if `raw_url` points to a Discord-controlled CDN / media proxy host that
+/// supports `POST /api/v10/attachments/refresh-urls` (`cdn.discordapp.com`,
+/// `media.discordapp.net`, or `images-ext-<N>.discordapp.net`).
+#[must_use]
+pub fn is_discord_cdn_url(raw_url: &str) -> bool {
+    let Ok(parsed) = Url::parse(raw_url.trim()) else {
+        return false;
+    };
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return false;
+    }
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    let lower = host.to_ascii_lowercase();
+    lower == "cdn.discordapp.com"
+        || lower == "media.discordapp.net"
+        || lower
+            .strip_prefix("images-ext-")
+            .and_then(|rest| rest.strip_suffix(".discordapp.net"))
+            .is_some_and(|num| !num.is_empty() && num.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Re-apply any `width`, `height`, `format`, and `animated` media-proxy resize parameters from
+/// `original_url` onto `refreshed_url`, preserving all fresh signed CDN parameters (`ex`, `is`, `hm`).
+#[must_use]
+pub fn preserve_cdn_resize_params(original_url: &str, refreshed_url: &str) -> String {
+    let Ok(orig) = Url::parse(original_url.trim()) else {
+        return refreshed_url.to_owned();
+    };
+    let mut resize_params: Vec<(String, String)> = Vec::new();
+    for (k, v) in orig.query_pairs() {
+        let lower = k.to_ascii_lowercase();
+        if matches!(lower.as_str(), "width" | "height" | "format" | "animated")
+            && !v.is_empty()
+            && !resize_params.iter().any(|(ek, _)| ek == &lower)
+        {
+            resize_params.push((lower, v.into_owned()));
+        }
+    }
+    if resize_params.is_empty() {
+        return refreshed_url.to_owned();
+    }
+
+    let Ok(mut refreshed) = Url::parse(refreshed_url.trim()) else {
+        return refreshed_url.to_owned();
+    };
+    let existing: Vec<(String, String)> = refreshed
+        .query_pairs()
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    {
+        let mut qp = refreshed.query_pairs_mut();
+        qp.clear();
+        let mut applied: Vec<String> = Vec::new();
+        for (k, v) in existing {
+            let lower = k.to_ascii_lowercase();
+            if let Some((_, new_val)) = resize_params.iter().find(|(rk, _)| rk == &lower) {
+                if !applied.contains(&lower) {
+                    qp.append_pair(&lower, new_val);
+                    applied.push(lower);
+                }
+            } else {
+                qp.append_pair(&k, &v);
+            }
+        }
+        for (rk, rv) in resize_params {
+            if !applied.contains(&rk) {
+                qp.append_pair(&rk, &rv);
+            }
+        }
+    }
+    refreshed.to_string()
 }
 
 /// Binary file or GIF payload prepared for multipart upload on `POST /channels/{id}/messages`.
@@ -373,8 +449,30 @@ impl DiscordRestClient {
         reply_to: Option<Snowflake>,
         attachments: &[UploadAttachment],
     ) -> CoreResult<Message> {
+        self.send_message_with_attachments_and_mention(
+            channel_id,
+            content,
+            reply_to,
+            true,
+            attachments,
+        )
+        .await
+    }
+
+    /// Send a message with optional local file or GIF attachments via Discord v10 multipart upload,
+    /// controlling whether replying pings the replied-to author (`allowed_mentions.replied_user`).
+    pub async fn send_message_with_attachments_and_mention(
+        &self,
+        channel_id: Snowflake,
+        content: &str,
+        reply_to: Option<Snowflake>,
+        mention_replied_user: bool,
+        attachments: &[UploadAttachment],
+    ) -> CoreResult<Message> {
         if attachments.is_empty() {
-            return self.send_message(channel_id, content, reply_to).await;
+            return self
+                .send_message_with_mention(channel_id, content, reply_to, mention_replied_user)
+                .await;
         }
 
         let nonce = generate_message_nonce();
@@ -397,6 +495,7 @@ impl DiscordRestClient {
                 message_id,
                 fail_if_not_exists: false,
             }),
+            allowed_mentions: reply_to.map(|_| OutboundAllowedMentions::for_reply(mention_replied_user)),
             attachments: Some(&attachment_meta),
         };
 
@@ -423,9 +522,30 @@ impl DiscordRestClient {
         Ok(msg)
     }
 
+    fn should_refresh_cdn_url(&self, raw_url: &str) -> bool {
+        if is_discord_cdn_url(raw_url) {
+            return true;
+        }
+        // Allow local loopback test harnesses that override `api_base_url` to exercise
+        // `/attachments/refresh-urls` against their own `/cdn/...` routes without calling
+        // refresh for unrelated third-party URLs.
+        if self.api_base_url != DISCORD_API_BASE_URL
+            && let (Ok(api), Ok(target)) = (Url::parse(&self.api_base_url), Url::parse(raw_url.trim()))
+            && matches!(api.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"))
+            && api.host_str() == target.host_str()
+            && api.port_or_known_default() == target.port_or_known_default()
+            && (target.path().starts_with("/cdn/")
+                || target.query_pairs().any(|(k, _)| k == "ex"))
+        {
+            return true;
+        }
+        false
+    }
+
     /// Download attachment bytes from a signed Discord CDN URL, automatically refreshing expired
-    /// URLs via `POST /attachments/refresh-urls` on any non-200 HTTP response (matching
-    /// `discordo/internal/ui/chat/messageslist/attachments.go:170-196`).
+    /// URLs via `POST /attachments/refresh-urls` ONLY for Discord CDN hosts (`cdn.discordapp.com`,
+    /// `media.discordapp.net`, `images-ext-*.discordapp.net`) and preserving any resize query
+    /// parameters (`width`, `height`, `format`, `animated`) onto the refreshed URL.
     pub async fn fetch_attachment_bytes(
         &self,
         url: &str,
@@ -445,13 +565,24 @@ impl DiscordRestClient {
             return Ok((bytes.to_vec(), None));
         }
 
-        debug!(
-            status = initial_resp.status().as_u16(),
-            "CDN attachment fetch returned non-200; refreshing signed URL"
-        );
+        let initial_status = initial_resp.status();
         drop(initial_resp);
 
-        let refreshed = self.refresh_attachment_url(url).await?;
+        if !self.should_refresh_cdn_url(url) {
+            return Err(CoreError::Media(format!(
+                "attachment fetch failed with HTTP {} (non-Discord host)",
+                initial_status.as_u16()
+            )));
+        }
+
+        debug!(
+            status = initial_status.as_u16(),
+            "Discord CDN attachment fetch returned non-200; refreshing signed URL"
+        );
+
+        let mut refreshed = self.refresh_attachment_url(url).await?;
+        refreshed.refreshed_url = preserve_cdn_resize_params(url, &refreshed.refreshed_url);
+
         let retry_resp = self
             .cdn_client
             .get(&refreshed.refreshed_url)
@@ -702,6 +833,26 @@ struct MultipartAttachmentMeta<'a> {
 }
 
 #[derive(Debug, Serialize)]
+struct OutboundAllowedMentions {
+    parse: &'static [&'static str],
+    replied_user: bool,
+}
+
+impl OutboundAllowedMentions {
+    const fn for_reply(replied_user: bool) -> Self {
+        Self {
+            parse: &["users", "roles", "everyone"],
+            replied_user,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct AckMessagePayload {
+    token: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
 struct CreateMessagePayload<'a> {
     content: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -710,6 +861,8 @@ struct CreateMessagePayload<'a> {
     flags: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     message_reference: Option<OutboundMessageReference>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    allowed_mentions: Option<OutboundAllowedMentions>,
     #[serde(skip_serializing_if = "Option::is_none")]
     attachments: Option<&'a [MultipartAttachmentMeta<'a>]>,
 }
@@ -865,6 +1018,17 @@ impl DiscordBackend for DiscordRestClient {
         content: &str,
         reply_to: Option<Snowflake>,
     ) -> CoreResult<Message> {
+        self.send_message_with_mention(channel_id, content, reply_to, true)
+            .await
+    }
+
+    async fn send_message_with_mention(
+        &self,
+        channel_id: Snowflake,
+        content: &str,
+        reply_to: Option<Snowflake>,
+        mention_replied_user: bool,
+    ) -> CoreResult<Message> {
         let nonce = generate_message_nonce();
         let payload = CreateMessagePayload {
             content,
@@ -875,6 +1039,7 @@ impl DiscordBackend for DiscordRestClient {
                 message_id,
                 fail_if_not_exists: false,
             }),
+            allowed_mentions: reply_to.map(|_| OutboundAllowedMentions::for_reply(mention_replied_user)),
             attachments: None,
         };
         let path = format!("/channels/{channel_id}/messages");
@@ -885,6 +1050,20 @@ impl DiscordBackend for DiscordRestClient {
         let msg = Message::from(wire);
         let _ = self.events_tx.send(BackendEvent::MessageCreated(msg.clone()));
         Ok(msg)
+    }
+
+    async fn ack_message(&self, channel_id: Snowflake, message_id: Snowflake) -> CoreResult<()> {
+        let payload = AckMessagePayload { token: None };
+        let path = format!("/channels/{channel_id}/messages/{message_id}/ack");
+        let route_key = format!("POST /channels/{channel_id}/messages/ack");
+        self.execute_no_content(Method::POST, &path, &route_key, RequestBody::json(&payload)?)
+            .await?;
+        let _ = self.events_tx.send(BackendEvent::MessageAcked {
+            channel_id,
+            last_message_id: message_id,
+            mention_count: 0,
+        });
+        Ok(())
     }
 
     async fn edit_message(

@@ -29,7 +29,7 @@ use bbs_protocol::gifs::{
 use bbs_protocol::remote_auth::{RemoteAuthClient, RemoteAuthEvent};
 use bbs_protocol::{
     DiscordFingerprint, DiscordRestClient, FingerprintConfig, RateLimitConfig, UploadAttachment,
-    encode_reaction_emoji,
+    encode_reaction_emoji, is_discord_cdn_url, preserve_cdn_resize_params,
 };
 use flate2::{Compress, Compression, FlushCompress};
 use futures::{SinkExt, StreamExt};
@@ -1422,8 +1422,17 @@ async fn gif_providers_parse_discord_klipy_giphy_direct_and_redact_keys() {
     let dp = parse_discord_gifs_response(discord_arr).expect("discord array");
     assert_eq!(dp.items.len(), 1);
     assert_eq!(dp.items[0].provider, GifProviderKind::DiscordProxy);
-    assert_eq!(dp.items[0].gif_url, "https://media.tenor.com/1.gif");
+    assert_eq!(dp.items[0].gif_url, "https://tenor.com/view/1");
     assert_eq!(dp.items[0].preview_url, "https://media.tenor.com/1-prev.png");
+
+    // Preview selection must skip `.webm` / `.mp4` and fall through to decodable `.webp` / `.gif`.
+    let klipy_discord_arr = br#"[{"id":"k1","title":"Klipy Wave","url":"https://klipy.com/gifs/wave","src":"https://static.klipy.com/wave.webm","gif_src":"https://static.klipy.com/wave.webp","preview":"https://static.klipy.com/wave-prev.webm","width":320,"height":240}]"#;
+    let dp_klipy = parse_discord_gifs_response(klipy_discord_arr).expect("klipy discord array");
+    assert_eq!(dp_klipy.items[0].gif_url, "https://klipy.com/gifs/wave");
+    assert_eq!(
+        dp_klipy.items[0].preview_url,
+        "https://static.klipy.com/wave.webp"
+    );
 
     let klipy_json = br#"{
         "result": true,
@@ -1480,9 +1489,27 @@ async fn gif_providers_parse_discord_klipy_giphy_direct_and_redact_keys() {
 
     let (base_url, server) = spawn_mock_http_server(move |req| match (req.method.as_str(), req.target.as_str()) {
         ("GET", t) if t.starts_with("/api/v10/gifs/search") => {
+            assert!(
+                t.contains("media_format=webp"),
+                "expected media_format=webp in {t}"
+            );
+            assert!(t.contains("limit=20"), "expected limit clamped to 20 in {t}");
+            assert!(
+                !t.contains("provider=tenor"),
+                "legacy provider=tenor must be omitted in {t}"
+            );
             MockHttpResponse::bytes(200, "application/json", discord_wire.clone())
         }
-        ("GET", t) if t.starts_with("/api/v10/gifs/trending") => {
+        ("GET", t) if t.starts_with("/api/v10/gifs/trending-gifs") => {
+            assert!(
+                t.contains("media_format=webp"),
+                "expected media_format=webp in {t}"
+            );
+            assert!(t.contains("limit=20"), "expected limit clamped to 20 in {t}");
+            assert!(
+                !t.contains("provider=tenor"),
+                "legacy provider=tenor must be omitted in {t}"
+            );
             MockHttpResponse::bytes(500, "application/json", b"{}".to_vec())
         }
         ("GET", t) if t.starts_with("/klipy/offline-test-klipy-key/gifs/") => {
@@ -1572,4 +1599,693 @@ async fn gif_providers_parse_discord_klipy_giphy_direct_and_redact_keys() {
     assert!(!err.to_string().contains("sentinel-ram-secret-never-log"));
 
     server.abort();
+}
+
+#[tokio::test]
+async fn discord_gif_provider_handles_429_retry_after_and_hard_rate_limit() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_handler = Arc::clone(&attempts);
+
+    let (base_url, server) = spawn_mock_http_server(move |req| {
+        if req.target.starts_with("/api/v10/gifs/trending-gifs") {
+            let n = attempts_handler.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                return MockHttpResponse::json(
+                    429,
+                    r#"{"message":"You are being rate limited.","retry_after":0.02,"global":false}"#,
+                );
+            }
+            return MockHttpResponse::json(
+                200,
+                r#"[{"id":"t1","title":"Trending OK","url":"https://klipy.com/gifs/t1","src":"https://static.klipy.com/t1.webp","gif_src":"https://static.klipy.com/t1.webp","preview":"https://static.klipy.com/t1.webp","width":200,"height":150}]"#,
+            );
+        }
+        if req.target.starts_with("/api/v10/gifs/search") {
+            return MockHttpResponse::json(
+                429,
+                r#"{"message":"Slow down","retry_after":30.0,"global":false}"#,
+            );
+        }
+        MockHttpResponse::json(404, r#"{"message":"not found"}"#)
+    })
+    .await;
+
+    let provider = DiscordGifProvider::new(
+        SecretToken::new("offline-test-session-cred").expect("tok"),
+        &test_fingerprint(),
+    )
+    .expect("gif provider")
+    .with_api_base_url(format!("{base_url}/api/v10"));
+
+    // Short 429 retry_after retries cleanly and returns trending results.
+    let page = provider.trending(20, None).await.expect("retry succeeded");
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].gif_url, "https://klipy.com/gifs/t1");
+
+    // Long 429 retry_after surfaces CoreError::RateLimited immediately without hanging.
+    let err = provider
+        .search(&GifSearchQuery {
+            query: "rate".to_owned(),
+            limit: 20,
+            cursor: None,
+            trending: false,
+            locale: Some("en-US".to_owned()),
+        })
+        .await
+        .expect_err("long 429 must return RateLimited");
+    assert!(
+        matches!(err, CoreError::RateLimited { retry_after_ms } if retry_after_ms >= 29_000),
+        "unexpected error: {err:?}"
+    );
+
+    server.abort();
+}
+
+// ============================================================================
+// 6. REST Ack, Allowed Mentions, CDN Host Guard & Resize Preservation
+// ============================================================================
+
+#[tokio::test]
+async fn rest_ack_message_allowed_mentions_and_cdn_host_guard() {
+    // Pure host-guard checks
+    assert!(is_discord_cdn_url(
+        "https://cdn.discordapp.com/attachments/1/2/a.png?ex=1"
+    ));
+    assert!(is_discord_cdn_url(
+        "https://media.discordapp.net/attachments/1/2/a.png?width=320&height=240"
+    ));
+    assert!(is_discord_cdn_url(
+        "https://images-ext-1.discordapp.net/external/h/https/example.invalid/a.gif"
+    ));
+    assert!(!is_discord_cdn_url("https://static.klipy.com/demo.webp"));
+    assert!(!is_discord_cdn_url("https://tenor.com/view/demo"));
+    assert!(!is_discord_cdn_url(
+        "https://images-ext-evil.discordapp.net/a.png"
+    ));
+
+    // Resize query param preservation across CDN refresh
+    let orig = "https://media.discordapp.net/attachments/1/2/anim.gif?ex=old&is=old&hm=old&width=320&height=240&format=webp&animated=true";
+    let fresh = "https://media.discordapp.net/attachments/1/2/anim.gif?ex=new&is=new&hm=new";
+    let merged = preserve_cdn_resize_params(orig, fresh);
+    assert!(merged.contains("ex=new&is=new&hm=new"), "{merged}");
+    assert!(merged.contains("width=320"), "{merged}");
+    assert!(merged.contains("height=240"), "{merged}");
+    assert!(merged.contains("format=webp"), "{merged}");
+    assert!(merged.contains("animated=true"), "{merged}");
+
+    let captured = Arc::new(Mutex::new(Vec::<CapturedHttpRequest>::new()));
+    let captured_handler = Arc::clone(&captured);
+    let refresh_hits = Arc::new(AtomicUsize::new(0));
+    let refresh_hits_handler = Arc::clone(&refresh_hits);
+    let base_holder: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+    let base_for_handler = Arc::clone(&base_holder);
+
+    let (base_url, server) = spawn_mock_http_server(move |req| {
+        if let Ok(mut list) = captured_handler.try_lock() {
+            list.push(req.clone());
+        }
+        let base = base_for_handler
+            .try_lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        match (req.method.as_str(), req.target.as_str()) {
+            ("POST", "/api/v10/channels/700/messages/900/ack") => {
+                let body: serde_json::Value =
+                    serde_json::from_slice(&req.body).expect("ack json");
+                assert!(body.get("token").is_some_and(serde_json::Value::is_null));
+                MockHttpResponse::json(200, r#"{"token":null}"#)
+            }
+            ("POST", "/api/v10/channels/700/messages") => MockHttpResponse::json(
+                200,
+                r#"{
+                    "id":"901",
+                    "channel_id":"700",
+                    "author":{"id":"10","username":"sysop"},
+                    "content":"silent reply",
+                    "timestamp":"2026-11-26T00:00:00Z"
+                }"#,
+            ),
+            ("GET", t) if t.starts_with("/cdn/expired.gif?ex=00000001") => {
+                MockHttpResponse::bytes(404, "text/plain", b"expired".to_vec())
+            }
+            ("POST", "/api/v10/attachments/refresh-urls") => {
+                refresh_hits_handler.fetch_add(1, Ordering::SeqCst);
+                let parsed: serde_json::Value =
+                    serde_json::from_slice(&req.body).expect("refresh json");
+                let original = parsed["attachment_urls"][0].as_str().unwrap_or("");
+                let refreshed = format!("{base}/cdn/fresh.gif?ex=70001234&hm=abcd");
+                MockHttpResponse::json(
+                    200,
+                    serde_json::json!({
+                        "refreshed_urls": [{
+                            "original": original,
+                            "refreshed": refreshed
+                        }]
+                    })
+                    .to_string(),
+                )
+            }
+            ("GET", t) if t.starts_with("/cdn/fresh.gif?") => {
+                assert!(t.contains("ex=70001234"), "{t}");
+                assert!(t.contains("width=256"), "{t}");
+                assert!(t.contains("height=192"), "{t}");
+                assert!(t.contains("format=webp"), "{t}");
+                assert!(t.contains("animated=true"), "{t}");
+                MockHttpResponse::bytes(200, "image/webp", b"RIFF....WEBP".to_vec())
+            }
+            ("GET", "/third-party/missing.webp") => {
+                MockHttpResponse::bytes(404, "text/plain", b"not found".to_vec())
+            }
+            _ => MockHttpResponse::json(404, r#"{"message":"not found"}"#),
+        }
+    })
+    .await;
+
+    *base_holder.lock().await = base_url.clone();
+
+    let client = DiscordRestClient::new(
+        SecretToken::new("offline-test-session-cred").expect("tok"),
+        test_fingerprint(),
+    )
+    .expect("client")
+    .with_api_base_url(format!("{base_url}/api/v10"));
+    let mut rx = client.subscribe_events();
+
+    // 1. ack_message posts {"token": null} and emits MessageAcked.
+    client
+        .ack_message(Snowflake(700), Snowflake(900))
+        .await
+        .expect("ack");
+    let ack_ev = rx.recv().await.expect("ack ev");
+    assert!(matches!(
+        ack_ev,
+        BackendEvent::MessageAcked {
+            channel_id: Snowflake(700),
+            last_message_id: Snowflake(900),
+            mention_count: 0,
+        }
+    ));
+
+    // 2. send_message_with_mention(false) sets allowed_mentions.replied_user = false.
+    let _ = client
+        .send_message_with_mention(Snowflake(700), "silent reply", Some(Snowflake(900)), false)
+        .await
+        .expect("silent reply");
+
+    // 3. Multipart upload with mention_replied_user = false also serializes allowed_mentions.
+    let _ = client
+        .send_message_with_attachments_and_mention(
+            Snowflake(700),
+            "silent pic",
+            Some(Snowflake(900)),
+            false,
+            &[UploadAttachment {
+                filename: "pic.png".to_owned(),
+                content_type: Some("image/png".to_owned()),
+                description: None,
+                bytes: b"PNG".to_vec(),
+            }],
+        )
+        .await
+        .expect("multipart silent reply");
+
+    // 4. Non-Discord host 404 MUST NOT call /attachments/refresh-urls.
+    let third_party_url = format!("{base_url}/third-party/missing.webp");
+    let err = client
+        .fetch_attachment_bytes(&third_party_url)
+        .await
+        .expect_err("third-party 404 must fail directly");
+    assert!(matches!(err, CoreError::Media(_)), "{err:?}");
+    assert_eq!(refresh_hits.load(Ordering::SeqCst), 0);
+
+    // 5. Expired CDN URL refreshes AND preserves width/height/format/animated params.
+    let expired_resized =
+        format!("{base_url}/cdn/expired.gif?ex=00000001&width=256&height=192&format=webp&animated=true");
+    let (bytes, refreshed) = client
+        .fetch_attachment_bytes(&expired_resized)
+        .await
+        .expect("resized refresh");
+    assert_eq!(bytes, b"RIFF....WEBP");
+    assert_eq!(refresh_hits.load(Ordering::SeqCst), 1);
+    let refreshed = refreshed.expect("refreshed info");
+    assert!(refreshed.refreshed_url.contains("width=256"));
+    assert!(refreshed.refreshed_url.contains("format=webp"));
+    assert!(refreshed.refreshed_url.contains("animated=true"));
+
+    // Verify captured JSON + multipart bodies carried allowed_mentions.replied_user = false.
+    let reqs = captured.lock().await;
+    let msg_reqs: Vec<&CapturedHttpRequest> = reqs
+        .iter()
+        .filter(|r| r.method == "POST" && r.target == "/api/v10/channels/700/messages")
+        .collect();
+    assert_eq!(msg_reqs.len(), 2);
+    let json_body: serde_json::Value =
+        serde_json::from_slice(&msg_reqs[0].body).expect("json reply");
+    assert_eq!(json_body["allowed_mentions"]["replied_user"], false);
+    assert_eq!(
+        json_body["allowed_mentions"]["parse"],
+        serde_json::json!(["users", "roles", "everyone"])
+    );
+    let multipart_body = String::from_utf8_lossy(&msg_reqs[1].body);
+    assert!(multipart_body.contains("\"replied_user\":false"));
+
+    server.abort();
+}
+
+// ============================================================================
+// 7. Gateway Roles, Mute Settings, Ack, Partial MESSAGE_UPDATE, Voice Roster & Scoped Calls
+// ============================================================================
+
+#[test]
+fn gateway_roles_mute_settings_ack_partial_patch_voice_roster_and_scoped_calls() {
+    let mut state = GatewaySessionState::default();
+
+    // 1. READY with roles, members, versioned user_guild_settings (muted guild, muted channel,
+    //    muted category), read_state (> comparison), and initial voice states.
+    let ready_frame = serde_json::json!({
+        "op": 0,
+        "s": 1,
+        "t": "READY",
+        "d": {
+            "session_id": "sess-roles-1",
+            "user": {"id": "1001", "username": "sysop"},
+            "users": [
+                {"id": "1002", "username": "alice", "global_name": "Alice"},
+                {"id": "1003", "username": "bob", "global_name": "Bob"}
+            ],
+            "read_state": {
+                "version": 1,
+                "entries": [
+                    {"id": "3001", "last_message_id": "5000", "mention_count": 0},
+                    {"id": "3003", "last_message_id": "5000", "mention_count": 0},
+                    {"id": "3011", "last_message_id": "5000", "mention_count": 0},
+                    {"id": "3012", "last_message_id": "6000", "mention_count": 0}
+                ]
+            },
+            "user_guild_settings": {
+                "version": 2,
+                "entries": [
+                    {
+                        "guild_id": "2001",
+                        "muted": false,
+                        "suppress_everyone": true,
+                        "suppress_roles": false,
+                        "channel_overrides": [
+                            {"channel_id": "3003", "muted": true},
+                            {"channel_id": "3010", "muted": true}
+                        ]
+                    },
+                    {
+                        "guild_id": "2002",
+                        "muted": true,
+                        "suppress_everyone": true,
+                        "suppress_roles": true,
+                        "channel_overrides": []
+                    }
+                ]
+            },
+            "private_channels": [
+                {"id": "4001", "type": 3, "name": "Ops Call", "recipient_ids": ["1002", "1003"]},
+                {"id": "4002", "type": 1, "recipient_ids": ["1002"]}
+            ],
+            "guilds": [
+                {
+                    "id": "2001",
+                    "properties": {"name": "RetroNet"},
+                    "roles": [
+                        {"id": "801", "name": "SysOp", "color": 3718648, "position": 20, "hoist": true},
+                        {"id": "802", "name": "Member", "color": 5306995, "position": 5, "hoist": false}
+                    ],
+                    "members": [
+                        {"user": {"id": "1002", "username": "alice"}, "nick": "Modem Wiz", "roles": ["801"]}
+                    ],
+                    "channels": [
+                        {"id": "3001", "type": 0, "name": "general", "position": 0, "last_message_id": "5500"},
+                        {"id": "3002", "type": 2, "name": "Lounge", "position": 1, "last_message_id": "9999"},
+                        {"id": "3003", "type": 0, "name": "muted-logs", "position": 2, "last_message_id": "5500"},
+                        {"id": "3010", "type": 4, "name": "MUTED CAT", "position": 3},
+                        {"id": "3011", "type": 0, "name": "under-muted-cat", "parent_id": "3010", "position": 4, "last_message_id": "5500"},
+                        {"id": "3012", "type": 0, "name": "deleted-tail", "position": 5, "last_message_id": "5900"}
+                    ],
+                    "voice_states": [
+                        {"guild_id": "2001", "channel_id": "3002", "user_id": "1002", "session_id": "v1", "self_mute": false, "self_deaf": false}
+                    ]
+                },
+                {
+                    "id": "2002",
+                    "properties": {"name": "Muted Guild"},
+                    "channels": [
+                        {"id": "3201", "type": 0, "name": "noise", "position": 0, "last_message_id": "7000"}
+                    ]
+                }
+            ]
+        }
+    });
+    let ready_out = state
+        .handle_raw_frame(ready_frame.to_string().as_bytes())
+        .expect("ready");
+
+    // NEVER emit VoiceStatusUpdated from gateway!
+    assert!(
+        !ready_out
+            .events
+            .iter()
+            .any(|e| matches!(e, BackendEvent::VoiceStatusUpdated(_)))
+    );
+
+    let ready_ev = ready_out
+        .events
+        .iter()
+        .find_map(|e| match e {
+            BackendEvent::Ready { guilds, .. } => Some(guilds),
+            _ => None,
+        })
+        .expect("Ready event");
+    assert_eq!(ready_ev[0].roles.len(), 2);
+    assert_eq!(ready_ev[0].highest_role_color(&[Snowflake(801)]), Some(3718648));
+    assert!(!ready_ev[0].muted);
+    assert!(ready_ev[0].suppress_everyone);
+    assert!(ready_ev[0].unread);
+    assert!(ready_ev[1].muted);
+    assert!(!ready_ev[1].unread, "muted guild must not mark unread");
+
+    let g1_channels = ready_out
+        .events
+        .iter()
+        .find_map(|e| match e {
+            BackendEvent::ChannelsLoaded {
+                guild_id: Some(Snowflake(2001)),
+                channels,
+            } => Some(channels),
+            _ => None,
+        })
+        .expect("guild 2001 channels");
+    let ch = |id: u64| g1_channels.iter().find(|c| c.id == Snowflake(id)).unwrap();
+    assert_eq!(ch(3001).unread_count, 1);
+    assert_eq!(ch(3001).last_ack_message_id, Some(Snowflake(5000)));
+    assert_eq!(ch(3002).unread_count, 0, "voice channels must not be unread");
+    assert!(ch(3003).muted);
+    assert!(ch(3011).muted, "child of muted category must inherit muted");
+    assert_eq!(
+        ch(3012).unread_count,
+        0,
+        "last_message_id < ack_id (deleted tail) must not mark unread"
+    );
+
+    // READY must emit VoiceRosterUpdated, GuildSettingsUpdated, and GuildMembersUpdated.
+    assert!(ready_out.events.iter().any(|e| matches!(
+        e,
+        BackendEvent::VoiceRosterUpdated {
+            guild_id: Some(Snowflake(2001)),
+            channel_id: Snowflake(3002),
+            participants,
+        } if participants.len() == 1 && participants[0].user_id == Snowflake(1002)
+    )));
+    assert!(ready_out.events.iter().any(|e| matches!(
+        e,
+        BackendEvent::GuildSettingsUpdated {
+            guild_id: Some(Snowflake(2001)),
+            suppress_everyone: true,
+            ..
+        }
+    )));
+    assert!(ready_out.events.iter().any(|e| matches!(
+        e,
+        BackendEvent::GuildMembersUpdated {
+            guild_id: Snowflake(2001),
+            members,
+        } if members.len() == 1 && members[0].nick.as_deref() == Some("Modem Wiz")
+    )));
+
+    // 2. READY_SUPPLEMENTAL emits VoiceRosterUpdated (never VoiceStatusUpdated).
+    let supp_frame = serde_json::json!({
+        "op": 0, "s": 2, "t": "READY_SUPPLEMENTAL",
+        "d": {
+            "guilds": [{
+                "id": "2001",
+                "voice_states": [
+                    {"guild_id": "2001", "channel_id": "3002", "user_id": "1003", "session_id": "v2", "self_mute": true}
+                ]
+            }]
+        }
+    });
+    let supp_out = state
+        .handle_raw_frame(supp_frame.to_string().as_bytes())
+        .expect("supp");
+    assert!(
+        !supp_out
+            .events
+            .iter()
+            .any(|e| matches!(e, BackendEvent::VoiceStatusUpdated(_)))
+    );
+    assert!(supp_out.events.iter().any(|e| matches!(
+        e,
+        BackendEvent::VoiceRosterUpdated {
+            channel_id: Snowflake(3002),
+            participants,
+            ..
+        } if participants.len() == 2
+    )));
+
+    // 3. VOICE_STATE_UPDATE move & leave update BOTH old and new channels via VoiceRosterUpdated.
+    let move_frame = serde_json::json!({
+        "op": 0, "s": 3, "t": "VOICE_STATE_UPDATE",
+        "d": {"guild_id": "2001", "channel_id": "3099", "user_id": "1003", "session_id": "v2", "self_mute": false}
+    });
+    let move_out = state
+        .handle_raw_frame(move_frame.to_string().as_bytes())
+        .expect("move");
+    assert!(
+        !move_out
+            .events
+            .iter()
+            .any(|e| matches!(e, BackendEvent::VoiceStatusUpdated(_)))
+    );
+    assert!(move_out.events.iter().any(|e| matches!(
+        e,
+        BackendEvent::VoiceRosterUpdated {
+            channel_id: Snowflake(3002),
+            participants,
+            ..
+        } if participants.len() == 1
+    )));
+    assert!(move_out.events.iter().any(|e| matches!(
+        e,
+        BackendEvent::VoiceRosterUpdated {
+            channel_id: Snowflake(3099),
+            participants,
+            ..
+        } if participants.len() == 1 && participants[0].user_id == Snowflake(1003)
+    )));
+
+    // 4. MESSAGE_CREATE with member nick/roles + mention_roles, then partial MESSAGE_UPDATE embed unfurl.
+    let msg_create = serde_json::json!({
+        "op": 0, "s": 4, "t": "MESSAGE_CREATE",
+        "d": {
+            "id": "7001", "channel_id": "3001", "guild_id": "2001",
+            "author": {"id": "1002", "username": "alice"},
+            "member": {"nick": "Modem Wiz", "roles": ["801"]},
+            "mention_roles": ["802"],
+            "content": "https://klipy.com/gifs/demo",
+            "timestamp": "2026-11-26T00:00:00Z"
+        }
+    });
+    let mc_out = state
+        .handle_raw_frame(msg_create.to_string().as_bytes())
+        .expect("msg create");
+    let mut cached_msg = mc_out
+        .events
+        .into_iter()
+        .find_map(|e| match e {
+            BackendEvent::MessageCreated(m) => Some(m),
+            _ => None,
+        })
+        .expect("MessageCreated");
+    assert_eq!(cached_msg.author_nick.as_deref(), Some("Modem Wiz"));
+    assert_eq!(cached_msg.author_role_ids, vec![Snowflake(801)]);
+    assert_eq!(cached_msg.mention_roles, vec![Snowflake(802)]);
+
+    let partial_unfurl = serde_json::json!({
+        "op": 0, "s": 5, "t": "MESSAGE_UPDATE",
+        "d": {
+            "id": "7001", "channel_id": "3001",
+            "embeds": [{"type": "gifv", "title": "Demo GIF", "thumbnail": {"url": "https://static.klipy.com/demo.webp"}}]
+        }
+    });
+    let patch_out = state
+        .handle_raw_frame(partial_unfurl.to_string().as_bytes())
+        .expect("partial update");
+    assert!(
+        !patch_out
+            .events
+            .iter()
+            .any(|e| matches!(e, BackendEvent::MessageUpdated(_)))
+    );
+    let patch = patch_out
+        .events
+        .into_iter()
+        .find_map(|e| match e {
+            BackendEvent::MessagePatched(p) => Some(p),
+            _ => None,
+        })
+        .expect("MessagePatched");
+    cached_msg.apply_patch(patch);
+    assert_eq!(cached_msg.author.username, "alice");
+    assert_eq!(cached_msg.content, "https://klipy.com/gifs/demo");
+    assert_eq!(cached_msg.embeds.len(), 1);
+
+    // 5. MESSAGE_ACK, USER_GUILD_SETTINGS_UPDATE, GUILD_ROLE_*, GUILD_MEMBER_UPDATE, GUILD_MEMBERS_CHUNK.
+    let ack_out = state
+        .handle_raw_frame(
+            br#"{"op":0,"s":6,"t":"MESSAGE_ACK","d":{"channel_id":"3001","message_id":"7001","mention_count":0}}"#,
+        )
+        .expect("ack");
+    assert!(matches!(
+        ack_out.events.as_slice(),
+        [BackendEvent::MessageAcked {
+            channel_id: Snowflake(3001),
+            last_message_id: Snowflake(7001),
+            mention_count: 0,
+        }]
+    ));
+
+    let settings_out = state
+        .handle_raw_frame(
+            br#"{"op":0,"s":7,"t":"USER_GUILD_SETTINGS_UPDATE","d":{"guild_id":"2001","muted":true,"suppress_everyone":true,"suppress_roles":true,"channel_overrides":[{"channel_id":"3001","muted":true}]}}"#,
+        )
+        .expect("settings update");
+    assert!(matches!(
+        settings_out.events.as_slice(),
+        [BackendEvent::GuildSettingsUpdated {
+            guild_id: Some(Snowflake(2001)),
+            muted: true,
+            suppress_everyone: true,
+            suppress_roles: true,
+            ..
+        }]
+    ));
+
+    let role_create = state
+        .handle_raw_frame(
+            br#"{"op":0,"s":8,"t":"GUILD_ROLE_CREATE","d":{"guild_id":"2001","role":{"id":"803","name":"VIP","color":16744192,"position":30,"hoist":true}}}"#,
+        )
+        .expect("role create");
+    assert!(matches!(
+        role_create.events.as_slice(),
+        [BackendEvent::GuildRolesUpdated { guild_id: Snowflake(2001), roles }] if roles.len() == 3
+    ));
+    let role_del = state
+        .handle_raw_frame(
+            br#"{"op":0,"s":9,"t":"GUILD_ROLE_DELETE","d":{"guild_id":"2001","role_id":"803"}}"#,
+        )
+        .expect("role delete");
+    assert!(matches!(
+        role_del.events.as_slice(),
+        [BackendEvent::GuildRolesUpdated { guild_id: Snowflake(2001), roles }] if roles.len() == 2
+    ));
+
+    let member_upd = state
+        .handle_raw_frame(
+            br#"{"op":0,"s":10,"t":"GUILD_MEMBER_UPDATE","d":{"guild_id":"2001","user":{"id":"1003","username":"bob"},"nick":"CRT Bob","roles":["802"]}}"#,
+        )
+        .expect("member update");
+    assert!(matches!(
+        member_upd.events.as_slice(),
+        [BackendEvent::GuildMembersUpdated { guild_id: Snowflake(2001), members }]
+            if members.len() == 1 && members[0].nick.as_deref() == Some("CRT Bob")
+    ));
+
+    let member_chunk = state
+        .handle_raw_frame(
+            br#"{"op":0,"s":11,"t":"GUILD_MEMBERS_CHUNK","d":{"guild_id":"2001","members":[{"user":{"id":"1004","username":"carol"},"nick":"ANSI","roles":["801","802"]}]}}"#,
+        )
+        .expect("member chunk");
+    assert!(matches!(
+        member_chunk.events.as_slice(),
+        [BackendEvent::GuildMembersUpdated { guild_id: Snowflake(2001), members }]
+            if members.len() == 1 && members[0].user_id == Snowflake(1004)
+    ));
+
+    // 6. Op 8 REQUEST_GUILD_MEMBERS serialization (query vs user_ids mutually exclusive).
+    let op8_query = serialize_gateway_command(&GatewayCommand::RequestGuildMembers {
+        guild_id: Snowflake(2001),
+        query: Some("ali".to_owned()),
+        user_ids: Vec::new(),
+        limit: 25,
+    })
+    .expect("op8 query")
+    .expect("some");
+    let v8q: serde_json::Value = serde_json::from_str(&op8_query).expect("json");
+    assert_eq!(v8q["op"], opcodes::REQUEST_GUILD_MEMBERS);
+    assert_eq!(v8q["d"]["query"], "ali");
+    assert!(v8q["d"].get("user_ids").is_none());
+
+    let op8_ids = serialize_gateway_command(&GatewayCommand::RequestGuildMembers {
+        guild_id: Snowflake(2001),
+        query: None,
+        user_ids: vec![Snowflake(1002)],
+        limit: 25,
+    })
+    .expect("op8 ids")
+    .expect("some");
+    let v8i: serde_json::Value = serde_json::from_str(&op8_ids).expect("json");
+    assert_eq!(v8i["op"], opcodes::REQUEST_GUILD_MEMBERS);
+    assert_eq!(v8i["d"]["user_ids"], serde_json::json!(["1002"]));
+    assert!(v8i["d"].get("query").is_none());
+
+    // 7. Channel-scoped CALL_CREATE / CALL_UPDATE / CALL_DELETE signaling & non-clobbering.
+    let call_create = state
+        .handle_raw_frame(
+            br#"{"op":0,"s":12,"t":"CALL_CREATE","d":{"channel_id":"4001","ringing":["1001"],"voice_states":[{"channel_id":"4001","user_id":"1002","session_id":"vs-call"}]}}"#,
+        )
+        .expect("call create");
+    assert!(call_create.signaling.iter().any(|s| matches!(
+        s,
+        GatewaySignalingEvent::CallCreate {
+            channel_id: Snowflake(4001),
+            is_group_dm: true,
+            ..
+        }
+    )));
+    assert!(call_create.events.iter().any(|e| matches!(
+        e,
+        BackendEvent::CallRingUpdated(CallRingState::IncomingRinging {
+            channel_id: Snowflake(4001),
+            ..
+        })
+    )));
+
+    // Unrelated CALL_DELETE for channel 4002 must NOT clear active call on 4001!
+    let unrelated_del = state
+        .handle_raw_frame(br#"{"op":0,"s":13,"t":"CALL_DELETE","d":{"channel_id":"4002"}}"#)
+        .expect("unrelated call delete");
+    assert!(unrelated_del.signaling.iter().any(|s| matches!(
+        s,
+        GatewaySignalingEvent::CallDelete {
+            channel_id: Snowflake(4002),
+        }
+    )));
+    assert!(
+        !unrelated_del
+            .events
+            .iter()
+            .any(|e| matches!(e, BackendEvent::CallRingUpdated(CallRingState::Idle))),
+        "CALL_DELETE for unrelated channel must not clear active call ring state"
+    );
+
+    // Matching CALL_DELETE for 4001 emits CallDelete signaling AND clears CallRingState::Idle.
+    let matching_del = state
+        .handle_raw_frame(br#"{"op":0,"s":14,"t":"CALL_DELETE","d":{"channel_id":"4001"}}"#)
+        .expect("matching call delete");
+    assert!(matching_del.signaling.iter().any(|s| matches!(
+        s,
+        GatewaySignalingEvent::CallDelete {
+            channel_id: Snowflake(4001),
+        }
+    )));
+    assert!(matching_del
+        .events
+        .iter()
+        .any(|e| matches!(e, BackendEvent::CallRingUpdated(CallRingState::Idle))));
 }
