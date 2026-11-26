@@ -6,7 +6,7 @@ use std::collections::{HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::io::Cursor;
 use std::num::NonZeroU16;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -22,11 +22,12 @@ use image::{AnimationDecoder, DynamicImage, ImageDecoder, ImageFormat, ImageRead
 use lru::LruCache;
 use ratatui::buffer::{Buffer, CellDiffOption};
 use ratatui::layout::{Position, Rect, Size};
+use ratatui::style::Color;
 use ratatui::widgets::Widget;
 use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::halfblocks::Halfblocks;
 use ratatui_image::protocol::iterm2::Iterm2;
-use ratatui_image::protocol::kitty::{Kitty, StatefulKitty};
+use ratatui_image::protocol::kitty::StatefulKitty;
 use ratatui_image::protocol::sixel::Sixel;
 use ratatui_image::protocol::{Protocol, StatefulProtocol, StatefulProtocolType};
 use ratatui_image::{FontSize, Image as RatatuiImageWidget};
@@ -742,6 +743,212 @@ fn zlib_compress_fast(raw: &[u8]) -> std::io::Result<Vec<u8>> {
     encoder.finish()
 }
 
+/// Kitty Unicode placeholder private-use character (`U+10EEEE`).
+const KITTY_PLACEHOLDER_CHAR: char = '\u{10EEEE}';
+
+/// Kitty row/column combining diacritics table (`rowcolumn-diacritics.txt`, 297 entries).
+const KITTY_DIACRITICS: [char; 297] = [
+    '\u{0305}', '\u{030D}', '\u{030E}', '\u{0310}', '\u{0312}', '\u{033D}', '\u{033E}', '\u{033F}',
+    '\u{0346}', '\u{034A}', '\u{034B}', '\u{034C}', '\u{0350}', '\u{0351}', '\u{0352}', '\u{0357}',
+    '\u{035B}', '\u{0363}', '\u{0364}', '\u{0365}', '\u{0366}', '\u{0367}', '\u{0368}', '\u{0369}',
+    '\u{036A}', '\u{036B}', '\u{036C}', '\u{036D}', '\u{036E}', '\u{036F}', '\u{0483}', '\u{0484}',
+    '\u{0485}', '\u{0486}', '\u{0487}', '\u{0592}', '\u{0593}', '\u{0594}', '\u{0595}', '\u{0597}',
+    '\u{0598}', '\u{0599}', '\u{059C}', '\u{059D}', '\u{059E}', '\u{059F}', '\u{05A0}', '\u{05A1}',
+    '\u{05A8}', '\u{05A9}', '\u{05AB}', '\u{05AC}', '\u{05AF}', '\u{05C4}', '\u{0610}', '\u{0611}',
+    '\u{0612}', '\u{0613}', '\u{0614}', '\u{0615}', '\u{0616}', '\u{0617}', '\u{0657}', '\u{0658}',
+    '\u{0659}', '\u{065A}', '\u{065B}', '\u{065D}', '\u{065E}', '\u{06D6}', '\u{06D7}', '\u{06D8}',
+    '\u{06D9}', '\u{06DA}', '\u{06DB}', '\u{06DC}', '\u{06DF}', '\u{06E0}', '\u{06E1}', '\u{06E2}',
+    '\u{06E4}', '\u{06E7}', '\u{06E8}', '\u{06EB}', '\u{06EC}', '\u{0730}', '\u{0732}', '\u{0733}',
+    '\u{0735}', '\u{0736}', '\u{073A}', '\u{073D}', '\u{073F}', '\u{0740}', '\u{0741}', '\u{0743}',
+    '\u{0745}', '\u{0747}', '\u{0749}', '\u{074A}', '\u{07EB}', '\u{07EC}', '\u{07ED}', '\u{07EE}',
+    '\u{07EF}', '\u{07F0}', '\u{07F1}', '\u{07F3}', '\u{0816}', '\u{0817}', '\u{0818}', '\u{0819}',
+    '\u{081B}', '\u{081C}', '\u{081D}', '\u{081E}', '\u{081F}', '\u{0820}', '\u{0821}', '\u{0822}',
+    '\u{0823}', '\u{0825}', '\u{0826}', '\u{0827}', '\u{0829}', '\u{082A}', '\u{082B}', '\u{082C}',
+    '\u{082D}', '\u{0951}', '\u{0953}', '\u{0954}', '\u{0F82}', '\u{0F83}', '\u{0F86}', '\u{0F87}',
+    '\u{135D}', '\u{135E}', '\u{135F}', '\u{17DD}', '\u{193A}', '\u{1A17}', '\u{1A75}', '\u{1A76}',
+    '\u{1A77}', '\u{1A78}', '\u{1A79}', '\u{1A7A}', '\u{1A7B}', '\u{1A7C}', '\u{1B6B}', '\u{1B6D}',
+    '\u{1B6E}', '\u{1B6F}', '\u{1B70}', '\u{1B71}', '\u{1B72}', '\u{1B73}', '\u{1CD0}', '\u{1CD1}',
+    '\u{1CD2}', '\u{1CDA}', '\u{1CDB}', '\u{1CE0}', '\u{1DC0}', '\u{1DC1}', '\u{1DC3}', '\u{1DC4}',
+    '\u{1DC5}', '\u{1DC6}', '\u{1DC7}', '\u{1DC8}', '\u{1DC9}', '\u{1DCB}', '\u{1DCC}', '\u{1DD1}',
+    '\u{1DD2}', '\u{1DD3}', '\u{1DD4}', '\u{1DD5}', '\u{1DD6}', '\u{1DD7}', '\u{1DD8}', '\u{1DD9}',
+    '\u{1DDA}', '\u{1DDB}', '\u{1DDC}', '\u{1DDD}', '\u{1DDE}', '\u{1DDF}', '\u{1DE0}', '\u{1DE1}',
+    '\u{1DE2}', '\u{1DE3}', '\u{1DE4}', '\u{1DE5}', '\u{1DE6}', '\u{1DFE}', '\u{20D0}', '\u{20D1}',
+    '\u{20D4}', '\u{20D5}', '\u{20D6}', '\u{20D7}', '\u{20DB}', '\u{20DC}', '\u{20E1}', '\u{20E7}',
+    '\u{20E9}', '\u{20F0}', '\u{2CEF}', '\u{2CF0}', '\u{2CF1}', '\u{2DE0}', '\u{2DE1}', '\u{2DE2}',
+    '\u{2DE3}', '\u{2DE4}', '\u{2DE5}', '\u{2DE6}', '\u{2DE7}', '\u{2DE8}', '\u{2DE9}', '\u{2DEA}',
+    '\u{2DEB}', '\u{2DEC}', '\u{2DED}', '\u{2DEE}', '\u{2DEF}', '\u{2DF0}', '\u{2DF1}', '\u{2DF2}',
+    '\u{2DF3}', '\u{2DF4}', '\u{2DF5}', '\u{2DF6}', '\u{2DF7}', '\u{2DF8}', '\u{2DF9}', '\u{2DFA}',
+    '\u{2DFB}', '\u{2DFC}', '\u{2DFD}', '\u{2DFE}', '\u{2DFF}', '\u{A66F}', '\u{A67C}', '\u{A67D}',
+    '\u{A6F0}', '\u{A6F1}', '\u{A8E0}', '\u{A8E1}', '\u{A8E2}', '\u{A8E3}', '\u{A8E4}', '\u{A8E5}',
+    '\u{A8E6}', '\u{A8E7}', '\u{A8E8}', '\u{A8E9}', '\u{A8EA}', '\u{A8EB}', '\u{A8EC}', '\u{A8ED}',
+    '\u{A8EE}', '\u{A8EF}', '\u{A8F0}', '\u{A8F1}', '\u{AAB0}', '\u{AAB2}', '\u{AAB3}', '\u{AAB7}',
+    '\u{AAB8}', '\u{AABE}', '\u{AABF}', '\u{AAC1}', '\u{FE20}', '\u{FE21}', '\u{FE22}', '\u{FE23}',
+    '\u{FE24}', '\u{FE25}', '\u{FE26}', '\u{10A0F}', '\u{10A38}', '\u{1D185}', '\u{1D186}',
+    '\u{1D187}', '\u{1D188}', '\u{1D189}', '\u{1D1AA}', '\u{1D1AB}', '\u{1D1AC}', '\u{1D1AD}',
+    '\u{1D242}', '\u{1D243}', '\u{1D244}',
+];
+
+#[inline]
+fn kitty_diacritic(index: u16) -> char {
+    *KITTY_DIACRITICS
+        .get(usize::from(index))
+        .unwrap_or(&KITTY_DIACRITICS[0])
+}
+
+/// Spec-compliant Kitty Unicode placeholder frame (`a=T,U=1,C=1,c=<cols>,r=<rows>`) with probed
+/// optional `o=z` zlib compression, clean cell style reset, explicit per-cell `(row, col)`
+/// diacritics, and zero-retransmit vertical slicing (`skip_rows`).
+#[derive(Debug, Clone)]
+pub struct KittyPlaceholderFrame {
+    /// Assigned Kitty image ID (`> 0`).
+    pub id: u32,
+    /// Full virtual placement bounding box in terminal character cells.
+    pub size: Size,
+    /// One-shot APC image transmission sequence (`a=T,U=1,C=1,c=...,r=...`).
+    pub payload: String,
+    /// Tracks whether [`Self::payload`] has already been emitted to the terminal buffer.
+    transmitted: Arc<AtomicBool>,
+}
+
+impl KittyPlaceholderFrame {
+    /// Encode `image` into a Kitty Unicode-placeholder virtual placement with `o=z` compression.
+    #[must_use]
+    pub fn encode(image: &DynamicImage, size: Size, id: u32, is_tmux: bool) -> Self {
+        Self::encode_with_compression(image, size, id, is_tmux, true)
+    }
+
+    /// Encode `image` into a Kitty Unicode-placeholder virtual placement (`a=T,U=1,C=1,c=,r=`),
+    /// optionally applying RFC 1950 zlib compression (`o=z`) when `use_zlib` is `true`.
+    #[must_use]
+    pub fn encode_with_compression(
+        image: &DynamicImage,
+        size: Size,
+        id: u32,
+        is_tmux: bool,
+        use_zlib: bool,
+    ) -> Self {
+        let rgba = image.to_rgba8();
+        let (px_w, px_h) = rgba.dimensions();
+        let raw = rgba.as_raw();
+        let (payload_bytes, compression_flag): (Cow<'_, [u8]>, &str) = if use_zlib {
+            match zlib_compress_fast(raw) {
+                Ok(compressed) => (Cow::Owned(compressed), "o=z,"),
+                Err(_) => (Cow::Borrowed(raw), ""),
+            }
+        } else {
+            (Cow::Borrowed(raw), "")
+        };
+        let b64 = base64::engine::general_purpose::STANDARD.encode(payload_bytes.as_ref());
+
+        let mut payload = String::with_capacity(b64.len() + 128);
+        let chunks: Vec<&str> = b64
+            .as_bytes()
+            .chunks(KITTY_CHUNK_BYTES)
+            .filter_map(|c| std::str::from_utf8(c).ok())
+            .collect();
+
+        let last_idx = chunks.len().saturating_sub(1);
+        for (idx, chunk) in chunks.iter().enumerate() {
+            let more = u8::from(idx < last_idx);
+            let esc = if is_tmux { "\x1b\x1b" } else { "\x1b" };
+            if is_tmux {
+                payload.push_str("\x1bPtmux;");
+            }
+            if idx == 0 {
+                // Explicit `c=`/`r=` and `C=1` match Kitty's virtual-placement specification and
+                // `kitten icat --unicode-placeholder`, ensuring accurate sizing across HiDPI
+                // fractional scaling and strict Kitty-protocol terminals.
+                let _ = write!(
+                    payload,
+                    "{esc}_Gq=2,i={id},a=T,U=1,C=1,f=32,{compression_flag}t=d,s={px_w},v={px_h},c={},r={},m={more};{chunk}{esc}\\",
+                    size.width, size.height
+                );
+            } else {
+                let _ = write!(payload, "{esc}_Gq=2,m={more};{chunk}{esc}\\");
+            }
+            if is_tmux {
+                payload.push_str("\x1b\\");
+            }
+        }
+
+        Self {
+            id,
+            size,
+            payload,
+            transmitted: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Render the Unicode placeholder grid into `buf`, optionally vertically sliced starting at
+    /// row `skip_rows` within the virtual placement.
+    pub fn render_sliced(&self, area: Rect, skip_rows: u16, buf: &mut Buffer) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        // Clear the entire slot first so no stale placeholder shade (`░`), label text, or SGR
+        // modifiers (`UNDERLINED`, `REVERSED`, `BOLD`) bleed into or around the rendered image.
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                if let Some(cell) = buf.cell_mut((x, y)) {
+                    cell.reset();
+                }
+            }
+        }
+        if self.size.width == 0 || self.size.height == 0 {
+            return;
+        }
+        let max_diac = KITTY_DIACRITICS.len() as u16;
+        let avail_rows = self.size.height.saturating_sub(skip_rows);
+        let draw_w = area.width.min(self.size.width).min(max_diac);
+        let draw_h = area.height.min(avail_rows).min(max_diac);
+        if draw_w == 0 || draw_h == 0 {
+            return;
+        }
+
+        let [id_extra, id_r, id_g, id_b] = self.id.to_be_bytes();
+        let fg = Color::Rgb(id_r, id_g, id_b);
+        let id_extra_u16 = u16::from(id_extra);
+
+        let mut transmit_once = if !self.transmitted.swap(true, Ordering::SeqCst) {
+            Some(self.payload.as_str())
+        } else {
+            None
+        };
+
+        let mut symbol = String::with_capacity(64);
+        for y in 0..draw_h {
+            let img_row = skip_rows.saturating_add(y);
+            if img_row >= max_diac {
+                break;
+            }
+            let row_diac = kitty_diacritic(img_row);
+            for x in 0..draw_w {
+                let Some(cell) = buf.cell_mut((area.left() + x, area.top() + y)) else {
+                    continue;
+                };
+                symbol.clear();
+                if let Some(seq) = transmit_once.take() {
+                    symbol.push_str(seq);
+                }
+                symbol.push(KITTY_PLACEHOLDER_CHAR);
+                symbol.push(row_diac);
+                symbol.push(kitty_diacritic(x));
+                if id_extra_u16 != 0 {
+                    symbol.push(kitty_diacritic(id_extra_u16));
+                }
+                cell.set_symbol(&symbol)
+                    .set_fg(fg)
+                    .set_diff_option(CellDiffOption::ForcedWidth(NonZeroU16::MIN));
+            }
+        }
+    }
+
+    /// Render the full virtual placement starting at row `0`.
+    pub fn render(&self, area: Rect, buf: &mut Buffer) {
+        self.render_sliced(area, 0, buf);
+    }
+}
+
 /// Direct Kitty graphics protocol frame (`a=T`, no Unicode placeholders) for WezTerm / Konsole.
 #[derive(Debug, Clone)]
 pub struct KittyDirectFrame {
@@ -757,13 +964,29 @@ impl KittyDirectFrame {
     /// Encode `image` into chunked Kitty direct graphics APC sequences (`f=32,o=z` fast zlib-deflated RGBA8).
     #[must_use]
     pub fn encode(image: &DynamicImage, size: Size, id: u32, is_tmux: bool) -> Self {
+        Self::encode_with_compression(image, size, id, is_tmux, true)
+    }
+
+    /// Encode `image` into chunked Kitty direct graphics APC sequences, enabling `o=z` zlib
+    /// compression only when `use_zlib` is `true` (confirmed by terminal capability probing).
+    #[must_use]
+    pub fn encode_with_compression(
+        image: &DynamicImage,
+        size: Size,
+        id: u32,
+        is_tmux: bool,
+        use_zlib: bool,
+    ) -> Self {
         let rgba = image.to_rgba8();
         let (px_w, px_h) = rgba.dimensions();
         let raw = rgba.as_raw();
-        let (payload_bytes, compression_flag): (Cow<'_, [u8]>, &str) = match zlib_compress_fast(raw)
-        {
-            Ok(compressed) => (Cow::Owned(compressed), "o=z,"),
-            Err(_) => (Cow::Borrowed(raw), ""),
+        let (payload_bytes, compression_flag): (Cow<'_, [u8]>, &str) = if use_zlib {
+            match zlib_compress_fast(raw) {
+                Ok(compressed) => (Cow::Owned(compressed), "o=z,"),
+                Err(_) => (Cow::Borrowed(raw), ""),
+            }
+        } else {
+            (Cow::Borrowed(raw), "")
         };
         let b64 = base64::engine::general_purpose::STANDARD.encode(payload_bytes.as_ref());
 
@@ -803,7 +1026,17 @@ impl KittyDirectFrame {
 
     /// Render the direct Kitty graphics payload into `buf`, marking covered cells `Skip`.
     pub fn render(&self, area: Rect, buf: &mut Buffer) {
-        if area.width == 0 || area.height == 0 || self.size.width == 0 || self.size.height == 0 {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                if let Some(cell) = buf.cell_mut((x, y)) {
+                    cell.reset();
+                }
+            }
+        }
+        if self.size.width == 0 || self.size.height == 0 {
             return;
         }
         let draw_w = area.width.min(self.size.width);
@@ -959,13 +1192,15 @@ fn clip_to_cells(s: &str, max_cells: usize) -> String {
 /// Encoded terminal media frame ready to render into a `ratatui` buffer across any [`GraphicsTier`].
 #[derive(Clone)]
 pub enum RenderedMedia {
-    /// Encoded by `ratatui-image` (`KittyPlaceholder`, `Sixel`, `ITerm2`, or `HalfBlock`).
+    /// Spec-compliant Kitty Unicode-placeholder virtual placement (`U=1,C=1,c=,r=`).
+    KittyPlaceholder(KittyPlaceholderFrame),
+    /// Encoded by `ratatui-image` (`Sixel`, `ITerm2`, or `HalfBlock`).
     Ratatui {
         /// Underlying `ratatui-image` fixed protocol state.
         protocol: Protocol,
         /// Active graphics tier that produced this frame.
         tier: GraphicsTier,
-        /// Assigned Kitty image ID when `tier == GraphicsTier::KittyPlaceholder`.
+        /// Assigned Kitty image ID when applicable.
         kitty_id: Option<u32>,
         /// Approximate serialized byte cost for PTY bandwidth accounting.
         estimated_bytes: usize,
@@ -981,6 +1216,7 @@ impl RenderedMedia {
     #[must_use]
     pub fn size(&self) -> Size {
         match self {
+            Self::KittyPlaceholder(frame) => frame.size,
             Self::Ratatui { protocol, .. } => protocol.size(),
             Self::KittyDirect(frame) => frame.size,
             Self::TextTag(frame) => frame.size,
@@ -991,6 +1227,7 @@ impl RenderedMedia {
     #[must_use]
     pub const fn tier(&self) -> GraphicsTier {
         match self {
+            Self::KittyPlaceholder(_) => GraphicsTier::KittyPlaceholder,
             Self::Ratatui { tier, .. } => *tier,
             Self::KittyDirect(_) => GraphicsTier::KittyDirect,
             Self::TextTag(_) => GraphicsTier::TextTagOnly,
@@ -1001,6 +1238,7 @@ impl RenderedMedia {
     #[must_use]
     pub const fn kitty_id(&self) -> Option<u32> {
         match self {
+            Self::KittyPlaceholder(frame) => Some(frame.id),
             Self::Ratatui { kitty_id, .. } => *kitty_id,
             Self::KittyDirect(frame) => Some(frame.id),
             Self::TextTag(_) => None,
@@ -1011,19 +1249,29 @@ impl RenderedMedia {
     #[must_use]
     pub fn estimated_pty_bytes(&self) -> usize {
         match self {
+            Self::KittyPlaceholder(frame) => frame.payload.len(),
             Self::Ratatui { estimated_bytes, .. } => *estimated_bytes,
             Self::KittyDirect(frame) => frame.payload.len(),
             Self::TextTag(frame) => frame.label.len(),
         }
     }
 
-    /// Render this frame into `buf` clipped to `area`.
-    pub fn render(&self, area: Rect, buf: &mut Buffer) {
+    /// Render this frame into `buf` clipped to `area`, optionally skipping `skip_rows` top rows
+    /// for smooth zero-retransmit vertical scrolling on [`GraphicsTier::KittyPlaceholder`].
+    pub fn render_sliced(&self, area: Rect, skip_rows: u16, buf: &mut Buffer) {
         if area.width == 0 || area.height == 0 {
             return;
         }
         match self {
+            Self::KittyPlaceholder(frame) => frame.render_sliced(area, skip_rows, buf),
             Self::Ratatui { protocol, .. } => {
+                for y in area.top()..area.bottom() {
+                    for x in area.left()..area.right() {
+                        if let Some(cell) = buf.cell_mut((x, y)) {
+                            cell.reset();
+                        }
+                    }
+                }
                 RatatuiImageWidget::new(protocol)
                     .allow_clipping(true)
                     .render(area, buf);
@@ -1032,34 +1280,51 @@ impl RenderedMedia {
             Self::TextTag(frame) => frame.render(area, buf),
         }
     }
+
+    /// Render this frame into `buf` clipped to `area`.
+    pub fn render(&self, area: Rect, buf: &mut Buffer) {
+        self.render_sliced(area, 0, buf);
+    }
 }
 
 /// Stateless `ratatui` widget borrowing a [`RenderedMedia`] for zero-cost immediate rendering.
 pub struct MediaWidget<'a> {
     media: &'a RenderedMedia,
+    skip_rows: u16,
 }
 
 impl<'a> MediaWidget<'a> {
     /// Wrap a [`RenderedMedia`] as a `ratatui` [`Widget`].
     #[must_use]
     pub const fn new(media: &'a RenderedMedia) -> Self {
-        Self { media }
+        Self {
+            media,
+            skip_rows: 0,
+        }
+    }
+
+    /// Start rendering `skip_rows` rows down from the top of the encoded image (for scrolled slots).
+    #[must_use]
+    pub const fn with_skip_rows(mut self, skip_rows: u16) -> Self {
+        self.skip_rows = skip_rows;
+        self
     }
 }
 
 impl Widget for MediaWidget<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        self.media.render(area, buf);
+        self.media.render_sliced(area, self.skip_rows, buf);
     }
 }
 
-/// Multi-tier renderer bridging `bbs-core` [`GraphicsTier`], `ratatui-image` [`Picker`]/protocols,
-/// `KittyDirect`, and `TextTagOnly`.
+/// Multi-tier renderer bridging `bbs-core` [`GraphicsTier`], `KittyPlaceholderFrame`,
+/// `KittyDirectFrame`, `ratatui-image` [`Picker`]/protocols, and `TextTagOnly`.
 pub struct MediaRenderer {
     tier: GraphicsTier,
     charset: ResolvedCharset,
     cell_pixels: (u16, u16),
     tmux_passthrough: bool,
+    use_kitty_zlib: bool,
     picker: Picker,
     next_kitty_id: AtomicU32,
 }
@@ -1074,6 +1339,7 @@ impl MediaRenderer {
             report.cell_pixels,
             report.tmux_passthrough_active,
         )
+        .with_kitty_zlib(report.kitty_zlib_compression)
     }
 
     /// Construct a [`MediaRenderer`] with explicit tier, charset, cell pixel metrics, and tmux mode.
@@ -1104,10 +1370,24 @@ impl MediaRenderer {
             charset,
             cell_pixels,
             tmux_passthrough,
+            use_kitty_zlib: true,
             picker,
-            // Start above probe ID 31 so rendered image IDs never collide with probe responses.
+            // Start above probe IDs 31/32 so rendered image IDs never collide with probe responses.
             next_kitty_id: AtomicU32::new(100),
         }
+    }
+
+    /// Configure whether Kitty transmissions emit `o=z` zlib compression (set from `ProbeReport`).
+    #[must_use]
+    pub const fn with_kitty_zlib(mut self, use_kitty_zlib: bool) -> Self {
+        self.use_kitty_zlib = use_kitty_zlib;
+        self
+    }
+
+    /// Whether `o=z` zlib compression is enabled for Kitty graphics transmissions.
+    #[must_use]
+    pub const fn uses_kitty_zlib(&self) -> bool {
+        self.use_kitty_zlib
     }
 
     /// Active [`GraphicsTier`].
@@ -1136,10 +1416,10 @@ impl MediaRenderer {
         &self.picker
     }
 
-    /// Allocate a monotonic non-zero Kitty image ID (`>= 100`).
+    /// Allocate a monotonic non-zero 24-bit Kitty image ID (`100..=16_777_215`).
     fn alloc_kitty_id(&self) -> u32 {
         let id = self.next_kitty_id.fetch_add(1, Ordering::Relaxed);
-        if id < 100 {
+        if !(100..=0x00FF_FFFF).contains(&id) {
             self.next_kitty_id.store(101, Ordering::Relaxed);
             100
         } else {
@@ -1168,7 +1448,7 @@ impl MediaRenderer {
             GraphicsTier::KittyPlaceholder => StatefulProtocolType::Kitty(StatefulKitty::new(
                 self.alloc_kitty_id(),
                 self.tmux_passthrough,
-                true,
+                self.use_kitty_zlib,
             )),
             GraphicsTier::Sixel => StatefulProtocolType::Sixel(Sixel {
                 is_tmux: self.tmux_passthrough,
@@ -1256,6 +1536,7 @@ impl MediaRenderer {
             self.charset,
             self.cell_pixels,
             self.tmux_passthrough,
+            self.use_kitty_zlib,
             &|| self.alloc_kitty_id(),
         )
     }
@@ -1274,6 +1555,7 @@ fn encode_rgba_frame(
     charset: ResolvedCharset,
     cell_pixels: (u16, u16),
     tmux_passthrough: bool,
+    use_kitty_zlib: bool,
     alloc_kitty_id: &impl Fn() -> u32,
 ) -> TermResult<RenderedMedia> {
     if max_cols == 0 || max_rows == 0 {
@@ -1326,27 +1608,27 @@ fn encode_rgba_frame(
     match tier {
         GraphicsTier::KittyPlaceholder => {
             let id = alloc_kitty_id();
-            // `Kitty::new(..., true)` deflates RGBA8 with fast zlib (`o=z`), shrinking typical
-            // wire payloads 3x-20x; estimate conservatively at 50% of raw base64 size.
-            let raw_b64 = (target_px_w as usize * target_px_h as usize * 4) * 4 / 3;
-            let est = (raw_b64 / 2).max(256);
-            let proto = Kitty::new(resized, cell_box, id, tmux_passthrough, true)
-                .map_err(|err| TermError::MediaEncode(err.to_string()))?;
-            Ok(RenderedMedia::Ratatui {
-                protocol: Protocol::Kitty(proto),
-                tier: GraphicsTier::KittyPlaceholder,
-                kitty_id: Some(id),
-                estimated_bytes: est,
-            })
+            Ok(RenderedMedia::KittyPlaceholder(
+                KittyPlaceholderFrame::encode_with_compression(
+                    &resized,
+                    cell_box,
+                    id,
+                    tmux_passthrough,
+                    use_kitty_zlib,
+                ),
+            ))
         }
         GraphicsTier::KittyDirect => {
             let id = alloc_kitty_id();
-            Ok(RenderedMedia::KittyDirect(KittyDirectFrame::encode(
-                &resized,
-                cell_box,
-                id,
-                tmux_passthrough,
-            )))
+            Ok(RenderedMedia::KittyDirect(
+                KittyDirectFrame::encode_with_compression(
+                    &resized,
+                    cell_box,
+                    id,
+                    tmux_passthrough,
+                    use_kitty_zlib,
+                ),
+            ))
         }
         GraphicsTier::Sixel => {
             let proto = Sixel::new(resized, cell_box, tmux_passthrough)
@@ -1414,6 +1696,8 @@ pub struct MediaEncodeRequest {
     pub charset: ResolvedCharset,
     /// Wrap Kitty/Sixel/iTerm2 sequences in `tmux` DCS passthrough.
     pub tmux_passthrough: bool,
+    /// Emit `o=z` zlib compression for Kitty transmissions (enable only when probed).
+    pub use_kitty_zlib: bool,
     /// Optional label/title for `TextTagOnly` fallback rendering.
     pub title: Option<String>,
     /// Whether this frame belongs to an animated sequence (for bandwidth prioritization).
@@ -1441,6 +1725,7 @@ impl MediaEncodeRequest {
             fit: MediaFitMode::Contain,
             charset: ResolvedCharset::Utf8,
             tmux_passthrough: false,
+            use_kitty_zlib: true,
             title: None,
             is_animated: false,
         }
@@ -1520,6 +1805,7 @@ pub struct MediaEncoderPool {
     next_kitty_id: Arc<AtomicU32>,
     charset: ResolvedCharset,
     tmux_passthrough: bool,
+    use_kitty_zlib: bool,
 }
 
 impl MediaEncoderPool {
@@ -1536,10 +1822,11 @@ impl MediaEncoderPool {
             semaphore: Arc::new(Semaphore::new(max_concurrent_encodes.max(1))),
             tx,
             in_flight: Arc::new(Mutex::new(HashSet::new())),
-            // Start above Kitty probe ID 31 and well separated from MediaRenderer's 100.. range.
+            // Start above Kitty probe IDs 31/32 and well separated from MediaRenderer's 100.. range.
             next_kitty_id: Arc::new(AtomicU32::new(10_000)),
             charset,
             tmux_passthrough,
+            use_kitty_zlib: true,
         };
         (pool, rx)
     }
@@ -1558,21 +1845,31 @@ impl MediaEncoderPool {
         Self::new(DEFAULT_ENCODE_CONCURRENCY)
     }
 
-    /// Create an encoder pool inheriting `resolved_charset` and `tmux_passthrough_active` from a [`ProbeReport`].
+    /// Create an encoder pool inheriting `resolved_charset`, `tmux_passthrough_active`, and
+    /// `kitty_zlib_compression` from a [`ProbeReport`].
     #[must_use]
     pub fn from_probe(
         report: &ProbeReport,
     ) -> (Self, mpsc::UnboundedReceiver<RenderedMediaFrame>) {
-        Self::with_options(
+        let (mut pool, rx) = Self::with_options(
             DEFAULT_ENCODE_CONCURRENCY,
             report.resolved_charset,
             report.tmux_passthrough_active,
-        )
+        );
+        pool.use_kitty_zlib = report.kitty_zlib_compression;
+        (pool, rx)
+    }
+
+    /// Override whether Kitty jobs created via [`Self::enqueue`] use `o=z` zlib compression.
+    #[must_use]
+    pub const fn with_kitty_zlib(mut self, use_kitty_zlib: bool) -> Self {
+        self.use_kitty_zlib = use_kitty_zlib;
+        self
     }
 
     fn alloc_kitty_id(counter: &AtomicU32) -> u32 {
         let id = counter.fetch_add(1, Ordering::Relaxed);
-        if id < 10_000 {
+        if !(10_000..=0x00FF_FFFF).contains(&id) {
             counter.store(10_001, Ordering::Relaxed);
             10_000
         } else {
@@ -1596,6 +1893,7 @@ impl MediaEncoderPool {
         let mut req = MediaEncodeRequest::new(key, frame, width_cells, height_cells, tier, cell_px);
         req.charset = self.charset;
         req.tmux_passthrough = self.tmux_passthrough;
+        req.use_kitty_zlib = self.use_kitty_zlib;
         self.enqueue_request(req)
     }
 
@@ -1700,6 +1998,7 @@ fn encode_request_sync(
         req.charset,
         req.cell_px,
         req.tmux_passthrough,
+        req.use_kitty_zlib,
         &|| MediaEncoderPool::alloc_kitty_id(kitty_ids),
     )?;
     Ok(RenderedMediaFrame {
@@ -2580,5 +2879,52 @@ mod tests {
             Err(err) => panic!("KittyDirect render_frame failed: {err}"),
         };
         assert!(matches!(kd_frame, RenderedMedia::KittyDirect(_)));
+    }
+
+    #[test]
+    fn kitty_placeholder_emits_cr_dimensions_gates_oz_cleans_modifiers_and_slices() {
+        use ratatui::style::Modifier;
+
+        let img = DynamicImage::ImageRgba8(RgbaImage::from_pixel(64, 64, Rgba([80, 160, 240, 255])));
+
+        // Uncompressed mode (`use_zlib = false`) must NOT send `o=z` and MUST emit `c=`, `r=`, `C=1`.
+        let raw_frame =
+            KittyPlaceholderFrame::encode_with_compression(&img, Size::new(8, 4), 10_042, false, false);
+        assert!(raw_frame.payload.contains("i=10042,a=T,U=1,C=1,f=32,t=d,s=64,v=64,c=8,r=4,"));
+        assert!(!raw_frame.payload.contains("o=z"));
+
+        // Compressed mode (`use_zlib = true`) includes `o=z` plus explicit `c=`, `r=`, `C=1`.
+        let z_frame =
+            KittyPlaceholderFrame::encode_with_compression(&img, Size::new(8, 4), 10_043, false, true);
+        assert!(z_frame.payload.contains("i=10043,a=T,U=1,C=1,f=32,o=z,t=d,s=64,v=64,c=8,r=4,"));
+
+        // Pre-populate buffer with stale shade + UNDERLINED/REVERSED modifiers.
+        let mut buf = Buffer::empty(Rect::new(0, 0, 10, 4));
+        for y in 0..4 {
+            for x in 0..10 {
+                buf[(x, y)]
+                    .set_symbol("░")
+                    .set_style(ratatui::style::Style::default().add_modifier(Modifier::UNDERLINED | Modifier::REVERSED));
+            }
+        }
+
+        // First render (sliced at skip_rows = 1, height = 2) emits APC once + row diacritic 1 (`\u{030D}`).
+        z_frame.render_sliced(Rect::new(0, 0, 10, 2), 1, &mut buf);
+        assert!(buf[(0, 0)].symbol().contains("\x1b_Gq=2,i=10043,a=T,U=1,C=1,"));
+        assert!(buf[(0, 0)].symbol().ends_with("\u{10EEEE}\u{030D}\u{0305}"));
+        assert_eq!(buf[(1, 0)].symbol(), "\u{10EEEE}\u{030D}\u{030D}");
+        assert_eq!(buf[(0, 1)].symbol(), "\u{10EEEE}\u{030E}\u{0305}");
+        assert!(
+            buf[(0, 0)].modifier.is_empty(),
+            "placeholder cells must strip stale UNDERLINED/REVERSED modifiers"
+        );
+        // Uncovered margin columns (8..10) must be cleared to space, not leftover `░`.
+        assert_eq!(buf[(9, 0)].symbol(), " ");
+
+        // Second render must NOT re-emit the APC transmission sequence.
+        let mut buf2 = Buffer::empty(Rect::new(0, 0, 10, 2));
+        z_frame.render_sliced(Rect::new(0, 0, 10, 2), 2, &mut buf2);
+        assert!(!buf2[(0, 0)].symbol().contains("\x1b_G"));
+        assert_eq!(buf2[(0, 0)].symbol(), "\u{10EEEE}\u{030E}\u{0305}");
     }
 }

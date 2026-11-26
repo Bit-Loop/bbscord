@@ -12,12 +12,12 @@ use bbs_core::{
     VideoSinkKind, ViewportGeometry, mock_ids,
 };
 use bbs_runtime_term::{
-    DecodedMedia, FramePacer, GifAnimationPlayer, MediaDecoderPool, MediaEncodeRequest,
-    MediaEncoderPool, MediaFitMode, MediaRenderer, MediaWidget, ProbeOptions, ProbeReport,
-    PtyBandwidthGovernor, RenderedMedia, RenderedMediaFrame, ResizeDebouncer,
+    DEFAULT_ENCODE_CONCURRENCY, DecodedMedia, FramePacer, GifAnimationPlayer, MediaDecoderPool,
+    MediaEncodeRequest, MediaEncoderPool, MediaFitMode, MediaRenderer, MediaWidget, ProbeOptions,
+    ProbeReport, PtyBandwidthGovernor, RenderedMedia, RenderedMediaFrame, ResizeDebouncer,
     ScrollProxyDebouncer, TerminalEnv, TerminalSignal, TtyGuard, TtyGuardConfig,
-    install_panic_hook, negotiate_capabilities, normalize_key_event, probe_terminal_async,
-    query_stdout_winsize,
+    install_panic_hook, kitty_delete_image_data_seq_for, negotiate_capabilities,
+    normalize_key_event, probe_terminal_async, query_stdout_winsize,
 };
 use bbs_tui::theme::{ThemeCatalog, ThemeDirs};
 use bbs_tui::{App, Effect, ImageSlot, Mode, TuiConfig};
@@ -45,6 +45,9 @@ const FAILED_URL_COOLDOWN: Duration = Duration::from_secs(60);
 /// Upper bound on cached encoded frames kept in memory by [`MediaCoordinator`].
 const MAX_ENCODED_FRAMES: usize = 256;
 
+/// Retry interval when the PTY bandwidth governor defers an image/GIF frame.
+const GOVERNOR_RETRY_DELAY: Duration = Duration::from_millis(100);
+
 type EncodedCacheKey = (String, usize, u16, u16, GraphicsTier);
 type DecodedOutcome = (String, Option<Arc<DecodedMedia>>, Vec<String>);
 
@@ -52,6 +55,7 @@ struct CachedEncodedFrame {
     media: RenderedMedia,
     is_animated: bool,
     emitted: bool,
+    last_used_seq: u64,
 }
 
 /// Media pipeline state pairing `bbs-tui`'s [`ImageSlot`]s with `bbs-runtime-term`'s
@@ -64,9 +68,13 @@ struct MediaCoordinator {
     pool: Arc<MediaDecoderPool>,
     pacer: FramePacer,
     governor: PtyBandwidthGovernor,
+    governor_deferred_at: Option<Instant>,
     scroll_proxy: ScrollProxyDebouncer,
     players: HashMap<String, GifAnimationPlayer>,
     encoded: HashMap<EncodedCacheKey, CachedEncodedFrame>,
+    active_slot_urls: HashSet<String>,
+    pending_kitty_deletes: Vec<u32>,
+    access_seq: u64,
     in_flight: HashSet<String>,
     failed_urls: HashMap<String, Instant>,
     decoded_tx: mpsc::UnboundedSender<DecodedOutcome>,
@@ -75,30 +83,61 @@ struct MediaCoordinator {
     cell_px: (u16, u16),
     charset: ResolvedCharset,
     tmux_passthrough: bool,
+    use_kitty_zlib: bool,
 }
 
 impl MediaCoordinator {
+    #[cfg(test)]
     fn new(report: &ProbeReport) -> Self {
+        Self::with_overrides(
+            report,
+            report.capabilities.graphics_tier,
+            report.resolved_charset,
+        )
+    }
+
+    fn with_overrides(
+        report: &ProbeReport,
+        effective_tier: GraphicsTier,
+        effective_charset: ResolvedCharset,
+    ) -> Self {
         let (decoded_tx, decoded_rx) = mpsc::unbounded_channel();
-        let (encoder, encoded_rx) = MediaEncoderPool::from_probe(report);
+        let (encoder, encoded_rx) = MediaEncoderPool::with_options(
+            DEFAULT_ENCODE_CONCURRENCY,
+            effective_charset,
+            report.tmux_passthrough_active,
+        );
+        let encoder = encoder.with_kitty_zlib(report.kitty_zlib_compression);
+        let renderer = MediaRenderer::new(
+            effective_tier,
+            effective_charset,
+            report.cell_pixels,
+            report.tmux_passthrough_active,
+        )
+        .with_kitty_zlib(report.kitty_zlib_compression);
         Self {
-            renderer: MediaRenderer::from_probe(report),
+            renderer,
             encoder,
             encoded_rx,
             pool: Arc::new(MediaDecoderPool::with_defaults()),
             pacer: FramePacer::from_capabilities(&report.capabilities),
             governor: PtyBandwidthGovernor::for_session(report.capabilities.over_ssh),
+            governor_deferred_at: None,
             scroll_proxy: ScrollProxyDebouncer::with_default_window(),
             players: HashMap::new(),
             encoded: HashMap::new(),
+            active_slot_urls: HashSet::new(),
+            pending_kitty_deletes: Vec::new(),
+            access_seq: 0,
             in_flight: HashSet::new(),
             failed_urls: HashMap::new(),
             decoded_tx,
             decoded_rx,
             last_slot_geom: Vec::new(),
             cell_px: (report.cell_pixels.0.max(1), report.cell_pixels.1.max(1)),
-            charset: report.resolved_charset,
+            charset: effective_charset,
             tmux_passthrough: report.tmux_passthrough_active,
+            use_kitty_zlib: report.kitty_zlib_compression,
         }
     }
 
@@ -111,10 +150,35 @@ impl MediaCoordinator {
         self.renderer.set_cell_pixels(self.cell_px);
     }
 
+    fn queue_kitty_delete(&mut self, frame: &CachedEncodedFrame) {
+        if frame.emitted
+            && let Some(id) = frame.media.kitty_id()
+        {
+            self.pending_kitty_deletes.push(id);
+        }
+    }
+
+    fn drain_kitty_delete_sequences(&mut self) -> Vec<u8> {
+        if self.pending_kitty_deletes.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(self.pending_kitty_deletes.len() * 32);
+        for id in self.pending_kitty_deletes.drain(..) {
+            out.extend_from_slice(
+                kitty_delete_image_data_seq_for(id, self.tmux_passthrough).as_bytes(),
+            );
+        }
+        out
+    }
+
     fn clear_encoded(&mut self) {
-        self.encoded.clear();
+        let old = std::mem::take(&mut self.encoded);
+        for (_, entry) in old {
+            self.queue_kitty_delete(&entry);
+        }
         self.encoder.clear_in_flight();
         self.in_flight.clear();
+        self.governor_deferred_at = None;
     }
 
     fn scroll_settle_deadline(&self, now: Instant) -> Option<Instant> {
@@ -125,11 +189,58 @@ impl MediaCoordinator {
         }
     }
 
+    fn governor_retry_deadline(&self, now: Instant) -> Option<Instant> {
+        self.governor_deferred_at.map(|ts| {
+            let target = ts + GOVERNOR_RETRY_DELAY;
+            if target <= now { now } else { target }
+        })
+    }
+
+    fn remove_encoded_for_url(&mut self, key: &str) {
+        let mut removed_ids = Vec::new();
+        self.encoded.retain(|(u, _, _, _, _), entry| {
+            if u == key {
+                if entry.emitted
+                    && let Some(id) = entry.media.kitty_id()
+                {
+                    removed_ids.push(id);
+                }
+                false
+            } else {
+                true
+            }
+        });
+        self.pending_kitty_deletes.extend(removed_ids);
+    }
+
+    fn evict_encoded_if_full(&mut self) {
+        if self.encoded.len() < MAX_ENCODED_FRAMES {
+            return;
+        }
+        let target_len = (MAX_ENCODED_FRAMES * 3) / 4;
+        let to_evict = self.encoded.len().saturating_sub(target_len).max(1);
+
+        // Prefer evicting non-visible URLs first (oldest LRU sequence), then oldest visible
+        // frames (e.g. non-current animation frames) so active visible images never vanish.
+        let mut candidates: Vec<(bool, u64, EncodedCacheKey)> = self
+            .encoded
+            .iter()
+            .map(|(k, v)| (self.active_slot_urls.contains(&k.0), v.last_used_seq, k.clone()))
+            .collect();
+        candidates.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+
+        for (_, _, key) in candidates.into_iter().take(to_evict) {
+            if let Some(entry) = self.encoded.remove(&key) {
+                self.queue_kitty_delete(&entry);
+            }
+        }
+    }
+
     fn evict_keys(&mut self, evicted: &[String], app: &mut App) {
         for key in evicted {
             app.images.remove(key);
             self.players.remove(key);
-            self.encoded.retain(|(k, _, _, _, _), _| k != key);
+            self.remove_encoded_for_url(key);
         }
     }
 
@@ -154,7 +265,7 @@ impl MediaCoordinator {
         );
         let outcome = self.pool.insert_cached(Arc::new(decoded));
         self.evict_keys(&outcome.evicted_keys, app);
-        self.encoded.retain(|(k, _, _, _, _), _| k != &key);
+        self.remove_encoded_for_url(&key);
     }
 
     fn apply_decoded_outcome(&mut self, outcome: DecodedOutcome, app: &mut App) -> bool {
@@ -182,7 +293,7 @@ impl MediaCoordinator {
         }
         let insert_outcome = self.pool.insert_cached(media);
         self.evict_keys(&insert_outcome.evicted_keys, app);
-        self.encoded.retain(|(k, _, _, _, _), _| k != &key);
+        self.remove_encoded_for_url(&key);
         true
     }
 
@@ -203,9 +314,8 @@ impl MediaCoordinator {
         let Ok(frame_idx) = idx_str.parse::<usize>() else {
             return;
         };
-        if self.encoded.len() >= MAX_ENCODED_FRAMES {
-            self.encoded.clear();
-        }
+        self.evict_encoded_if_full();
+        self.access_seq = self.access_seq.wrapping_add(1);
         let cache_key = (
             url.to_string(),
             frame_idx,
@@ -214,14 +324,17 @@ impl MediaCoordinator {
             frame.tier,
         );
         // Cache BEFORE checking `PtyBandwidthGovernor` so throttled frames are never re-encoded at 10 Hz.
-        self.encoded.insert(
+        if let Some(prev) = self.encoded.insert(
             cache_key,
             CachedEncodedFrame {
                 media: frame.media,
                 is_animated: frame.is_animated,
                 emitted: false,
+                last_used_seq: self.access_seq,
             },
-        );
+        ) {
+            self.queue_kitty_delete(&prev);
+        }
     }
 
     fn ingest_encoded(&mut self) -> bool {
@@ -291,24 +404,7 @@ impl MediaCoordinator {
                 let tx = self.decoded_tx.clone();
                 let url = slot.url.clone();
                 tokio::spawn(async move {
-                    let mut result: Option<Arc<DecodedMedia>> = None;
-                    let mut evicted: Vec<String> = Vec::new();
-                    if let Ok((bytes, _)) = rest.fetch_attachment_bytes(&url).await {
-                        let name = url
-                            .rsplit('/')
-                            .next()
-                            .unwrap_or("image.bin")
-                            .split('?')
-                            .next()
-                            .unwrap_or("image.bin")
-                            .to_string();
-                        if let Ok((decoded, ev)) =
-                            pool.decode_and_cache(url.clone(), bytes, Some(name)).await
-                        {
-                            result = Some(decoded);
-                            evicted = ev;
-                        }
-                    }
+                    let (result, evicted) = fetch_and_decode_with_fallback(&rest, &pool, &url).await;
                     // Always notify completion so failed fetches release `in_flight` and enter cooldown.
                     let _ = tx.send((url, result, evicted));
                 });
@@ -365,6 +461,11 @@ impl MediaCoordinator {
             return;
         }
 
+        self.active_slot_urls.clear();
+        for slot in slots {
+            self.active_slot_urls.insert(slot.url.clone());
+        }
+
         // Compare ONLY geometry `(url, rect, visible)` — NOT `focused` — so moving selection
         // never triggers a spurious 150 ms HalfBlock scroll-proxy flash.
         let current_geom: Vec<(String, Rect, Rect)> = slots
@@ -385,6 +486,8 @@ impl MediaCoordinator {
             self.renderer.tier()
         };
 
+        let mut any_deferred = false;
+
         for slot in slots {
             if slot.visible.width == 0 || slot.visible.height == 0 {
                 continue;
@@ -396,24 +499,47 @@ impl MediaCoordinator {
                 .players
                 .get(&slot.url)
                 .map_or(0, GifAnimationPlayer::frame_index);
+
+            // On KittyPlaceholder, encode ONCE at full `slot.rect` dimensions and slice vertically
+            // via `clip_top` row diacritics — zero re-encode and zero re-upload while scrolling!
+            let (encode_w, encode_h, skip_rows) = if target_tier == GraphicsTier::KittyPlaceholder {
+                (
+                    slot.rect.width.max(slot.visible.width),
+                    slot.rect.height.max(slot.visible.height),
+                    slot.clip_top,
+                )
+            } else {
+                (slot.visible.width, slot.visible.height, 0)
+            };
+
             let key: EncodedCacheKey = (
                 slot.url.clone(),
                 frame_idx,
-                slot.visible.width,
-                slot.visible.height,
+                encode_w,
+                encode_h,
                 target_tier,
             );
 
+            self.access_seq = self.access_seq.wrapping_add(1);
+            let seq = self.access_seq;
+
             if let Some(entry) = self.encoded.get_mut(&key) {
+                entry.last_used_seq = seq;
                 if !entry.emitted {
                     let est = entry.media.estimated_pty_bytes();
-                    if self.governor.can_emit_for(est, entry.is_animated, now) {
+                    // Frame 0 is the poster frame needed so the user sees the image/GIF at all;
+                    // meter it with static token-bucket debt so SSH / multi-tile GIF grids never
+                    // permanently starve initial frames.
+                    let meter_as_anim = entry.is_animated && frame_idx > 0;
+                    if self.governor.can_emit_for(est, meter_as_anim, now) {
                         self.governor.record_emitted(est, now);
                         entry.emitted = true;
+                    } else {
+                        any_deferred = true;
                     }
                 }
                 if entry.emitted {
-                    let widget = MediaWidget::new(&entry.media);
+                    let widget = MediaWidget::new(&entry.media).with_skip_rows(skip_rows);
                     ratatui::widgets::Widget::render(widget, slot.visible, buf);
                     continue;
                 }
@@ -424,14 +550,17 @@ impl MediaCoordinator {
                 let mut req = MediaEncodeRequest::new(
                     stable_job_key,
                     Arc::new(rgba.clone()),
-                    slot.visible.width,
-                    slot.visible.height,
+                    encode_w,
+                    encode_h,
                     target_tier,
                     self.cell_px,
                 );
-                req.fit = MediaFitMode::Contain;
+                // `bbs-tui`'s `image_box` already avoids upscaling chat attachments past native
+                // pixels, while GIF picker tiles & downscaled proxies should fill their box cleanly.
+                req.fit = MediaFitMode::ScaleToFit;
                 req.charset = self.charset;
                 req.tmux_passthrough = self.tmux_passthrough;
+                req.use_kitty_zlib = self.use_kitty_zlib;
                 req.title = media.title.clone();
                 req.is_animated = media.is_animated;
 
@@ -442,13 +571,110 @@ impl MediaCoordinator {
             // bandwidth budget, keep drawing the latest already-emitted frame for this slot size
             // to avoid flicker.
             if let Some((_, fallback)) = self.encoded.iter().find(|((u, _, w, h, _), v)| {
-                u == &slot.url && *w == slot.visible.width && *h == slot.visible.height && v.emitted
+                u == &slot.url && *w == encode_w && *h == encode_h && v.emitted
             }) {
-                let widget = MediaWidget::new(&fallback.media);
+                let widget = MediaWidget::new(&fallback.media).with_skip_rows(skip_rows);
                 ratatui::widgets::Widget::render(widget, slot.visible, buf);
             }
         }
+
+        self.governor_deferred_at = if any_deferred { Some(now) } else { None };
     }
+}
+
+/// Remove `format=webp` from a Discord proxy URL as a fallback when WebP transcoding fails
+/// (for instance on exotic `.svg` or edge-case CDN assets).
+fn strip_webp_format_param(url: &str) -> Option<String> {
+    let (before_frag, frag) = match url.find('#') {
+        Some(idx) => (&url[..idx], Some(&url[idx..])),
+        None => (url, None),
+    };
+    let (base, query) = before_frag.split_once('?')?;
+    let mut removed = false;
+    let kept: Vec<&str> = query
+        .split('&')
+        .filter(|pair| {
+            if pair.eq_ignore_ascii_case("format=webp") {
+                removed = true;
+                false
+            } else {
+                !pair.is_empty()
+            }
+        })
+        .collect();
+    if !removed {
+        return None;
+    }
+    let mut out = String::with_capacity(url.len());
+    out.push_str(base);
+    if !kept.is_empty() {
+        out.push('?');
+        out.push_str(&kept.join("&"));
+    }
+    if let Some(f) = frag {
+        out.push_str(f);
+    }
+    Some(out)
+}
+
+fn redacted_url_host(url: &str) -> &str {
+    url.strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url)
+        .split('/')
+        .next()
+        .unwrap_or("unknown")
+}
+
+async fn fetch_and_decode_with_fallback(
+    rest: &bbs_protocol::DiscordRestClient,
+    pool: &MediaDecoderPool,
+    cache_url: &str,
+) -> (Option<Arc<DecodedMedia>>, Vec<String>) {
+    let name = cache_url
+        .rsplit('/')
+        .next()
+        .unwrap_or("image.bin")
+        .split('?')
+        .next()
+        .unwrap_or("image.bin")
+        .to_string();
+
+    let mut attempts = vec![cache_url.to_string()];
+    if let Some(fallback) = strip_webp_format_param(cache_url) {
+        attempts.push(fallback);
+    }
+
+    for (idx, attempt_url) in attempts.iter().enumerate() {
+        match rest.fetch_attachment_bytes(attempt_url).await {
+            Ok((bytes, _)) => {
+                match pool
+                    .decode_and_cache(cache_url.to_string(), bytes, Some(name.clone()))
+                    .await
+                {
+                    Ok((decoded, evicted)) => return (Some(decoded), evicted),
+                    Err(err) => {
+                        warn!(
+                            host = redacted_url_host(attempt_url),
+                            attempt = idx + 1,
+                            error = %err,
+                            "media decode failed"
+                        );
+                    }
+                }
+            }
+            Err(err) => {
+                warn!(
+                    host = redacted_url_host(attempt_url),
+                    attempt = idx + 1,
+                    error = %err,
+                    "media fetch failed"
+                );
+            }
+        }
+    }
+
+    (None, Vec::new())
 }
 
 fn synthesize_mock_preview_frame(seed_str: &str, width: u32, height: u32) -> RgbaFrame {
@@ -660,7 +886,8 @@ pub async fn run_interactive(
     apply_initial_theme(&mut app, &catalog, &tui_cfg.theme);
 
     let mut persisted_theme = app.theme().name().to_string();
-    let mut media = MediaCoordinator::new(&probe_report);
+    let mut media =
+        MediaCoordinator::with_overrides(&probe_report, tui_cfg.graphics, tui_cfg.charset);
     let mut debouncer = ResizeDebouncer::with_default_window(probe_report.capabilities.geometry);
     let sync_output = probe_report.capabilities.synchronized_output;
     let osc52 = probe_report.capabilities.osc52_clipboard;
@@ -675,10 +902,20 @@ pub async fn run_interactive(
         media.ingest_decoded(&mut app);
         media.ingest_encoded();
 
-        // Emit frame wrapped in DEC Mode 2026 synchronized output when supported.
-        if sync_output {
+        // Emit frame wrapped in DEC Mode 2026 synchronized output when supported, flushing any
+        // deferred Kitty image deletions (`a=d,d=I,i=<id>,q=2`) before painting the next frame.
+        let kitty_deletes = media.drain_kitty_delete_sequences();
+        if sync_output || !kitty_deletes.is_empty() {
             let mut out = io::stdout();
-            let _ = out.write_all(bbs_runtime_term::tty_guard::BEGIN_SYNC_OUTPUT_SEQ);
+            if sync_output {
+                let _ = out.write_all(bbs_runtime_term::tty_guard::BEGIN_SYNC_OUTPUT_SEQ);
+            }
+            if !kitty_deletes.is_empty() {
+                let _ = out.write_all(&kitty_deletes);
+                if !sync_output {
+                    let _ = out.flush();
+                }
+            }
         }
 
         terminal.draw(|frame| {
@@ -722,6 +959,15 @@ pub async fn run_interactive(
         let scroll_settle_deadline = media.scroll_settle_deadline(Instant::now());
         let scroll_settle_sleep = async move {
             match scroll_settle_deadline {
+                Some(deadline) => {
+                    tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        };
+        let governor_retry_deadline = media.governor_retry_deadline(Instant::now());
+        let governor_retry_sleep = async move {
+            match governor_retry_deadline {
                 Some(deadline) => {
                     tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
                 }
@@ -834,6 +1080,7 @@ pub async fn run_interactive(
                 }
             }
             () = scroll_settle_sleep => {}
+            () = governor_retry_sleep => {}
             _ = tick_interval.tick() => {
                 tick_count = tick_count.saturating_add(1);
                 let now_tick = Instant::now();
@@ -926,6 +1173,7 @@ pub async fn run_interactive(
                 }
             }
             () = scroll_settle_sleep => {}
+            () = governor_retry_sleep => {}
             _ = tick_interval.tick() => {
                 tick_count = tick_count.saturating_add(1);
                 let now_tick = Instant::now();
@@ -1002,6 +1250,13 @@ pub async fn run_interactive(
         }
     }
 
+    media.clear_encoded();
+    let final_deletes = media.drain_kitty_delete_sequences();
+    if !final_deletes.is_empty() {
+        let mut out = io::stdout();
+        let _ = out.write_all(&final_deletes);
+        let _ = out.flush();
+    }
     services.shutdown().await;
     drop(terminal);
     let _ = tty_guard.restore();
@@ -1156,7 +1411,7 @@ pub async fn run_headless_smoke(cli: &Cli, app_cfg: &AppConfig) -> Result<SmokeS
     let (mut services, mut backend_rx) = RuntimeServices::build_mock();
     services.seed_mock_state().await?;
 
-    let mut media = MediaCoordinator::new(&report);
+    let mut media = MediaCoordinator::with_overrides(&report, tui_cfg.graphics, tui_cfg.charset);
     let mut debouncer = ResizeDebouncer::with_default_window(ViewportGeometry::new(80, 24));
     let mut frames_rendered = 0usize;
     let mut total_image_slots = 0usize;
@@ -1583,5 +1838,282 @@ mod tests {
         ));
         assert_ne!(app.theme().name(), initial);
         assert_eq!(app.cfg.theme, app.theme().name());
+    }
+
+    #[tokio::test]
+    async fn kitty_placeholder_vertical_clip_top_slices_without_reencoding() {
+        let env = TerminalEnv::default();
+        let opts = ProbeOptions {
+            charset_override: CharsetMode::Utf8,
+            graphics_override: Some(GraphicsTier::KittyPlaceholder),
+            ..ProbeOptions::default()
+        };
+        let probe_resp = bbs_runtime_term::ProbeResponse {
+            kitty_graphics: true,
+            kitty_zlib_compression: true,
+            ..Default::default()
+        };
+        let report = negotiate_capabilities(
+            &env,
+            ViewportGeometry::new(80, 24),
+            bbs_runtime_term::GeometrySource::CliOverride,
+            &probe_resp,
+            &opts,
+            false,
+            true,
+        );
+        let mut media = MediaCoordinator::new(&report);
+        let mut app = App::new(TuiConfig::default());
+
+        let url = "https://cdn.example/clip-test.png".to_string();
+        // 80x96 pixels matches 10x6 cells at default 8x16 cell_px -> exact c=10,r=6 placement.
+        let rgba = RgbaFrame {
+            width: 80,
+            height: 96,
+            delay_ms: 0,
+            pixels: vec![0x77; 80 * 96 * 4],
+        };
+        let decoded = DecodedMedia::from_rgba_frames(
+            url.clone(),
+            Some("clip-test.png".to_string()),
+            80,
+            96,
+            vec![rgba],
+        );
+        assert!(media.apply_decoded_outcome((url.clone(), Some(Arc::new(decoded)), Vec::new()), &mut app));
+
+        // Frame 1: full unclipped slot triggers off-thread encode at full 10x6 rect.
+        let mut buf = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 80, 24));
+        let t0 = Instant::now();
+        let full_slot = ImageSlot {
+            url: url.clone(),
+            rect: Rect::new(4, 2, 10, 6),
+            visible: Rect::new(4, 2, 10, 6),
+            clip_top: 0,
+            animated: false,
+            focused: false,
+        };
+        media.overlay_pixel_slots(std::slice::from_ref(&full_slot), &mut buf, false, t0);
+        let encoded = tokio::time::timeout(Duration::from_secs(2), media.encoded_rx.recv())
+            .await
+            .expect("encoder timed out")
+            .expect("encoder channel closed");
+        media.apply_encoded_frame(encoded);
+        assert_eq!(media.encoded.len(), 1);
+
+        // Render full slot: emits one-shot APC payload containing c=10,r=6,C=1,o=z.
+        let t1 = t0 + Duration::from_millis(200);
+        media.overlay_pixel_slots(std::slice::from_ref(&full_slot), &mut buf, false, t1);
+        let top_left = buf[(4, 2)].symbol().to_string();
+        assert!(top_left.contains("a=T,U=1,C=1,f=32,o=z,"), "got: {top_left}");
+        assert!(top_left.contains(",c=10,r=6,"), "got: {top_left}");
+
+        // Frame 2: scroll image up by 2 rows (clip_top = 2, visible height = 4).
+        // Must reuse the EXACT same encoded cache entry and emit row-2 diacritic U+030D without re-uploading!
+        let mut buf2 = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 80, 24));
+        let scrolled_slot = ImageSlot {
+            url,
+            rect: Rect::new(4, 0, 10, 6),
+            visible: Rect::new(4, 0, 10, 4),
+            clip_top: 2,
+            animated: false,
+            focused: false,
+        };
+        media.overlay_pixel_slots(
+            std::slice::from_ref(&scrolled_slot),
+            &mut buf2,
+            false,
+            t1 + Duration::from_millis(50),
+        );
+        assert_eq!(media.encoded.len(), 1);
+        let sliced_top = buf2[(4, 0)].symbol();
+        assert!(!sliced_top.contains("a=T"), "scroll slice must not re-transmit APC");
+        assert!(
+            sliced_top.starts_with("\u{10EEEE}\u{030E}\u{0305}"),
+            "expected row=2 (U+030E) col=0 (U+0305), got: {sliced_top:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn gif_frame_zero_uses_static_debt_under_ssh_bandwidth_budget() {
+        let env = TerminalEnv {
+            ssh_connection: Some("1.2.3.4 1234 5.6.7.8 22".to_string()),
+            ..Default::default()
+        };
+        let opts = ProbeOptions {
+            charset_override: CharsetMode::Utf8,
+            graphics_override: Some(GraphicsTier::KittyPlaceholder),
+            ..ProbeOptions::default()
+        };
+        let report = negotiate_capabilities(
+            &env,
+            ViewportGeometry::new(80, 24),
+            bbs_runtime_term::GeometrySource::CliOverride,
+            &bbs_runtime_term::ProbeResponse::default(),
+            &opts,
+            false,
+            true,
+        );
+        assert!(report.capabilities.over_ssh);
+        let mut media = MediaCoordinator::new(&report);
+        let mut app = App::new(TuiConfig::default());
+
+        // 2-frame animated GIF with noisy pixels whose encoded payload exceeds the 50 KiB SSH anim cap
+        // if metered strictly as animation, yet MUST still display Frame 0 via static debt.
+        let url = "https://cdn.example/anim.webp".to_string();
+        let pixels: Vec<u8> = (0..(96 * 96 * 4))
+            .map(|i| ((i * 73 + 19) % 251) as u8)
+            .collect();
+        let f0 = RgbaFrame {
+            width: 96,
+            height: 96,
+            delay_ms: 80,
+            pixels: pixels.clone(),
+        };
+        let f1 = RgbaFrame {
+            width: 96,
+            height: 96,
+            delay_ms: 80,
+            pixels,
+        };
+        let decoded = DecodedMedia::from_rgba_frames(
+            url.clone(),
+            Some("anim.webp".to_string()),
+            96,
+            96,
+            vec![f0, f1],
+        );
+        assert!(decoded.is_animated);
+        media.apply_decoded_outcome((url.clone(), Some(Arc::new(decoded)), Vec::new()), &mut app);
+
+        let slot = ImageSlot {
+            url: url.clone(),
+            rect: Rect::new(2, 2, 16, 8),
+            visible: Rect::new(2, 2, 16, 8),
+            clip_top: 0,
+            animated: true,
+            focused: true,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 80, 24));
+        let t0 = Instant::now();
+        media.overlay_pixel_slots(std::slice::from_ref(&slot), &mut buf, false, t0);
+        let encoded = tokio::time::timeout(Duration::from_secs(2), media.encoded_rx.recv())
+            .await
+            .expect("encoder timed out")
+            .expect("encoder channel closed");
+        media.apply_encoded_frame(encoded);
+
+        media.overlay_pixel_slots(std::slice::from_ref(&slot), &mut buf, false, t0);
+        assert!(
+            buf[(2, 2)].symbol().contains('\u{10EEEE}'),
+            "Frame 0 of animated GIF must render on SSH instead of starving"
+        );
+    }
+
+    #[test]
+    fn evict_encoded_if_full_preserves_visible_slots_and_queues_kitty_deletes() {
+        let env = TerminalEnv::default();
+        let opts = ProbeOptions {
+            charset_override: CharsetMode::Utf8,
+            graphics_override: Some(GraphicsTier::KittyPlaceholder),
+            ..ProbeOptions::default()
+        };
+        let report = negotiate_capabilities(
+            &env,
+            ViewportGeometry::new(80, 24),
+            bbs_runtime_term::GeometrySource::CliOverride,
+            &bbs_runtime_term::ProbeResponse::default(),
+            &opts,
+            false,
+            true,
+        );
+        let mut media = MediaCoordinator::new(&report);
+        let decoded = DecodedMedia::from_rgba_frames(
+            "https://cdn.example/tile.png".to_string(),
+            Some("tile.png".to_string()),
+            4,
+            4,
+            vec![RgbaFrame {
+                width: 4,
+                height: 4,
+                delay_ms: 0,
+                pixels: [10, 20, 30, 255].repeat(16),
+            }],
+        );
+
+        let visible_url = "https://cdn.example/visible.png".to_string();
+        media.active_slot_urls.insert(visible_url.clone());
+
+        // Insert visible entry first (oldest LRU seq!) + MAX_ENCODED_FRAMES-1 non-visible entries.
+        let vis_media = media
+            .renderer
+            .render_frame(&decoded, 0, 4, 2, MediaFitMode::ScaleToFit)
+            .expect("render kitty placeholder");
+        let vis_id = vis_media.kitty_id().expect("expected Kitty placeholder ID");
+        let vis_key = (
+            visible_url.clone(),
+            0usize,
+            4u16,
+            2u16,
+            GraphicsTier::KittyPlaceholder,
+        );
+        media.encoded.insert(
+            vis_key.clone(),
+            CachedEncodedFrame {
+                media: vis_media,
+                is_animated: false,
+                emitted: true,
+                last_used_seq: 1,
+            },
+        );
+
+        let mut first_offscreen_id = 0u32;
+        for i in 1..MAX_ENCODED_FRAMES {
+            let rendered = media
+                .renderer
+                .render_frame(&decoded, 0, 4, 2, MediaFitMode::ScaleToFit)
+                .expect("render kitty placeholder");
+            if i == 1 {
+                first_offscreen_id = rendered.kitty_id().expect("expected Kitty placeholder ID");
+            }
+            media.encoded.insert(
+                (
+                    format!("https://cdn.example/offscreen-{i}.png"),
+                    0,
+                    4,
+                    2,
+                    GraphicsTier::KittyPlaceholder,
+                ),
+                CachedEncodedFrame {
+                    media: rendered,
+                    is_animated: false,
+                    emitted: true,
+                    last_used_seq: 100 + i as u64,
+                },
+            );
+        }
+
+        assert_eq!(media.encoded.len(), MAX_ENCODED_FRAMES);
+        media.evict_encoded_if_full();
+
+        // Visible slot MUST survive even though its LRU sequence was the oldest!
+        assert!(media.encoded.contains_key(&vis_key));
+        assert_eq!(media.encoded.len(), (MAX_ENCODED_FRAMES * 3) / 4);
+
+        let deletes = String::from_utf8(media.drain_kitty_delete_sequences()).unwrap();
+        assert!(deletes.contains(&format!("\x1b_Ga=d,d=I,i={first_offscreen_id},q=2\x1b\\")));
+        assert!(!deletes.contains(&format!("i={vis_id},")));
+        assert!(media.drain_kitty_delete_sequences().is_empty());
+    }
+
+    #[test]
+    fn strip_webp_format_param_removes_only_webp_format() {
+        let url = "https://media.discordapp.net/attachments/1/2/a.gif?ex=abc&format=webp&width=320&animated=true#frag";
+        let stripped = strip_webp_format_param(url).expect("should strip format=webp");
+        assert_eq!(
+            stripped,
+            "https://media.discordapp.net/attachments/1/2/a.gif?ex=abc&width=320&animated=true#frag"
+        );
+        assert!(strip_webp_format_param("https://cdn.example/plain.png?width=320").is_none());
     }
 }

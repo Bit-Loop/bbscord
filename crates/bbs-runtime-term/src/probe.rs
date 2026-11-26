@@ -42,9 +42,16 @@ pub const VT100_CURSOR_RESTORE: &[u8] = b"\x1b8";
 /// 1×1 Kitty graphics protocol capability query (`a=q`, `i=31`).
 pub const KITTY_GRAPHICS_QUERY: &[u8] = b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\";
 
+/// 1×1 Kitty graphics zlib-compression capability query (`a=q`, `i=32`, `o=z`, zlib(`[0,0,0]`)).
+pub const KITTY_ZLIB_QUERY: &[u8] = b"\x1b_Gi=32,s=1,v=1,a=q,t=d,f=24,o=z;eJxjYGAAAAADAAE=\x1b\\";
+
 /// DCS-wrapped 1×1 Kitty graphics query for explicit `tmux` passthrough mode.
 pub const KITTY_TMUX_PASSTHROUGH_QUERY: &[u8] =
     b"\x1bPtmux;\x1b\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\x1b\\\x1b\\";
+
+/// DCS-wrapped 1×1 Kitty zlib-compression query for explicit `tmux` passthrough mode.
+pub const KITTY_TMUX_PASSTHROUGH_ZLIB_QUERY: &[u8] =
+    b"\x1bPtmux;\x1b\x1b_Gi=32,s=1,v=1,a=q,t=d,f=24,o=z;eJxjYGAAAAADAAE=\x1b\x1b\\\x1b\\";
 
 /// DECRQM query for DEC synchronized output mode (`CSI ? 2026 $ p`).
 pub const DECRQM_SYNC_OUTPUT_QUERY: &[u8] = b"\x1b[?2026$p";
@@ -406,8 +413,10 @@ pub fn parse_geometry_override(raw: &str) -> TermResult<ViewportGeometry> {
 pub struct ProbeResponse {
     /// Geometry reported by VT100 cursor-clamp DSR (`\x1b[{rows};{cols}R`), stored as `(cols, rows)`.
     pub dsr_geometry: Option<ViewportGeometry>,
-    /// Kitty graphics protocol 1×1 query returned `OK`.
+    /// Kitty graphics protocol 1×1 query (`i=31`) returned `OK`.
     pub kitty_graphics: bool,
+    /// Kitty graphics protocol 1×1 `o=z` zlib-compression query (`i=32`) returned `OK`.
+    pub kitty_zlib_compression: bool,
     /// Primary Device Attributes (`DA1`) fence reply was received.
     pub da1_received: bool,
     /// `DA1` advertised attribute `4` (DEC Sixel graphics).
@@ -728,7 +737,11 @@ impl ProbeResponseParser {
         if status.trim() != "OK" {
             return;
         }
-        // Match query image ID `i=31` (or empty header if terminal omits `i`).
+        // Match query image ID `i=31` (base Kitty support) or `i=32` (`o=z` zlib support).
+        if header.split(',').any(|kv| kv.trim() == "i=32") {
+            self.response.kitty_zlib_compression = true;
+            return;
+        }
         let id_matches = header.is_empty() || header.split(',').any(|kv| kv.trim() == "i=31");
         if id_matches {
             self.response.kitty_graphics = true;
@@ -755,6 +768,8 @@ pub struct ProbeReport {
     pub grapheme_mode_2027: bool,
     /// Whether Kitty graphics query succeeded.
     pub kitty_graphics_supported: bool,
+    /// Whether Kitty graphics `o=z` zlib compression probe (`i=32`) succeeded.
+    pub kitty_zlib_compression: bool,
     /// Whether terminal-side Kitty animation frames (`a=f`/`a=a`) are supported (native `kitty`).
     pub kitty_animation_supported: bool,
     /// Whether `DA1` advertised DEC Sixel (`;4`).
@@ -914,6 +929,7 @@ pub fn negotiate_capabilities(
             && !env.is_dumb_term()
             && resolved_charset == ResolvedCharset::Utf8,
         kitty_graphics_supported: probe.kitty_graphics,
+        kitty_zlib_compression: probe.kitty_zlib_compression,
         kitty_animation_supported,
         sixel_supported: probe.sixel,
         tmux_passthrough_active,
@@ -989,8 +1005,10 @@ pub fn build_active_probe_payload(
     let mut payload = Vec::with_capacity(256);
     if include_tmux_passthrough_kitty {
         payload.extend_from_slice(KITTY_TMUX_PASSTHROUGH_QUERY);
+        payload.extend_from_slice(KITTY_TMUX_PASSTHROUGH_ZLIB_QUERY);
     } else {
         payload.extend_from_slice(KITTY_GRAPHICS_QUERY);
+        payload.extend_from_slice(KITTY_ZLIB_QUERY);
     }
     payload.extend_from_slice(DECRQM_SYNC_OUTPUT_QUERY);
     payload.extend_from_slice(DECRQM_GRAPHEME_QUERY);
@@ -1817,5 +1835,25 @@ mod tests {
         let emitted = &written[..n as usize];
         assert!(emitted.starts_with(VT100_CURSOR_CLAMP_QUERY));
         assert!(emitted.ends_with(VT100_CURSOR_RESTORE));
+    }
+
+    #[test]
+    fn parser_distinguishes_kitty_base_and_zlib_compression_probes() {
+        let base_only = ProbeResponseParser::parse_slice(
+            b"\x1b_Gi=31;OK\x1b\\\x1b_Gi=32;EINVAL:unsupported compression\x1b\\\x1b[?62;c",
+        );
+        assert!(base_only.kitty_graphics);
+        assert!(!base_only.kitty_zlib_compression);
+        assert!(base_only.da1_received);
+
+        let with_zlib = ProbeResponseParser::parse_slice(
+            b"\x1b_Gi=31;OK\x1b\\\x1b_Gi=32;OK\x1b\\\x1b[?62;c",
+        );
+        assert!(with_zlib.kitty_graphics);
+        assert!(with_zlib.kitty_zlib_compression);
+
+        let payload = build_active_probe_payload(false, false);
+        assert!(payload.windows(KITTY_GRAPHICS_QUERY.len()).any(|w| w == KITTY_GRAPHICS_QUERY));
+        assert!(payload.windows(KITTY_ZLIB_QUERY.len()).any(|w| w == KITTY_ZLIB_QUERY));
     }
 }

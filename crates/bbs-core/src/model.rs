@@ -1374,10 +1374,10 @@ pub struct VideoFrame {
 /// to request a downscaled image (`width` × `height`) and optionally WebP format (`format=webp`),
 /// while preserving signed CDN query parameters (`ex`, `is`, `hm`) and any URL fragment.
 ///
-/// When `prefer_webp` is `true` and the path ends with `.gif` without an explicit `animated` query
-/// parameter, `animated=true` is also appended so Discord serves an animated WebP instead of a
-/// static first frame. Non-proxy URLs and requests with zero `width` or `height` are returned
-/// unchanged.
+/// When `prefer_webp` is `true` and the path ends with `.gif` or `.webp` without an explicit
+/// `animated` query parameter, `animated=true` is also appended so Discord serves an animated WebP
+/// instead of a static first frame. Non-proxy URLs and requests with zero `width` or `height` are
+/// returned unchanged.
 #[must_use]
 pub fn resize_discord_media_proxy_url(
     url: &str,
@@ -1438,7 +1438,8 @@ pub fn resize_discord_media_proxy_url(
         return url.to_owned();
     }
 
-    let path_is_gif = path.to_ascii_lowercase().ends_with(".gif");
+    let path_lower = path.to_ascii_lowercase();
+    let path_is_animated = path_lower.ends_with(".gif") || path_lower.ends_with(".webp");
 
     let mut params: Vec<String> = Vec::new();
     let mut saw_width = false;
@@ -1487,7 +1488,7 @@ pub fn resize_discord_media_proxy_url(
     if prefer_webp && !saw_format {
         params.push("format=webp".to_owned());
     }
-    if prefer_webp && !saw_animated && path_is_gif {
+    if prefer_webp && !saw_animated && path_is_animated {
         params.push("animated=true".to_owned());
     }
 
@@ -1808,6 +1809,12 @@ mod tests {
         assert_eq!(
             resize_discord_media_proxy_url(gif, 256, 256, true),
             "https://media.discordapp.net/attachments/1/2/party.gif?ex=1&is=2&hm=3&width=256&height=256&format=webp&animated=true"
+        );
+        let webp_proxy =
+            "https://images-ext-1.discordapp.net/external/hash/https/static.klipy.com/demo/anim.webp";
+        assert_eq!(
+            resize_discord_media_proxy_url(webp_proxy, 256, 256, true),
+            "https://images-ext-1.discordapp.net/external/hash/https/static.klipy.com/demo/anim.webp?width=256&height=256&format=webp&animated=true"
         );
         let gif_static =
             "https://media.discordapp.net/attachments/1/2/party.gif?ex=1&animated=false";

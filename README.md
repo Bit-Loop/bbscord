@@ -115,10 +115,13 @@ bbscord --mock-demo --geometry 16x2 --charset ascii
 
 ### Connect Live
 ```bash
-# Opens QR Remote-Auth v2 (scan from Discord mobile) or masked token login; saves to your OS keyring
+# First run opens the Initial Setup screen:
+#   [1] Import Session (auto-detects Discordo OS keyring or $BBSCORD_TOKEN/$DISCORD_TOKEN)
+#   [2] QR Remote-Auth v2 (scan with Discord mobile)
+#   [3] Token Paste (masked, zeroized in RAM)
 bbscord
 
-# Reuse an existing `discordo` OS keyring token strictly in RAM (never copied or written to disk)
+# Or skip the setup screen and reuse a `discordo` keyring session strictly in RAM
 bbscord --import-discordo-keyring
 ```
 

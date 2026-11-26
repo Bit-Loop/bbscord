@@ -1167,6 +1167,23 @@ pub fn render_image_box(
     label: &str,
     frame: Option<&RgbaFrame>,
 ) {
+    render_image_box_sliced(app, buf, ctx, rect, rect.height, 0, url, label, frame);
+}
+
+/// Draw a possibly vertically-clipped image box (starting at `clip_top` out of `full_rows`),
+/// slicing HalfBlock rows cleanly without vertical squishing during scrolling.
+#[allow(clippy::too_many_arguments)]
+pub fn render_image_box_sliced(
+    app: &App,
+    buf: &mut Buffer,
+    ctx: &Ctx<'_>,
+    rect: Rect,
+    full_rows: u16,
+    clip_top: u16,
+    url: &str,
+    label: &str,
+    frame: Option<&RgbaFrame>,
+) {
     let rect = rect.intersection(buf.area);
     if rect.width == 0 || rect.height == 0 {
         return;
@@ -1179,7 +1196,7 @@ pub fn render_image_box(
         )
         && ctx.cfg.charset != bbs_core::ResolvedCharset::Ascii7Bit;
     if let (true, Some(f)) = (halfblock, frame) {
-        halfblock_frame(buf, ctx, rect, f);
+        halfblock_frame_sliced(buf, ctx, rect, full_rows.max(rect.height), clip_top, f);
         return;
     }
     let shade = if ctx.g.is_ascii() { "." } else { "░" };
@@ -1198,23 +1215,38 @@ pub fn render_image_box(
 
 /// HalfBlock rasteriser: `▀` with fg = top pixel, bg = bottom pixel (nearest sampling).
 pub fn halfblock_frame(buf: &mut Buffer, ctx: &Ctx<'_>, rect: Rect, f: &RgbaFrame) {
+    halfblock_frame_sliced(buf, ctx, rect, rect.height, 0, f);
+}
+
+/// Vertically sliced HalfBlock rasteriser sampling rows `clip_top .. clip_top + rect.height`
+/// out of a full `full_rows`-tall image box.
+pub fn halfblock_frame_sliced(
+    buf: &mut Buffer,
+    ctx: &Ctx<'_>,
+    rect: Rect,
+    full_rows: u16,
+    clip_top: u16,
+    f: &RgbaFrame,
+) {
     let (w, h) = (f.width as usize, f.height as usize);
     if w == 0 || h == 0 || f.pixels.len() < w * h * 4 {
         return;
     }
     let cols = usize::from(rect.width);
-    let rows = usize::from(rect.height) * 2;
+    let total_rows = usize::from(full_rows.max(rect.height)).max(1) * 2;
+    let skip_px_rows = usize::from(clip_top) * 2;
     let px = |x: usize, y: usize| -> Color {
         let sx = (x * w / cols.max(1)).min(w - 1);
-        let sy = (y * h / rows.max(1)).min(h - 1);
+        let sy = (y * h / total_rows).min(h - 1);
         let i = (sy * w + sx) * 4;
         let c = bbs_core::RgbColor::new(f.pixels[i], f.pixels[i + 1], f.pixels[i + 2]);
         ctx.theme.rgb(c)
     };
     for cy in 0..usize::from(rect.height) {
+        let py = skip_px_rows + cy * 2;
         for cx in 0..cols {
-            let top = px(cx, cy * 2);
-            let bot = px(cx, cy * 2 + 1);
+            let top = px(cx, py);
+            let bot = px(cx, py + 1);
             let x = rect.x + u16::try_from(cx).unwrap_or(0);
             let y = rect.y + u16::try_from(cy).unwrap_or(0);
             draw::cell(buf, x, y, "▀", Style::default().fg(top).bg(bot));

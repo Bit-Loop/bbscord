@@ -795,12 +795,17 @@ impl App {
                         .map(|im| im.label.clone())
                 })
                 .unwrap_or_default();
-            if s.clip_top == 0 && s.visible.height == s.rect.height {
-                crate::panes::render_image_box(self, buf, ctx, s.visible, &s.url, &label, frame);
-            } else {
-                // Partially visible: placeholder only (scroll-proxy semantics; runtime re-sends when settled).
-                crate::panes::render_image_box(self, buf, ctx, s.visible, &s.url, &label, None);
-            }
+            crate::panes::render_image_box_sliced(
+                self,
+                buf,
+                ctx,
+                s.visible,
+                s.rect.height,
+                s.clip_top,
+                &s.url,
+                &label,
+                frame,
+            );
         }
         self.image_slots.extend(slots);
         draw::scrollbar(
@@ -1013,9 +1018,9 @@ impl App {
                 .map(|c| sanitize_single_line(&c.display_label()).into_owned())
                 .unwrap_or_default();
             let hint = if insert {
-                format!("Message {ch_name} - Enter send, @/#/: complete, Ctrl+J newline, Esc normal")
+                format!("Message {ch_name} - Enter send, Ctrl+G GIF, @/#/: complete, Esc normal")
             } else {
-                "[i] compose  [/] jump  [?] help".to_string()
+                "[i] compose  [G] GIF  [/] jump  [?] help".to_string()
             };
             draw::put(buf, tx, r.y, &ctx.n(&hint), tw, ctx.s(Role::Inactive));
             return insert.then_some((tx, r.y));
