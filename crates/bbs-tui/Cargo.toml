@@ -13,3 +13,15 @@ ratatui.workspace = true
 crossterm.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+serde.workspace = true
+toml.workspace = true
+lru.workspace = true
+fuzzy-matcher.workspace = true
+dirs.workspace = true
+unicode-width.workspace = true
+unicode-segmentation.workspace = true
+pulldown-cmark = { version = "0.13", default-features = false }
+syntect = { version = "5.3", default-features = false, features = ["parsing", "default-syntaxes", "default-themes", "regex-fancy", "dump-load"] }
+
+[dev-dependencies]
+tokio.workspace = true
