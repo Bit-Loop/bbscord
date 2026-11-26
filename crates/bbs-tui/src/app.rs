@@ -43,6 +43,8 @@ pub enum Effect {
         /// Reply target.
         reply_to: Option<Snowflake>,
     },
+    /// Request clipboard payload (image, file URIs, or text) from the host runner (`Ctrl+V`).
+    PasteClipboard,
     /// Audible bell.
     Bell,
 }
@@ -190,6 +192,7 @@ pub struct App {
     pub(crate) last_typing_sent_ms: u64,
     pub(crate) pending_open_url: Option<String>,
     pub(crate) pending_copy_text: Option<String>,
+    pub(crate) last_attach_dir: Option<std::path::PathBuf>,
 }
 
 impl std::fmt::Debug for App {
@@ -281,8 +284,52 @@ impl App {
             last_typing_sent_ms: 0,
             pending_open_url: None,
             pending_copy_text: None,
+            last_attach_dir: None,
             cfg,
         }
+    }
+
+    /// Maximum attachments Discord permits on a single message (`10`).
+    pub const MAX_ATTACHMENTS: usize = 10;
+
+    /// Stage a local file/image path for upload with the next message.
+    ///
+    /// Returns `true` if newly added, `false` if already staged or at the 10-file limit.
+    pub fn stage_attachment(&mut self, path: String) -> bool {
+        if self.composer.attachments.iter().any(|p| p == &path) {
+            return false;
+        }
+        if self.composer.attachments.len() >= Self::MAX_ATTACHMENTS {
+            self.store.banners.push(crate::state::Banner {
+                scope: "attach".to_string(),
+                message: format!("Discord allows at most {} attachments per message.", Self::MAX_ATTACHMENTS),
+                recoverable: true,
+            });
+            return false;
+        }
+        self.composer.attachments.push(path);
+        true
+    }
+
+    /// Toggle a local file/image path in the staged attachments list (for multi-select).
+    pub fn toggle_staged_attachment(&mut self, path: String) -> bool {
+        if let Some(pos) = self.composer.attachments.iter().position(|p| p == &path) {
+            self.composer.attachments.remove(pos);
+            false
+        } else {
+            self.stage_attachment(path)
+        }
+    }
+
+    /// Remove the most recently staged attachment (`Alt+X`).
+    pub fn pop_staged_attachment(&mut self) -> Option<String> {
+        self.composer.attachments.pop()
+    }
+
+    /// Open the interactive file & image attachment browser (`Alt+A` / `A` / `/attach`).
+    pub fn open_attach(&mut self) {
+        let dir = self.last_attach_dir.clone();
+        self.open(Modal::attach(dir));
     }
 
     /// Take a pending URL/attachment queued by the user (`o` or double-click) for the host runner
@@ -862,7 +909,7 @@ impl App {
             self.close_modal();
             return;
         }
-        if !self.composer.is_empty() {
+        if !self.composer.is_empty() || !self.composer.attachments.is_empty() {
             self.composer.clear();
             return;
         }
@@ -1674,6 +1721,42 @@ impl App {
         if self.composer.is_empty() && self.composer.attachments.is_empty() {
             return;
         }
+        // Built-in `/attach [path]` command for quick file/image attachment from the composer.
+        let trimmed_cmd = self.composer.text().trim();
+        if trimmed_cmd == "/attach" || trimmed_cmd.starts_with("/attach ") {
+            let arg = trimmed_cmd.strip_prefix("/attach").unwrap_or("").trim().to_string();
+            let _ = self.composer.take();
+            self.autocomplete.clear();
+            if arg.is_empty() {
+                self.open_attach();
+            } else {
+                let base = self
+                    .last_attach_dir
+                    .clone()
+                    .or_else(|| std::env::current_dir().ok())
+                    .unwrap_or_else(|| std::path::PathBuf::from("."));
+                let resolved = crate::modals::expand_user_path(&arg, &base);
+                if resolved.is_dir() {
+                    self.last_attach_dir = Some(resolved.clone());
+                    self.open(Modal::attach(Some(resolved)));
+                } else if resolved.is_file() {
+                    if let Some(parent) = resolved.parent() {
+                        self.last_attach_dir = Some(parent.to_path_buf());
+                    }
+                    let _ = self.stage_attachment(resolved.to_string_lossy().into_owned());
+                } else {
+                    self.store.banners.push(crate::state::Banner {
+                        scope: "attach".to_string(),
+                        message: format!(
+                            "File not found: {}",
+                            crate::sanitize::sanitize_single_line(&resolved.to_string_lossy())
+                        ),
+                        recoverable: true,
+                    });
+                }
+            }
+            return;
+        }
         if self.composer.char_len() > self.cfg.max_message_len() {
             self.open(Modal::too_long(self.cfg.max_message_len()));
             return;
@@ -1806,6 +1889,10 @@ impl App {
             if ctrl(&k, 'e') {
                 self.pending
                     .push(Effect::ExternalEditor(self.composer.text().to_string()));
+                return;
+            }
+            if ctrl(&k, 'a') {
+                self.open_attach();
                 return;
             }
         }
@@ -1960,6 +2047,11 @@ impl App {
                 }
             },
             KeyCode::Char('g') if ctl => self.open_gif(),
+            KeyCode::Char('v') if ctl => self.pending.push(Effect::PasteClipboard),
+            KeyCode::Char('a') if alt => self.open_attach(),
+            KeyCode::Char('x') if alt => {
+                let _ = self.pop_staged_attachment();
+            }
             KeyCode::Char('o') if ctl => self.toggle_mute(),
             KeyCode::Char('n') if ctl => self.jump_unread(1),
             KeyCode::Char('p') if ctl => self.jump_unread(-1),
@@ -2087,6 +2179,18 @@ impl App {
             self.open_gif();
             return;
         }
+        if ctrl(&k, 'v') {
+            self.pending.push(Effect::PasteClipboard);
+            return;
+        }
+        if k.modifiers.contains(KeyModifiers::ALT) && k.code == KeyCode::Char('a') {
+            self.open_attach();
+            return;
+        }
+        if k.modifiers.contains(KeyModifiers::ALT) && k.code == KeyCode::Char('x') {
+            let _ = self.pop_staged_attachment();
+            return;
+        }
         if ctrl(&k, 'o') {
             self.toggle_mute();
             return;
@@ -2182,6 +2286,7 @@ impl App {
                 self.open(m);
             }
             'G' => self.open_gif(),
+            'A' => self.open_attach(),
             ']' => self.jump_unread(1),
             '[' => self.jump_unread(-1),
             'm' => self.toggle_mute(),

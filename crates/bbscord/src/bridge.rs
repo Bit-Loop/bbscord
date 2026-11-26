@@ -770,39 +770,99 @@ async fn execute_ui_action(
             mention_replied_user,
             attachment_paths,
         } => {
-            if !attachment_paths.is_empty()
-                && let Some(rest) = rest_client
-            {
-                let mut uploads = Vec::with_capacity(attachment_paths.len());
-                for raw_path in &attachment_paths {
-                    let path = Path::new(raw_path);
-                    let bytes = tokio::fs::read(path).await.map_err(|err| {
-                        bbs_core::CoreError::Media(format!(
-                            "failed to read attachment '{}': {err}",
-                            path.display()
-                        ))
-                    })?;
-                    let filename = path
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("attachment.bin")
-                        .to_string();
-                    uploads.push(UploadAttachment {
-                        filename,
-                        content_type: None,
-                        description: None,
-                        bytes,
-                    });
+            if !attachment_paths.is_empty() {
+                if let Some(rest) = rest_client {
+                    const MAX_UPLOAD_BYTES: u64 = 100 * 1024 * 1024;
+                    let mut uploads = Vec::with_capacity(attachment_paths.len());
+                    let mut temp_cleanup = Vec::new();
+                    for raw_path in &attachment_paths {
+                        let path = Path::new(raw_path);
+                        if crate::platform::is_managed_clipboard_temp(path) {
+                            temp_cleanup.push(path.to_path_buf());
+                        }
+                        let meta = tokio::fs::metadata(path).await.map_err(|err| {
+                            bbs_core::CoreError::Media(format!(
+                                "cannot inspect attachment '{}': {err}",
+                                path.display()
+                            ))
+                        })?;
+                        if !meta.is_file() {
+                            return Err(bbs_core::CoreError::Media(format!(
+                                "attachment '{}' is not a regular file",
+                                path.display()
+                            )));
+                        }
+                        if meta.len() > MAX_UPLOAD_BYTES {
+                            return Err(bbs_core::CoreError::Media(format!(
+                                "attachment '{}' ({:.1} MiB) exceeds 100 MiB safety limit",
+                                path.display(),
+                                meta.len() as f64 / (1024.0 * 1024.0)
+                            )));
+                        }
+                        let bytes = tokio::fs::read(path).await.map_err(|err| {
+                            bbs_core::CoreError::Media(format!(
+                                "failed to read attachment '{}': {err}",
+                                path.display()
+                            ))
+                        })?;
+                        let filename = path
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("attachment.bin")
+                            .to_string();
+                        let content_type = Some(guess_mime_for_path(path).to_string());
+                        uploads.push(UploadAttachment {
+                            filename,
+                            content_type,
+                            description: None,
+                            bytes,
+                        });
+                    }
+                    let upload_res = rest
+                        .send_message_with_attachments_and_mention(
+                            channel_id,
+                            &content,
+                            reply_to,
+                            mention_replied_user,
+                            &uploads,
+                        )
+                        .await;
+                    for tmp in temp_cleanup {
+                        let _ = tokio::fs::remove_file(tmp).await;
+                    }
+                    let _ = upload_res?;
+                } else {
+                    let names: Vec<String> = attachment_paths
+                        .iter()
+                        .map(|p| {
+                            Path::new(p)
+                                .file_name()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("file")
+                                .to_string()
+                        })
+                        .collect();
+                    let label = format!("[attached: {}]", names.join(", "));
+                    let body = if content.trim().is_empty() {
+                        label
+                    } else {
+                        format!("{content}\n{label}")
+                    };
+                    let _ = discord
+                        .send_message_with_mention(
+                            channel_id,
+                            &body,
+                            reply_to,
+                            mention_replied_user,
+                        )
+                        .await?;
+                    for raw_path in &attachment_paths {
+                        let path = Path::new(raw_path);
+                        if crate::platform::is_managed_clipboard_temp(path) {
+                            let _ = tokio::fs::remove_file(path).await;
+                        }
+                    }
                 }
-                let _ = rest
-                    .send_message_with_attachments_and_mention(
-                        channel_id,
-                        &content,
-                        reply_to,
-                        mention_replied_user,
-                        &uploads,
-                    )
-                    .await?;
             } else {
                 let _ = discord
                     .send_message_with_mention(channel_id, &content, reply_to, mention_replied_user)
@@ -1315,4 +1375,55 @@ fn spawn_video_command_bridge(
             }
         }
     })
+}
+
+fn guess_mime_for_path(path: &Path) -> &'static str {
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return "application/octet-stream";
+    };
+    match ext.to_ascii_lowercase().as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "avif" => "image/avif",
+        "svg" => "image/svg+xml",
+        "mp4" | "m4v" => "video/mp4",
+        "webm" => "video/webm",
+        "mov" => "video/quicktime",
+        "mp3" => "audio/mpeg",
+        "ogg" | "opus" => "audio/ogg",
+        "wav" => "audio/wav",
+        "flac" => "audio/flac",
+        "pdf" => "application/pdf",
+        "zip" => "application/zip",
+        "gz" | "tgz" => "application/gzip",
+        "tar" => "application/x-tar",
+        "json" => "application/json",
+        "txt" | "md" | "log" | "rs" | "py" | "js" | "ts" | "toml" | "yaml" | "yml" | "sh"
+        | "c" | "h" | "cpp" | "go" | "csv" => "text/plain; charset=utf-8",
+        _ => "application/octet-stream",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mime_guessing_covers_images_media_and_fallback() {
+        assert_eq!(guess_mime_for_path(Path::new("shot.PNG")), "image/png");
+        assert_eq!(guess_mime_for_path(Path::new("cat.webp")), "image/webp");
+        assert_eq!(guess_mime_for_path(Path::new("clip.mp4")), "video/mp4");
+        assert_eq!(guess_mime_for_path(Path::new("report.pdf")), "application/pdf");
+        assert_eq!(
+            guess_mime_for_path(Path::new("README.md")),
+            "text/plain; charset=utf-8"
+        );
+        assert_eq!(
+            guess_mime_for_path(Path::new("blob.unknown")),
+            "application/octet-stream"
+        );
+    }
 }

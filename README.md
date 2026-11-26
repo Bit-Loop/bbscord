@@ -147,6 +147,7 @@ Every action works via single-letter **NORMAL** keys (100% safe inside `tmux`, `
 | **Navigate / Scroll** | `j`/`k` · `↑`/`↓` · `g`/`End` · Wheel | **Quick Switcher** | `/` or `Ctrl+K` |
 | **Compose / Autocomplete** | `i` / `Enter` · `Tab` (`@` `:` `#`) | **Live Theme Picker** | `F2`, `T`, or `Ctrl+T` |
 | **Reply (`@` ping toggle)** | `r` (`Tab` / `Alt+M` toggle) | **Animated GIF Picker** | `G`, `F5`, or `Ctrl+G` |
+| **Attach File / Paste Image** | `A`, `Alt+A`, `/attach` · `Ctrl+V` · Drag & Drop | **Remove Staged File** | `Alt+X` (or `Ctrl+C` clear) |
 | **Edit / Delete (confirm)** | `e` / `E` (last own) · `d` / `Del` | **React / Threads / Pins** | `R` / `t` / `p` |
 | **Open Link / Copy Msg / URL** | `o` (or dbl-click) · `y` / `u` | **Search / Next / Prev Unread** | `f` (`Ctrl+F`) · `]` / `[` |
 | **Voice Join / Answer / Hang Up** | `v` / `a` / `h` · `F9` | **Mute / Deafen / Stream** | `m` / `D` / `s` · `F7` / `F8` |

@@ -36,7 +36,9 @@ use crate::cli::Cli;
 use crate::config::{AppConfig, OptionalApiSecrets, save_config};
 use crate::login::{ensure_interactive_tty, run_interactive_login, try_resolve_stored_token};
 use crate::platform::{
-    copy_to_clipboard, detect_local_utc_offset_minutes, open_external_url, run_external_editor,
+    ClipboardPayload, cleanup_managed_clipboard_temps_for_pid, copy_to_clipboard,
+    detect_local_utc_offset_minutes, extract_dropped_file_paths, open_external_url,
+    read_clipboard_payload, run_external_editor,
 };
 
 /// Negative-cache cooldown preventing failed/404/unsupported media URLs from triggering 10 Hz
@@ -394,6 +396,46 @@ impl MediaCoordinator {
             .retain(|_, failed_at| now.saturating_duration_since(*failed_at) < FAILED_URL_COOLDOWN);
 
         for slot in slots {
+            // Local file preview inside the `Alt+A` attachment browser (`file://<path>`).
+            if let Some(local_path) = slot.url.strip_prefix("file://") {
+                if self.pool.get_cached(&slot.url).is_some()
+                    || self.in_flight.contains(&slot.url)
+                    || self.failed_urls.contains_key(&slot.url)
+                {
+                    continue;
+                }
+                self.in_flight.insert(slot.url.clone());
+                let pool = Arc::clone(&self.pool);
+                let tx = self.decoded_tx.clone();
+                let url = slot.url.clone();
+                let path = std::path::PathBuf::from(local_path);
+                tokio::spawn(async move {
+                    let name = path
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("preview.bin")
+                        .to_string();
+                    let (result, evicted) = match tokio::fs::metadata(&path).await {
+                        Ok(meta) if meta.is_file() && meta.len() <= 32 * 1024 * 1024 => {
+                            match tokio::fs::read(&path).await {
+                                Ok(bytes) => {
+                                    match pool
+                                        .decode_and_cache(url.clone(), bytes, Some(name))
+                                        .await
+                                    {
+                                        Ok((decoded, evicted)) => (Some(decoded), evicted),
+                                        Err(_) => (None, Vec::new()),
+                                    }
+                                }
+                                Err(_) => (None, Vec::new()),
+                            }
+                        }
+                        _ => (None, Vec::new()),
+                    };
+                    let _ = tx.send((url, result, evicted));
+                });
+                continue;
+            }
             // Inline video stream keys (e.g. `guild:...` / `call:...`) are populated directly by
             // `ingest_video_frame` and must never be HTTP-fetched or replaced with mock previews.
             if !slot.url.starts_with("http://") && !slot.url.starts_with("https://") {
@@ -1087,7 +1129,7 @@ pub async fn run_interactive(
                         effects.extend(app.handle_mouse(mouse_ev));
                     }
                     Some(Ok(Event::Paste(text))) => {
-                        effects.extend(app.handle_paste(&text));
+                        handle_terminal_paste(&mut app, &text, &mut effects);
                     }
                     Some(Ok(Event::FocusLost)) => {
                         if ptt_held {
@@ -1189,7 +1231,7 @@ pub async fn run_interactive(
                         effects.extend(app.handle_mouse(mouse_ev));
                     }
                     Some(Ok(Event::Paste(text))) => {
-                        effects.extend(app.handle_paste(&text));
+                        handle_terminal_paste(&mut app, &text, &mut effects);
                     }
                     Some(Ok(Event::FocusLost)) => {
                         if ptt_held {
@@ -1306,6 +1348,54 @@ pub async fn run_interactive(
                 } => {
                     services.dispatch_send_as_file(channel_id, content, reply_to);
                 }
+                Effect::PasteClipboard => {
+                    let clip_res = tokio::time::timeout(
+                        Duration::from_millis(1500),
+                        tokio::task::spawn_blocking(read_clipboard_payload),
+                    )
+                    .await;
+                    match clip_res {
+                        Ok(Ok(Ok(Some(ClipboardPayload::ImageFile(path))))) => {
+                            let _ = app.stage_attachment(path.to_string_lossy().into_owned());
+                            if !app.has_modal() {
+                                app.mode = Mode::Insert;
+                            }
+                        }
+                        Ok(Ok(Ok(Some(ClipboardPayload::Files(paths))))) => {
+                            for path in paths {
+                                let _ = app.stage_attachment(path.to_string_lossy().into_owned());
+                            }
+                            if !app.has_modal() {
+                                app.mode = Mode::Insert;
+                            }
+                        }
+                        Ok(Ok(Ok(Some(ClipboardPayload::Text(text))))) => {
+                            let mut extra = Vec::new();
+                            handle_terminal_paste(&mut app, &text, &mut extra);
+                        }
+                        Ok(Ok(Ok(None))) => {
+                            let _ = app.handle_event(BackendEvent::ErrorBanner {
+                                scope: "clipboard".to_string(),
+                                message: "System clipboard is empty.".to_string(),
+                                recoverable: true,
+                            });
+                        }
+                        Ok(Ok(Err(err))) => {
+                            let _ = app.handle_event(BackendEvent::ErrorBanner {
+                                scope: "clipboard".to_string(),
+                                message: err.to_string(),
+                                recoverable: true,
+                            });
+                        }
+                        _ => {
+                            let _ = app.handle_event(BackendEvent::ErrorBanner {
+                                scope: "clipboard".to_string(),
+                                message: "Clipboard read timed out.".to_string(),
+                                recoverable: true,
+                            });
+                        }
+                    }
+                }
                 Effect::Bell => {
                     let mut out = io::stdout();
                     let _ = out.write_all(b"\x07");
@@ -1322,10 +1412,25 @@ pub async fn run_interactive(
         let _ = out.write_all(&final_deletes);
         let _ = out.flush();
     }
+    cleanup_managed_clipboard_temps_for_pid();
     services.shutdown().await;
     drop(terminal);
     let _ = tty_guard.restore();
     Ok(())
+}
+
+fn handle_terminal_paste(app: &mut App, text: &str, effects: &mut Vec<Effect>) {
+    if !app.has_modal() {
+        let dropped = extract_dropped_file_paths(text);
+        if !dropped.is_empty() {
+            for path in dropped {
+                let _ = app.stage_attachment(path.to_string_lossy().into_owned());
+            }
+            app.mode = Mode::Insert;
+            return;
+        }
+    }
+    effects.extend(app.handle_paste(text));
 }
 
 fn handle_interactive_key(
@@ -2327,5 +2432,93 @@ mod tests {
             "rendering Frame 3 must pre-encode next wrap-around Frame 0, got {}",
             lookahead.key
         );
+    }
+
+    #[tokio::test]
+    async fn attach_browser_local_file_preview_and_drag_drop_staging() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "bbscord-attach-test-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Write a tiny valid 1x1 PNG file + a plain text file.
+        let png_path = dir.join("pixel.png");
+        let txt_path = dir.join("notes.txt");
+        // Valid 1x1 red PNG (68 bytes).
+        let png_bytes: &[u8] = &[
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+            0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08,
+            0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xDD, 0x8D,
+            0xB0, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+        std::fs::write(&png_path, png_bytes).unwrap();
+        std::fs::write(&txt_path, b"hello attachment").unwrap();
+
+        // 1. Drag-and-drop paste stages both files directly into `composer.attachments`.
+        let mut app = App::new(TuiConfig::default());
+        let mut effects = Vec::new();
+        let drop_str = format!("'{}' '{}'", png_path.display(), txt_path.display());
+        handle_terminal_paste(&mut app, &drop_str, &mut effects);
+        assert_eq!(app.composer.attachments.len(), 2);
+        assert_eq!(app.mode, Mode::Insert);
+
+        // Alt+X pops the last staged attachment cleanly.
+        let _ = app.handle_key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::ALT,
+        ));
+        assert_eq!(app.composer.attachments.len(), 1);
+
+        // Ctrl+V emits Effect::PasteClipboard.
+        let clip_effects = app.handle_key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('v'),
+            KeyModifiers::CONTROL,
+        ));
+        assert!(clip_effects.iter().any(|e| matches!(e, Effect::PasteClipboard)));
+
+        // 2. `request_missing_slots` decodes local `file://` image previews asynchronously.
+        let env = TerminalEnv::default();
+        let opts = ProbeOptions {
+            charset_override: CharsetMode::Utf8,
+            graphics_override: Some(GraphicsTier::HalfBlock),
+            ..ProbeOptions::default()
+        };
+        let report = negotiate_capabilities(
+            &env,
+            ViewportGeometry::new(80, 24),
+            bbs_runtime_term::GeometrySource::CliOverride,
+            &bbs_runtime_term::ProbeResponse::default(),
+            &opts,
+            false,
+            true,
+        );
+        let mut media = MediaCoordinator::new(&report);
+        let (mut services, _rx) = RuntimeServices::build_mock();
+        let file_url = format!("file://{}", png_path.display());
+        let slot = ImageSlot {
+            url: file_url.clone(),
+            rect: Rect::new(0, 0, 10, 6),
+            visible: Rect::new(0, 0, 10, 6),
+            clip_top: 0,
+            animated: false,
+            focused: true,
+        };
+        media.request_missing_slots(std::slice::from_ref(&slot), &services, &mut app);
+        let outcome = tokio::time::timeout(Duration::from_secs(2), media.decoded_rx.recv())
+            .await
+            .expect("local file decode timed out")
+            .expect("decoded channel closed");
+        assert!(media.apply_decoded_outcome(outcome, &mut app));
+        assert!(media.pool.get_cached(&file_url).is_some());
+        assert!(app.images.contains_key(&file_url));
+
+        services.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

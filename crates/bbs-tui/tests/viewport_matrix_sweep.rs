@@ -1244,3 +1244,69 @@ fn gif_debounce_error_grid_nav_and_media_polish() {
         "newest visible animated chat GIF must be focused when no message is selected"
     );
 }
+
+#[test]
+fn attach_modal_browse_preview_multiselect_slash_cmd_and_send() {
+    let dir = std::env::temp_dir().join(format!(
+        "bbscord-tui-attach-test-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let img = dir.join("alpha.png");
+    let doc = dir.join("beta.txt");
+    std::fs::write(&img, b"fake-png").unwrap();
+    std::fs::write(&doc, b"hello-world").unwrap();
+
+    let mut app = demo_app(ResolvedCharset::Utf8, false);
+    let _ = render(&mut app, 120, 36);
+
+    // 1. `/attach <dir>` opens the interactive file browser rooted at `dir`.
+    app.mode = bbs_tui::Mode::Insert;
+    app.set_composer_text(&format!("/attach {}", dir.display()));
+    let _ = app.handle_key(key(KeyCode::Enter));
+    assert!(app.has_modal(), "/attach <dir> should open Modal::Attach");
+    assert!(app.composer.is_empty());
+
+    // Render modal and navigate down from `..` to `alpha.png` -> must emit a `file://` preview ImageSlot!
+    let _ = app.handle_key(key(KeyCode::Down));
+    let _ = render(&mut app, 120, 36);
+    assert!(
+        app.image_slots()
+            .iter()
+            .any(|s| s.url.starts_with("file://") && s.url.ends_with("alpha.png")),
+        "hovering an image file in Modal::Attach must emit a live file:// preview slot"
+    );
+
+    // Space multi-selects `alpha.png`, Down + Enter selects `beta.txt` and closes modal into Insert mode.
+    let _ = app.handle_key(key(KeyCode::Char(' ')));
+    assert_eq!(app.composer.attachments.len(), 1);
+    let _ = app.handle_key(key(KeyCode::Down));
+    let _ = app.handle_key(key(KeyCode::Enter));
+    assert!(!app.has_modal());
+    assert_eq!(app.mode, bbs_tui::Mode::Insert);
+    assert_eq!(app.composer.attachments.len(), 2);
+
+    // Pressing Enter with empty text sends the 2 staged attachments cleanly!
+    let effects = app.handle_key(key(KeyCode::Enter));
+    let sent = effects.iter().find_map(|e| match e {
+        Effect::Action(UiAction::SendMessage {
+            content,
+            attachment_paths,
+            ..
+        }) => Some((content.clone(), attachment_paths.clone())),
+        _ => None,
+    });
+    let (content, paths) = sent.expect("expected SendMessage with staged attachments");
+    assert_eq!(content, "");
+    assert_eq!(paths.len(), 2);
+    assert!(app.composer.attachments.is_empty());
+
+    // 2. Direct `/attach <file>` stages a single file without opening the modal.
+    app.set_composer_text(&format!("/attach '{}'", img.display()));
+    let _ = app.handle_key(key(KeyCode::Enter));
+    assert!(!app.has_modal());
+    assert_eq!(app.composer.attachments.len(), 1);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

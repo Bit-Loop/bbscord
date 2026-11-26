@@ -864,13 +864,25 @@ impl App {
                 .attachments
                 .iter()
                 .map(|p| {
-                    std::path::Path::new(p)
+                    let path = std::path::Path::new(p);
+                    let fname = path
                         .file_name()
-                        .map(|f| f.to_string_lossy().into_owned())
-                        .unwrap_or_default()
+                        .map(|f| sanitize_single_line(&f.to_string_lossy()).into_owned())
+                        .unwrap_or_else(|| sanitize_single_line(p).into_owned());
+                    if let Ok(meta) = std::fs::metadata(path) {
+                        format!("{fname} ({})", crate::modals::format_file_size(meta.len()))
+                    } else {
+                        fname
+                    }
                 })
                 .collect();
-            let s = format!("{} {}: {}", ctx.g.clip, names.len(), names.join(", "));
+            let s = format!(
+                "{} {}/{}: {}  [Alt+A + · Alt+X pop]",
+                ctx.g.clip,
+                names.len(),
+                Self::MAX_ATTACHMENTS,
+                names.join(", ")
+            );
             draw::put(buf, r.x, r.y, &ctx.n(&s), r.width, ctx.s(Role::Hotkey));
         }
         if l.header.is_none()
@@ -1017,10 +1029,14 @@ impl App {
                 .and_then(|c| self.store.channel(c))
                 .map(|c| sanitize_single_line(&c.display_label()).into_owned())
                 .unwrap_or_default();
-            let hint = if insert {
-                format!("Message {ch_name} - Enter send, Ctrl+G GIF, @/#/: complete, Esc normal")
+            let hint = if insert && !self.composer.attachments.is_empty() {
+                "Optional caption - Enter send attachments, Alt+A add more, Alt+X remove".to_string()
+            } else if insert {
+                format!(
+                    "Message {ch_name} - Enter send, Alt+A file, Ctrl+V img, Ctrl+G GIF, Esc normal"
+                )
             } else {
-                "[i] compose  [G] GIF  [/] jump  [?] help".to_string()
+                "[i] compose  [A] attach  [G] GIF  [/] jump  [?] help".to_string()
             };
             draw::put(buf, tx, r.y, &ctx.n(&hint), tw, ctx.s(Role::Inactive));
             return insert.then_some((tx, r.y));

@@ -2,6 +2,7 @@
 //! reactions, threads/pins/search, Group DM management, DAVE verification, help, confirms.
 
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 use bbs_core::{ChannelKind, DaveSessionState, GifSearchQuery, Snowflake, UiAction};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -52,6 +53,8 @@ pub enum MenuCmd {
     Theme,
     /// GIF picker.
     Gif,
+    /// File / image attachment browser.
+    Attach,
     /// Voice deck.
     Voice,
     /// Help.
@@ -164,6 +167,241 @@ pub enum ConfirmKind {
     TooLong(usize),
 }
 
+/// A single filesystem entry shown inside [`Modal::Attach`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachEntry {
+    /// Display filename (`..` for parent directory).
+    pub name: String,
+    /// Absolute or canonicalized filesystem path.
+    pub path: PathBuf,
+    /// Whether this entry is a directory.
+    pub is_dir: bool,
+    /// Whether this entry is a previewable image or animated GIF/WebP.
+    pub is_image: bool,
+    /// File size in bytes (`0` for directories).
+    pub size_bytes: u64,
+}
+
+/// Interactive file & image attachment browser state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachState {
+    /// Current browsed directory.
+    pub dir: PathBuf,
+    /// Live filter text or typed/pasted filesystem path.
+    pub input: String,
+    /// Whether hidden dotfiles are listed.
+    pub show_hidden: bool,
+    /// Loaded entries in [`Self::dir`].
+    pub entries: Vec<AttachEntry>,
+    /// Filtered indices into [`Self::entries`].
+    pub filtered: Vec<usize>,
+    /// Highlighted row within [`Self::filtered`].
+    pub cursor: usize,
+    /// Inline non-fatal status/error message (e.g. permission denied or path not found).
+    pub error: Option<String>,
+}
+
+impl AttachState {
+    /// Build a new attachment browser rooted at `start_dir`.
+    #[must_use]
+    pub fn new(start_dir: PathBuf) -> Self {
+        let mut s = Self {
+            dir: start_dir,
+            input: String::new(),
+            show_hidden: false,
+            entries: Vec::new(),
+            filtered: Vec::new(),
+            cursor: 0,
+            error: None,
+        };
+        s.reload_dir();
+        s
+    }
+
+    /// Navigate to `dir` and refresh entries.
+    pub fn cd(&mut self, dir: PathBuf) {
+        self.dir = dir;
+        self.cursor = 0;
+        self.error = None;
+        self.reload_dir();
+    }
+
+    /// Reload filesystem entries for [`Self::dir`].
+    pub fn reload_dir(&mut self) {
+        self.entries.clear();
+        if let Some(parent) = self.dir.parent() {
+            self.entries.push(AttachEntry {
+                name: "..".to_string(),
+                path: parent.to_path_buf(),
+                is_dir: true,
+                is_image: false,
+                size_bytes: 0,
+            });
+        }
+        let mut dirs: Vec<AttachEntry> = Vec::new();
+        let mut files: Vec<AttachEntry> = Vec::new();
+        match std::fs::read_dir(&self.dir) {
+            Ok(rd) => {
+                for item in rd.flatten() {
+                    let name = item.file_name().to_string_lossy().into_owned();
+                    if !self.show_hidden && name.starts_with('.') {
+                        continue;
+                    }
+                    let path = item.path();
+                    let meta = std::fs::metadata(&path).ok();
+                    let is_dir = meta.as_ref().is_some_and(std::fs::Metadata::is_dir);
+                    let size_bytes = if is_dir {
+                        0
+                    } else {
+                        meta.as_ref().map_or(0, std::fs::Metadata::len)
+                    };
+                    let entry = AttachEntry {
+                        is_image: !is_dir && is_image_path(&path),
+                        name,
+                        path,
+                        is_dir,
+                        size_bytes,
+                    };
+                    if entry.is_dir {
+                        dirs.push(entry);
+                    } else {
+                        files.push(entry);
+                    }
+                }
+                dirs.sort_by_key(|e| e.name.to_lowercase());
+                files.sort_by_key(|e| e.name.to_lowercase());
+                self.entries.extend(dirs);
+                self.entries.extend(files);
+            }
+            Err(err) => {
+                self.error = Some(format!("Cannot open directory: {err}"));
+            }
+        }
+        self.refilter();
+    }
+
+    /// Recompute [`Self::filtered`] for [`Self::input`].
+    pub fn refilter(&mut self) {
+        let q = self.input.trim();
+        if q.is_empty() || q.contains('/') || q.starts_with('~') || q.starts_with("file://") {
+            self.filtered = (0..self.entries.len()).collect();
+        } else {
+            let m = SkimMatcherV2::default();
+            let mut scored: Vec<(i64, usize)> = self
+                .entries
+                .iter()
+                .enumerate()
+                .filter_map(|(i, e)| m.fuzzy_match(&e.name, q).map(|score| (score, i)))
+                .collect();
+            scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+            self.filtered = scored.into_iter().map(|(_, i)| i).collect();
+        }
+        self.cursor = self.cursor.min(self.filtered.len().saturating_sub(1));
+    }
+
+    /// Currently highlighted filesystem entry.
+    #[must_use]
+    pub fn current(&self) -> Option<&AttachEntry> {
+        self.filtered
+            .get(self.cursor)
+            .and_then(|i| self.entries.get(*i))
+    }
+}
+
+/// Returns `true` if `path` has a previewable image or animated WebP/GIF extension.
+#[must_use]
+pub fn is_image_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "avif" | "ico"
+            )
+        })
+}
+
+/// Format a byte count into a compact human-readable label (`512 B`, `14.2 KB`, `2.4 MB`).
+#[must_use]
+pub fn format_file_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let b = bytes as f64;
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if b < MB {
+        format!("{:.1} KB", b / KB)
+    } else if b < GB {
+        format!("{:.1} MB", b / MB)
+    } else {
+        format!("{:.1} GB", b / GB)
+    }
+}
+
+fn percent_decode_uri_path(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Ok(hex_str) = std::str::from_utf8(&bytes[i + 1..i + 3])
+            && let Ok(val) = u8::from_str_radix(hex_str, 16)
+        {
+            out.push(val);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Expand outer quotes, `file://` URIs, leading `~`, and relative paths against `base_dir`.
+#[must_use]
+pub fn expand_user_path(raw: &str, base_dir: &Path) -> PathBuf {
+    let mut s = raw.trim();
+    if s.len() >= 2
+        && ((s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')))
+    {
+        s = &s[1..s.len() - 1];
+    }
+    let unescaped: String = if let Some(rest) = s.strip_prefix("file://localhost") {
+        percent_decode_uri_path(rest)
+    } else if let Some(rest) = s.strip_prefix("file://") {
+        percent_decode_uri_path(rest)
+    } else {
+        // Unescape shell backslash-escaped spaces/chars when pasted from terminal drag-and-drop.
+        let mut out = String::with_capacity(s.len());
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c == '\\'
+                && let Some(next) = chars.next()
+            {
+                out.push(next);
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    };
+    let candidate = if unescaped == "~" {
+        std::env::var_os("HOME").map_or_else(|| PathBuf::from("~"), PathBuf::from)
+    } else if let Some(rest) = unescaped.strip_prefix("~/") {
+        std::env::var_os("HOME")
+            .map_or_else(|| PathBuf::from(&unescaped), |h| PathBuf::from(h).join(rest))
+    } else {
+        PathBuf::from(&unescaped)
+    };
+    if candidate.is_absolute() {
+        candidate
+    } else {
+        base_dir.join(candidate)
+    }
+}
+
 /// All modals.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Modal {
@@ -173,6 +411,8 @@ pub enum Modal {
     Theme(Picker),
     /// GIF picker.
     Gif(GifState),
+    /// Interactive file / image attachment browser.
+    Attach(AttachState),
     /// Help.
     Help(u16),
     /// Confirmation (`selected_yes` defaults to `false`, i.e., "No" focused for safety).
@@ -546,6 +786,17 @@ impl Modal {
         ))
     }
 
+    /// Interactive file & image attachment browser rooted at `start_dir` (or cwd / `$HOME`).
+    #[must_use]
+    pub fn attach(start_dir: Option<PathBuf>) -> Self {
+        let dir = start_dir
+            .filter(|d| d.is_dir())
+            .or_else(|| std::env::current_dir().ok())
+            .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+            .unwrap_or_else(|| PathBuf::from("."));
+        Self::Attach(AttachState::new(dir))
+    }
+
     /// Feed pasted text into a text input.
     pub fn paste(&mut self, s: &str) {
         let one = s.replace('\n', " ");
@@ -559,6 +810,11 @@ impl Modal {
                 g.cursor = 0;
                 g.pending_search_at_ms = Some(0);
             }
+            Self::Attach(a) => {
+                a.input.push_str(one.trim());
+                a.error = None;
+                a.refilter();
+            }
             Self::Rename(_, t) | Self::Search(t) => t.push_str(&one),
             _ => {}
         }
@@ -569,7 +825,12 @@ impl Modal {
     pub fn has_input(&self) -> bool {
         matches!(
             self,
-            Self::Picker(_) | Self::Theme(_) | Self::Gif(_) | Self::Rename(..) | Self::Search(_)
+            Self::Picker(_)
+                | Self::Theme(_)
+                | Self::Gif(_)
+                | Self::Attach(_)
+                | Self::Rename(..)
+                | Self::Search(_)
         )
     }
 }
@@ -713,6 +974,7 @@ fn run_pick(app: &mut App, a: PickAction) -> ModalOutcome {
                     }));
                     Modal::gif(app.gif_req)
                 }
+                MenuCmd::Attach => Modal::attach(app.last_attach_dir.clone()),
                 MenuCmd::Voice => Modal::Voice,
                 MenuCmd::Help => Modal::help(),
                 MenuCmd::Quit => Modal::confirm_quit(),
@@ -729,6 +991,7 @@ pub fn main_menu() -> Modal {
     let items = [
         ("Jump to channel", MenuCmd::Switcher),
         ("Voice", MenuCmd::Voice),
+        ("Attach file / image", MenuCmd::Attach),
         ("GIF search", MenuCmd::Gif),
         ("Theme", MenuCmd::Theme),
         ("Help", MenuCmd::Help),
@@ -859,6 +1122,26 @@ pub fn activate_row(app: &mut App, m: &mut Modal, index: usize) -> ModalOutcome 
             }
             ModalOutcome::Keep
         }
+        Modal::Attach(a) => {
+            if index >= a.filtered.len() {
+                return ModalOutcome::Keep;
+            }
+            a.cursor = index;
+            if let Some(entry) = a.current().cloned() {
+                if entry.is_dir {
+                    a.cd(entry.path);
+                    a.input.clear();
+                    app.last_attach_dir = Some(a.dir.clone());
+                    return ModalOutcome::Keep;
+                }
+                app.last_attach_dir = Some(a.dir.clone());
+                let path_str = entry.path.to_string_lossy().into_owned();
+                let _ = app.stage_attachment(path_str);
+                app.mode = crate::app::Mode::Insert;
+                return ModalOutcome::Close;
+            }
+            ModalOutcome::Keep
+        }
         Modal::Voice | Modal::Dave => {
             app.deck_cursor = index;
             ModalOutcome::Keep
@@ -897,6 +1180,13 @@ pub fn scroll_modal(app: &mut App, m: &mut Modal, delta: i16) {
                 g.cursor = g.cursor.saturating_sub(stride);
             } else if !items.is_empty() {
                 g.cursor = (g.cursor + stride).min(items.len() - 1);
+            }
+        }
+        Modal::Attach(a) => {
+            if delta < 0 {
+                a.cursor = a.cursor.saturating_sub(steps);
+            } else if !a.filtered.is_empty() {
+                a.cursor = (a.cursor + steps).min(a.filtered.len() - 1);
             }
         }
         Modal::Help(scroll) => {
@@ -1035,6 +1325,156 @@ pub fn handle_key(app: &mut App, m: &mut Modal, k: KeyEvent) -> ModalOutcome {
                         // Debounce live search by 300ms; Enter fires immediately.
                         g.cursor = 0;
                         g.pending_search_at_ms = Some(app.now_ms.saturating_add(300));
+                    }
+                }
+            }
+            ModalOutcome::Keep
+        }
+        Modal::Attach(a) => {
+            if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('v') {
+                app.pending.push(Effect::PasteClipboard);
+                return ModalOutcome::Keep;
+            }
+            if list_nav(&mut a.cursor, a.filtered.len(), &k) {
+                return ModalOutcome::Keep;
+            }
+            match k.code {
+                KeyCode::Backspace if a.input.is_empty() => {
+                    if let Some(parent) = a.dir.parent().map(Path::to_path_buf) {
+                        a.cd(parent);
+                        app.last_attach_dir = Some(a.dir.clone());
+                    }
+                }
+                KeyCode::Left if a.input.is_empty() => {
+                    if let Some(parent) = a.dir.parent().map(Path::to_path_buf) {
+                        a.cd(parent);
+                        app.last_attach_dir = Some(a.dir.clone());
+                    }
+                }
+                KeyCode::Right if a.input.is_empty() => {
+                    if let Some(entry) = a.current().cloned()
+                        && entry.is_dir
+                    {
+                        a.cd(entry.path);
+                        app.last_attach_dir = Some(a.dir.clone());
+                    }
+                }
+                KeyCode::Char('.') if a.input.is_empty() => {
+                    a.show_hidden = !a.show_hidden;
+                    a.reload_dir();
+                }
+                KeyCode::Char('~') if a.input.is_empty() => {
+                    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
+                        && home.is_dir()
+                    {
+                        a.cd(home);
+                        app.last_attach_dir = Some(a.dir.clone());
+                    }
+                }
+                KeyCode::Char(' ') if a.input.is_empty() => {
+                    if let Some(entry) = a.current().cloned()
+                        && !entry.is_dir
+                    {
+                        let p = entry.path.to_string_lossy().into_owned();
+                        app.toggle_staged_attachment(p);
+                        a.error = None;
+                    }
+                }
+                KeyCode::Tab => {
+                    let trimmed = a.input.trim();
+                    if !trimmed.is_empty()
+                        && (trimmed.contains('/') || trimmed.starts_with('~'))
+                    {
+                        let expanded = expand_user_path(trimmed, &a.dir);
+                        if expanded.is_dir() {
+                            a.cd(expanded);
+                            a.input.clear();
+                            app.last_attach_dir = Some(a.dir.clone());
+                        } else if let (Some(parent), Some(prefix)) =
+                            (expanded.parent(), expanded.file_name().and_then(|s| s.to_str()))
+                            && let Ok(rd) = std::fs::read_dir(parent)
+                        {
+                            let mut matches: Vec<PathBuf> = rd
+                                .flatten()
+                                .filter(|e| {
+                                    e.file_name()
+                                        .to_string_lossy()
+                                        .to_lowercase()
+                                        .starts_with(&prefix.to_lowercase())
+                                })
+                                .map(|e| e.path())
+                                .collect();
+                            matches.sort();
+                            if let Some(first) = matches.first() {
+                                if first.is_dir() {
+                                    a.cd(first.clone());
+                                    a.input.clear();
+                                    app.last_attach_dir = Some(a.dir.clone());
+                                } else {
+                                    a.input = first.to_string_lossy().into_owned();
+                                    a.refilter();
+                                }
+                            }
+                        }
+                    } else if let Some(entry) = a.current().cloned() {
+                        if entry.is_dir {
+                            a.cd(entry.path);
+                            a.input.clear();
+                            app.last_attach_dir = Some(a.dir.clone());
+                        } else {
+                            let p = entry.path.to_string_lossy().into_owned();
+                            app.toggle_staged_attachment(p);
+                            a.error = None;
+                        }
+                    }
+                }
+                KeyCode::Enter => {
+                    let trimmed = a.input.trim();
+                    if !trimmed.is_empty()
+                        && (trimmed.contains('/')
+                            || trimmed.starts_with('~')
+                            || trimmed.starts_with("file://"))
+                    {
+                        let p = expand_user_path(trimmed, &a.dir);
+                        if p.is_dir() {
+                            a.cd(p);
+                            a.input.clear();
+                            app.last_attach_dir = Some(a.dir.clone());
+                            return ModalOutcome::Keep;
+                        }
+                        if p.is_file() {
+                            if let Some(parent) = p.parent() {
+                                app.last_attach_dir = Some(parent.to_path_buf());
+                            }
+                            let _ = app.stage_attachment(p.to_string_lossy().into_owned());
+                            app.mode = crate::app::Mode::Insert;
+                            return ModalOutcome::Close;
+                        }
+                        a.error = Some(format!("File not found: {}", sanitize_single_line(&p.to_string_lossy())));
+                        return ModalOutcome::Keep;
+                    }
+                    if let Some(entry) = a.current().cloned() {
+                        if entry.is_dir {
+                            a.cd(entry.path);
+                            a.input.clear();
+                            app.last_attach_dir = Some(a.dir.clone());
+                            return ModalOutcome::Keep;
+                        }
+                        app.last_attach_dir = Some(a.dir.clone());
+                        let p = entry.path.to_string_lossy().into_owned();
+                        let _ = app.stage_attachment(p);
+                        app.mode = crate::app::Mode::Insert;
+                        return ModalOutcome::Close;
+                    }
+                    if !app.composer.attachments.is_empty() {
+                        app.mode = crate::app::Mode::Insert;
+                        return ModalOutcome::Close;
+                    }
+                }
+                _ => {
+                    if edit_line(&mut a.input, &k) {
+                        a.error = None;
+                        a.refilter();
                     }
                 }
             }
@@ -1193,6 +1633,9 @@ pub const KEYMAP: &[(&str, &str, &str, &str)] = &[
     ("Search messages", "f", "", "Ctrl+F"),
     ("Theme switcher", "T", "F2", "Ctrl+T"),
     ("GIF picker", "G", "F5", "Ctrl+G"),
+    ("Attach file / image (/attach)", "A", "", "Alt+A"),
+    ("Paste clipboard image / text", "", "", "Ctrl+V"),
+    ("Remove last staged attachment", "", "", "Alt+X"),
     ("Next / prev unread", "] / [", "", "Ctrl+N / Ctrl+P"),
     ("Mute / deafen (in voice)", "m / D", "F7 / F8", "Ctrl+O"),
     ("Join/leave voice / call / hang up", "v / a / h", "F9", ""),
@@ -1217,6 +1660,7 @@ pub fn render(
     let (want_w, want_h, title) = match m {
         Modal::Picker(p) | Modal::Theme(p) => (60, 20, p.title.clone()),
         Modal::Gif(_) => (86, 24, "GIF".to_string()),
+        Modal::Attach(_) => (86, 24, "Attach File / Image".to_string()),
         Modal::Help(_) => (78, 30, "Help".to_string()),
         Modal::Confirm { .. } => (48, 8, "Confirm".to_string()),
         Modal::Rename(..) => (48, 5, "Rename Group DM".to_string()),
@@ -1245,6 +1689,7 @@ pub fn render(
             render_picker(app, p, inner, mr.sheet, hint_row, buf, ctx)
         }
         Modal::Gif(g) => render_gif(app, g, inner, mr.sheet, hint_row, buf, ctx),
+        Modal::Attach(a) => render_attach(app, a, inner, mr.sheet, hint_row, buf, ctx),
         Modal::Help(scroll) => {
             render_help(*scroll, inner, buf, ctx);
             None
@@ -1800,4 +2245,260 @@ fn render_dave(app: &mut App, inner: Rect, buf: &mut Buffer, ctx: &Ctx<'_>) {
         inner.width,
         ctx.s(Role::Inactive),
     );
+}
+
+fn render_attach(
+    app: &mut App,
+    a: &AttachState,
+    inner: Rect,
+    sheet: bool,
+    hint_row: bool,
+    buf: &mut Buffer,
+    ctx: &Ctx<'_>,
+) -> Option<(u16, u16)> {
+    let _ = sheet;
+    // Row 0: prompt + live filter / path input + right-aligned staged counter.
+    let line = format!("FILE> {}", ctx.n(&a.input));
+    let w = draw::put(
+        buf,
+        inner.x,
+        inner.y,
+        &line,
+        inner.width,
+        ctx.s(Role::Hotkey),
+    );
+    let staged_count = app.composer.attachments.len();
+    let badge = if staged_count > 0 {
+        format!("Staged: {staged_count}/10")
+    } else {
+        "Staged: 0/10".to_string()
+    };
+    let bw = u16::try_from(str_width(&badge)).unwrap_or(0);
+    if inner.width > w + bw + 2 {
+        let st = if staged_count > 0 {
+            ctx.s(Role::Hotkey).add_modifier(Modifier::BOLD)
+        } else {
+            ctx.s(Role::Inactive)
+        };
+        draw::put_right(buf, inner.x, inner.y, &badge, inner.width, st);
+    }
+    let cursor = Some((inner.x + w.min(inner.width.saturating_sub(1)), inner.y));
+
+    if inner.height < 2 {
+        return cursor;
+    }
+
+    // Row 1: active directory (or inline error).
+    if let Some(err) = &a.error {
+        draw::put(
+            buf,
+            inner.x,
+            inner.y + 1,
+            &ctx.n(&format!("! {err}")),
+            inner.width,
+            ctx.s(Role::Mention).add_modifier(Modifier::BOLD),
+        );
+    } else {
+        let hidden_tag = if a.show_hidden { " [hidden]" } else { "" };
+        let dir_label = format!(
+            "Dir: {}{hidden_tag}",
+            sanitize_single_line(&a.dir.to_string_lossy())
+        );
+        draw::put(
+            buf,
+            inner.x,
+            inner.y + 1,
+            &ctx.n(&dir_label),
+            inner.width,
+            ctx.s(Role::Inactive),
+        );
+    }
+
+    let body_top = inner.y + 2;
+    let body_h = inner.height.saturating_sub(2 + u16::from(hint_row));
+    let body = Rect::new(inner.x, body_top, inner.width, body_h);
+    if body.height == 0 || body.width == 0 {
+        if hint_row {
+            draw::put(
+                buf,
+                inner.x,
+                inner.bottom() - 1,
+                &ctx.n("Enter attach  Space multi  Tab complete  Ctrl+V img  Esc close"),
+                inner.width,
+                ctx.s(Role::Inactive),
+            );
+        }
+        return cursor;
+    }
+
+    let preview_entry = a.current().filter(|e| e.is_image && !e.is_dir).cloned();
+    let show_preview = preview_entry.is_some()
+        && body.width >= 56
+        && body.height >= 6
+        && ctx.cfg.graphics != bbs_core::GraphicsTier::TextTagOnly;
+    let (list_rect, preview_pane) = if show_preview {
+        let prev_w = (body.width * 38 / 100).clamp(20, 34);
+        let list_w = body.width.saturating_sub(prev_w + 1);
+        (
+            Rect::new(body.x, body.y, list_w, body.height),
+            Some(Rect::new(body.x + list_w + 1, body.y, prev_w, body.height)),
+        )
+    } else {
+        (body, None)
+    };
+
+    if a.filtered.is_empty() {
+        draw::put(
+            buf,
+            list_rect.x,
+            list_rect.y,
+            &ctx.n("(no matching files — type a path or press Backspace for parent)"),
+            list_rect.width,
+            ctx.s(Role::Inactive),
+        );
+    } else {
+        let lh = usize::from(list_rect.height);
+        let start = a.cursor.saturating_sub(lh.saturating_sub(1));
+        for (vis_idx, &entry_idx) in a.filtered.iter().enumerate().skip(start).take(lh) {
+            let y = list_rect.y + u16::try_from(vis_idx - start).unwrap_or(0);
+            let Some(entry) = a.entries.get(entry_idx) else {
+                continue;
+            };
+            app.modal_rows
+                .push((Rect::new(list_rect.x, y, list_rect.width, 1), vis_idx));
+            let selected = vis_idx == a.cursor;
+            let path_str = entry.path.to_string_lossy();
+            let staged = !entry.is_dir
+                && app
+                    .composer
+                    .attachments
+                    .iter()
+                    .any(|p| p == path_str.as_ref());
+            let prefix = if entry.is_dir {
+                "    "
+            } else if staged {
+                "[x] "
+            } else {
+                "[ ] "
+            };
+            let suffix = if entry.is_dir && entry.name != ".." {
+                "/"
+            } else {
+                ""
+            };
+            let label = format!(
+                "{prefix}{}{suffix}",
+                sanitize_single_line(&entry.name)
+            );
+            let detail = if entry.is_dir {
+                "DIR".to_string()
+            } else if entry.is_image {
+                format!("IMG {}", format_file_size(entry.size_bytes))
+            } else {
+                format_file_size(entry.size_bytes)
+            };
+            let dw = u16::try_from(str_width(&detail)).unwrap_or(0);
+            let lw = list_rect
+                .width
+                .saturating_sub(if dw > 0 { dw + 1 } else { 0 });
+            let row_style = if entry.is_dir {
+                ctx.s(Role::Title)
+            } else if staged {
+                ctx.s(Role::Hotkey).add_modifier(Modifier::BOLD)
+            } else {
+                ctx.s(Role::Fg)
+            };
+            draw::list_row(
+                buf,
+                ctx,
+                list_rect.x,
+                y,
+                list_rect.width,
+                "",
+                selected,
+                row_style,
+            );
+            let st_text = if selected {
+                ctx.s(Role::Selected)
+            } else {
+                row_style
+            };
+            draw::put(buf, list_rect.x, y, &ctx.n(&label), lw, st_text);
+            if dw > 0 && list_rect.width > dw {
+                let st_det = if selected {
+                    ctx.s(Role::Selected)
+                } else if entry.is_image {
+                    ctx.s(Role::Hotkey)
+                } else {
+                    ctx.s(Role::Inactive)
+                };
+                draw::put_right(buf, list_rect.x, y, &detail, list_rect.width, st_det);
+            }
+        }
+    }
+
+    // Live image preview pane when hovering over an image file.
+    if let (Some(pane), Some(entry)) = (preview_pane, preview_entry) {
+        let div_x = pane.x.saturating_sub(1);
+        for y in body.top()..body.bottom() {
+            draw::cell(buf, div_x, y, ctx.g.v, ctx.s(Role::Divider));
+        }
+        let img_h = pane.height.saturating_sub(2).max(1);
+        let img_rect = Rect::new(pane.x, pane.y, pane.width, img_h);
+        let file_url = format!("file://{}", entry.path.to_string_lossy());
+        crate::panes::render_image_box(
+            app,
+            buf,
+            ctx,
+            img_rect,
+            &file_url,
+            &format!("[{}]", sanitize_single_line(&entry.name)),
+            None,
+        );
+        let visible = img_rect.intersection(pane).intersection(buf.area);
+        if visible.width > 0 && visible.height > 0 {
+            let animated = entry
+                .path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|ext| {
+                    ext.eq_ignore_ascii_case("gif") || ext.eq_ignore_ascii_case("webp")
+                });
+            app.image_slots.push(crate::app::ImageSlot {
+                url: file_url,
+                rect: img_rect,
+                visible,
+                clip_top: 0,
+                animated,
+                focused: true,
+            });
+        }
+        if pane.height >= 2 {
+            let meta = format!(
+                "{} ({})",
+                sanitize_single_line(&entry.name),
+                format_file_size(entry.size_bytes)
+            );
+            draw::put(
+                buf,
+                pane.x,
+                pane.bottom() - 1,
+                &ctx.n(&meta),
+                pane.width,
+                ctx.s(Role::Inactive),
+            );
+        }
+    }
+
+    if hint_row {
+        draw::put(
+            buf,
+            inner.x,
+            inner.bottom() - 1,
+            &ctx.n("Enter open/attach  Space multi  Tab complete  Bksp up  . hidden  Ctrl+V img  Esc close"),
+            inner.width,
+            ctx.s(Role::Inactive),
+        );
+    }
+    cursor
 }
