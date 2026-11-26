@@ -12,3 +12,13 @@ bbs-core.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+ratatui-image.workspace = true
+image.workspace = true
+lru.workspace = true
+base64.workspace = true
+unicode-width.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
