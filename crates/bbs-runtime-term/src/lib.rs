@@ -55,9 +55,11 @@ pub use animator::{
     ScrollProxyDebouncer, SettledResize,
 };
 pub use media::{
-    CacheInsertOutcome, DEFAULT_DECODE_CONCURRENCY, DEFAULT_MEDIA_CACHE_BYTES, DecodeLimits,
-    DecodedMedia, KittyDirectFrame, MediaDecoderPool, MediaFitMode, MediaFrameCache, MediaRenderer,
-    MediaWidget, PtyBandwidthGovernor, RenderedMedia, TextTagFrame, aspect_clamped_pixels,
+    CacheInsertOutcome, DEFAULT_DECODE_CONCURRENCY, DEFAULT_ENCODE_CONCURRENCY,
+    DEFAULT_MEDIA_CACHE_BYTES, DecodeLimits, DecodedMedia, KittyDirectFrame,
+    LOCAL_PTY_BYTE_BUDGET_PER_SEC, MediaDecoderPool, MediaEncodeRequest, MediaEncoderPool,
+    MediaFitMode, MediaFrameCache, MediaRenderer, MediaWidget, PtyBandwidthGovernor, RenderedMedia,
+    RenderedMediaFrame, SSH_PTY_BYTE_BUDGET_PER_SEC, TextTagFrame, aspect_clamped_pixels,
     compute_image_cell_box, decode_image_bytes, rgba_frame_to_dynamic_image,
 };
 pub use probe::{

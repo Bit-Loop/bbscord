@@ -1,7 +1,8 @@
 //! Multi-tier terminal media renderer, bounded background image/GIF decoder, byte-bounded
 //! decoded-frame LRU cache, aspect-ratio clamping, and PTY bandwidth governor.
 
-use std::collections::VecDeque;
+use std::borrow::Cow;
+use std::collections::{HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::io::Cursor;
 use std::num::NonZeroU16;
@@ -12,7 +13,10 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use bbs_core::model::RgbaFrame;
 use bbs_core::viewport::{GraphicsTier, ResolvedCharset};
+use flate2::Compression;
+use flate2::write::ZlibEncoder;
 use image::codecs::gif::GifDecoder;
+use image::codecs::webp::WebPDecoder;
 use image::imageops::FilterType;
 use image::{AnimationDecoder, DynamicImage, ImageDecoder, ImageFormat, ImageReader, RgbaImage};
 use lru::LruCache;
@@ -26,7 +30,7 @@ use ratatui_image::protocol::kitty::{Kitty, StatefulKitty};
 use ratatui_image::protocol::sixel::Sixel;
 use ratatui_image::protocol::{Protocol, StatefulProtocol, StatefulProtocolType};
 use ratatui_image::{FontSize, Image as RatatuiImageWidget};
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, mpsc};
 use unicode_width::UnicodeWidthChar;
 
 use crate::probe::{DEFAULT_CELL_PIXELS, ProbeReport};
@@ -35,13 +39,13 @@ use crate::{TermError, TermResult};
 /// Default decoded RGBA frame cache budget (`64 MiB`).
 pub const DEFAULT_MEDIA_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
-/// Default maximum width or height retained for static images after decode.
-pub const DEFAULT_MAX_STATIC_DIM: u32 = 2048;
+/// Default maximum width or height retained for static images after decode (`1024 px`).
+pub const DEFAULT_MAX_STATIC_DIM: u32 = 1024;
 
-/// Default maximum width or height retained for animated GIF preview frames.
+/// Default maximum width or height retained for animated GIF/WebP preview frames.
 pub const DEFAULT_MAX_ANIMATED_DIM: u32 = 320;
 
-/// Default maximum number of decoded frames kept per animated GIF.
+/// Default maximum number of decoded frames kept per animated GIF/WebP.
 pub const DEFAULT_MAX_ANIMATED_FRAMES: usize = 60;
 
 /// Default per-item decoded RGBA memory ceiling (`16 MiB`).
@@ -50,8 +54,11 @@ pub const DEFAULT_MAX_DECODED_BYTES_PER_ITEM: usize = 16 * 1024 * 1024;
 /// Default hard image-header dimension guard against decompression bombs.
 pub const DEFAULT_MAX_HEADER_DIM: u32 = 16_384;
 
-/// Default maximum concurrent background image/GIF decode tasks.
-pub const DEFAULT_DECODE_CONCURRENCY: usize = 4;
+/// Default maximum concurrent background image/GIF decode tasks (`8` parallel workers).
+pub const DEFAULT_DECODE_CONCURRENCY: usize = 8;
+
+/// Default maximum concurrent background terminal-graphics encode tasks (`4` workers).
+pub const DEFAULT_ENCODE_CONCURRENCY: usize = 4;
 
 /// Standard GIF fallback delay when a GIF frame declares `0 ms` (`100 ms`).
 pub const DEFAULT_GIF_DELAY_MS: u16 = 100;
@@ -62,11 +69,11 @@ pub const MIN_GIF_DELAY_MS: u16 = 20;
 /// Maximum clamped per-frame GIF delay (`10_000 ms`).
 pub const MAX_GIF_DELAY_MS: u16 = 10_000;
 
-/// Default local PTY media byte-rate ceiling (`256 KiB/s`).
-pub const LOCAL_PTY_BYTE_BUDGET_PER_SEC: usize = 256 * 1024;
+/// Default local PTY media byte-rate ceiling (`2 MiB/s`).
+pub const LOCAL_PTY_BYTE_BUDGET_PER_SEC: usize = 2 * 1024 * 1024;
 
-/// Default SSH PTY media byte-rate ceiling (`48 KiB/s`).
-pub const SSH_PTY_BYTE_BUDGET_PER_SEC: usize = 48 * 1024;
+/// Default SSH PTY media byte-rate ceiling (`128 KiB/s`).
+pub const SSH_PTY_BYTE_BUDGET_PER_SEC: usize = 128 * 1024;
 
 /// Base64 payload chunk size mandated by the Kitty graphics protocol.
 const KITTY_CHUNK_BYTES: usize = 4096;
@@ -268,8 +275,8 @@ pub fn rgba_frame_to_dynamic_image(frame: &RgbaFrame) -> TermResult<DynamicImage
     Ok(DynamicImage::ImageRgba8(buf))
 }
 
-/// Decode an encoded image or multi-frame GIF byte buffer (GIF, PNG, JPEG, WebP) into a bounded
-/// [`DecodedMedia`] RGBA frame sequence.
+/// Decode an encoded image or multi-frame GIF/WebP byte buffer (GIF, PNG, JPEG, WebP) into a
+/// bounded [`DecodedMedia`] RGBA frame sequence.
 pub fn decode_image_bytes(
     key: impl Into<String>,
     bytes: &[u8],
@@ -286,7 +293,8 @@ pub fn decode_image_bytes(
 
     match format {
         ImageFormat::Gif => decode_gif_bytes(key, bytes, title, limits),
-        ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::WebP => {
+        ImageFormat::WebP => decode_webp_bytes(key, bytes, title, limits),
+        ImageFormat::Png | ImageFormat::Jpeg => {
             decode_static_bytes(key, bytes, format, title, limits)
         }
         other => Err(TermError::MediaDecode(format!(
@@ -305,14 +313,59 @@ fn decode_gif_bytes(
         .map_err(|err| TermError::MediaDecode(format!("invalid GIF header: {err}")))?;
 
     let (source_width, source_height) = decoder.dimensions();
+    decode_animated_frames(
+        key,
+        source_width,
+        source_height,
+        decoder.into_frames(),
+        title,
+        limits,
+        "GIF",
+    )
+}
+
+fn decode_webp_bytes(
+    key: String,
+    bytes: &[u8],
+    title: Option<String>,
+    limits: &DecodeLimits,
+) -> TermResult<DecodedMedia> {
+    let decoder = WebPDecoder::new(Cursor::new(bytes))
+        .map_err(|err| TermError::MediaDecode(format!("invalid WebP header: {err}")))?;
+
+    if !decoder.has_animation() {
+        return decode_static_bytes(key, bytes, ImageFormat::WebP, title, limits);
+    }
+
+    let (source_width, source_height) = decoder.dimensions();
+    decode_animated_frames(
+        key,
+        source_width,
+        source_height,
+        decoder.into_frames(),
+        title,
+        limits,
+        "WebP",
+    )
+}
+
+fn decode_animated_frames(
+    key: String,
+    source_width: u32,
+    source_height: u32,
+    frame_iter: image::Frames<'_>,
+    title: Option<String>,
+    limits: &DecodeLimits,
+    format_label: &str,
+) -> TermResult<DecodedMedia> {
     if source_width == 0 || source_height == 0 {
-        return Err(TermError::MediaDecode(
-            "GIF has zero width or height".to_owned(),
-        ));
+        return Err(TermError::MediaDecode(format!(
+            "{format_label} has zero width or height"
+        )));
     }
     if source_width > limits.max_header_dimension || source_height > limits.max_header_dimension {
         return Err(TermError::MediaDecode(format!(
-            "GIF dimensions {source_width}x{source_height} exceed safety limit {}",
+            "{format_label} dimensions {source_width}x{source_height} exceed safety limit {}",
             limits.max_header_dimension
         )));
     }
@@ -329,12 +382,12 @@ fn decode_gif_bytes(
     let mut accumulated_bytes = 0usize;
     let max_frames = limits.max_animated_frames.max(1);
 
-    for frame_res in decoder.into_frames() {
+    for frame_res in frame_iter {
         if frames.len() >= max_frames {
             break;
         }
         let frame = frame_res
-            .map_err(|err| TermError::MediaDecode(format!("corrupt GIF frame: {err}")))?;
+            .map_err(|err| TermError::MediaDecode(format!("corrupt {format_label} frame: {err}")))?;
 
         let (numer, denom) = frame.delay().numer_denom_ms();
         let raw_delay_ms = numer
@@ -373,7 +426,9 @@ fn decode_gif_bytes(
     }
 
     if frames.is_empty() {
-        return Err(TermError::MediaDecode("GIF contained zero frames".to_owned()));
+        return Err(TermError::MediaDecode(format!(
+            "{format_label} contained zero frames"
+        )));
     }
 
     Ok(DecodedMedia::from_rgba_frames(
@@ -602,7 +657,7 @@ impl MediaDecoderPool {
         }
     }
 
-    /// Create a decoder pool with default settings (`4` workers, `64 MiB` cache).
+    /// Create a decoder pool with default settings (`8` workers, `64 MiB` cache).
     #[must_use]
     pub fn with_defaults() -> Self {
         Self::new(
@@ -680,6 +735,13 @@ impl MediaDecoderPool {
     }
 }
 
+fn zlib_compress_fast(raw: &[u8]) -> std::io::Result<Vec<u8>> {
+    use std::io::Write as _;
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+    encoder.write_all(raw)?;
+    encoder.finish()
+}
+
 /// Direct Kitty graphics protocol frame (`a=T`, no Unicode placeholders) for WezTerm / Konsole.
 #[derive(Debug, Clone)]
 pub struct KittyDirectFrame {
@@ -692,12 +754,18 @@ pub struct KittyDirectFrame {
 }
 
 impl KittyDirectFrame {
-    /// Encode `image` into chunked Kitty direct graphics APC sequences (`f=32` RGBA8).
+    /// Encode `image` into chunked Kitty direct graphics APC sequences (`f=32,o=z` fast zlib-deflated RGBA8).
     #[must_use]
     pub fn encode(image: &DynamicImage, size: Size, id: u32, is_tmux: bool) -> Self {
         let rgba = image.to_rgba8();
         let (px_w, px_h) = rgba.dimensions();
-        let b64 = base64::engine::general_purpose::STANDARD.encode(rgba.as_raw());
+        let raw = rgba.as_raw();
+        let (payload_bytes, compression_flag): (Cow<'_, [u8]>, &str) = match zlib_compress_fast(raw)
+        {
+            Ok(compressed) => (Cow::Owned(compressed), "o=z,"),
+            Err(_) => (Cow::Borrowed(raw), ""),
+        };
+        let b64 = base64::engine::general_purpose::STANDARD.encode(payload_bytes.as_ref());
 
         let mut payload = String::with_capacity(b64.len() + 128);
         let chunks: Vec<&str> = b64
@@ -715,10 +783,11 @@ impl KittyDirectFrame {
             }
             if idx == 0 {
                 // `C=1` suppresses terminal cursor advance so `ratatui`'s `ForcedWidth(1)` cursor
-                // tracking remains synchronized on WezTerm and Konsole.
+                // tracking remains synchronized on WezTerm and Konsole. `s`/`v` carry uncompressed
+                // pixel dimensions even when `o=z` deflates the payload stream.
                 let _ = write!(
                     payload,
-                    "{esc}_Ga=T,f=32,s={px_w},v={px_h},c={},r={},i={id},C=1,q=2,m={more};{chunk}{esc}\\",
+                    "{esc}_Ga=T,f=32,{compression_flag}s={px_w},v={px_h},c={},r={},i={id},C=1,q=2,m={more};{chunk}{esc}\\",
                     size.width, size.height
                 );
             } else {
@@ -772,30 +841,43 @@ impl TextTagFrame {
     /// Format a clean `[GIF: title]` or `[IMG: WxH]` tag clamped to `max_cols`.
     #[must_use]
     pub fn new(media: &DecodedMedia, charset: ResolvedCharset, max_cols: u16) -> Self {
-        let raw = if media.is_animated {
-            let title = media
-                .title
-                .as_deref()
+        Self::from_parts(
+            media.title.as_deref(),
+            media.is_animated,
+            media.source_width,
+            media.source_height,
+            charset,
+            max_cols,
+        )
+    }
+
+    /// Format a clean `[GIF: title]` or `[IMG: WxH]` tag from explicit metadata clamped to `max_cols`.
+    #[must_use]
+    pub fn from_parts(
+        title: Option<&str>,
+        is_animated: bool,
+        source_width: u32,
+        source_height: u32,
+        charset: ResolvedCharset,
+        max_cols: u16,
+    ) -> Self {
+        let raw = if is_animated {
+            let title = title
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .unwrap_or("animation");
             format!("[GIF: {}]", sanitize_tag_text(title, charset))
-        } else if let Some(title) = media
-            .title
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
+        } else if let Some(title) = title.map(str::trim).filter(|s| !s.is_empty()) {
             let clean = sanitize_tag_text(title, charset);
-            let compact = format!("[IMG: {}x{}]", media.source_width, media.source_height);
-            let verbose = format!("[IMG: {clean} {}x{}]", media.source_width, media.source_height);
+            let compact = format!("[IMG: {source_width}x{source_height}]");
+            let verbose = format!("[IMG: {clean} {source_width}x{source_height}]");
             if display_width(&verbose) <= usize::from(max_cols) {
                 verbose
             } else {
                 compact
             }
         } else {
-            format!("[IMG: {}x{}]", media.source_width, media.source_height)
+            format!("[IMG: {source_width}x{source_height}]")
         };
 
         let clipped = clip_to_cells(&raw, usize::from(max_cols));
@@ -1086,7 +1168,7 @@ impl MediaRenderer {
             GraphicsTier::KittyPlaceholder => StatefulProtocolType::Kitty(StatefulKitty::new(
                 self.alloc_kitty_id(),
                 self.tmux_passthrough,
-                false,
+                true,
             )),
             GraphicsTier::Sixel => StatefulProtocolType::Sixel(Sixel {
                 is_tmux: self.tmux_passthrough,
@@ -1158,105 +1240,481 @@ impl MediaRenderer {
         fit: MediaFitMode,
         tier: GraphicsTier,
     ) -> TermResult<RenderedMedia> {
-        if max_cols == 0 || max_rows == 0 {
-            return Ok(RenderedMedia::TextTag(TextTagFrame {
-                label: String::new(),
-                size: Size::new(0, 0),
-            }));
-        }
-
-        if tier == GraphicsTier::TextTagOnly || self.charset == ResolvedCharset::Ascii7Bit {
-            return Ok(self.render_text_tag(media, max_cols));
-        }
-
         let frame = media
             .frame(frame_index)
             .ok_or_else(|| TermError::MediaDecode("media has no decoded frames".to_owned()))?;
 
-        let cell_box = compute_image_cell_box(
-            frame.width,
-            frame.height,
+        encode_rgba_frame(
+            frame,
+            media.title.as_deref(),
+            media.is_animated,
+            (media.source_width, media.source_height),
             max_cols,
             max_rows,
-            self.cell_pixels,
             fit,
-        );
-        if cell_box.width == 0 || cell_box.height == 0 {
-            return Ok(self.render_text_tag(media, max_cols));
+            tier,
+            self.charset,
+            self.cell_pixels,
+            self.tmux_passthrough,
+            &|| self.alloc_kitty_id(),
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_rgba_frame(
+    frame: &RgbaFrame,
+    title: Option<&str>,
+    is_animated: bool,
+    source_dims: (u32, u32),
+    max_cols: u16,
+    max_rows: u16,
+    fit: MediaFitMode,
+    tier: GraphicsTier,
+    charset: ResolvedCharset,
+    cell_pixels: (u16, u16),
+    tmux_passthrough: bool,
+    alloc_kitty_id: &impl Fn() -> u32,
+) -> TermResult<RenderedMedia> {
+    if max_cols == 0 || max_rows == 0 {
+        return Ok(RenderedMedia::TextTag(TextTagFrame {
+            label: String::new(),
+            size: Size::new(0, 0),
+        }));
+    }
+
+    if tier == GraphicsTier::TextTagOnly || charset == ResolvedCharset::Ascii7Bit {
+        return Ok(RenderedMedia::TextTag(TextTagFrame::from_parts(
+            title,
+            is_animated,
+            source_dims.0,
+            source_dims.1,
+            charset,
+            max_cols,
+        )));
+    }
+
+    let safe_cell_px = (cell_pixels.0.max(1), cell_pixels.1.max(1));
+    let cell_box = compute_image_cell_box(
+        frame.width,
+        frame.height,
+        max_cols,
+        max_rows,
+        safe_cell_px,
+        fit,
+    );
+    if cell_box.width == 0 || cell_box.height == 0 {
+        return Ok(RenderedMedia::TextTag(TextTagFrame::from_parts(
+            title,
+            is_animated,
+            source_dims.0,
+            source_dims.1,
+            charset,
+            max_cols,
+        )));
+    }
+
+    let image = rgba_frame_to_dynamic_image(frame)?;
+    let target_px_w = (u32::from(cell_box.width) * u32::from(safe_cell_px.0)).max(1);
+    let target_px_h = (u32::from(cell_box.height) * u32::from(safe_cell_px.1)).max(1);
+    let resized = if image.width() == target_px_w && image.height() == target_px_h {
+        image
+    } else {
+        image.resize_exact(target_px_w, target_px_h, FilterType::Triangle)
+    };
+
+    match tier {
+        GraphicsTier::KittyPlaceholder => {
+            let id = alloc_kitty_id();
+            // `Kitty::new(..., true)` deflates RGBA8 with fast zlib (`o=z`), shrinking typical
+            // wire payloads 3x-20x; estimate conservatively at 50% of raw base64 size.
+            let raw_b64 = (target_px_w as usize * target_px_h as usize * 4) * 4 / 3;
+            let est = (raw_b64 / 2).max(256);
+            let proto = Kitty::new(resized, cell_box, id, tmux_passthrough, true)
+                .map_err(|err| TermError::MediaEncode(err.to_string()))?;
+            Ok(RenderedMedia::Ratatui {
+                protocol: Protocol::Kitty(proto),
+                tier: GraphicsTier::KittyPlaceholder,
+                kitty_id: Some(id),
+                estimated_bytes: est,
+            })
         }
+        GraphicsTier::KittyDirect => {
+            let id = alloc_kitty_id();
+            Ok(RenderedMedia::KittyDirect(KittyDirectFrame::encode(
+                &resized,
+                cell_box,
+                id,
+                tmux_passthrough,
+            )))
+        }
+        GraphicsTier::Sixel => {
+            let proto = Sixel::new(resized, cell_box, tmux_passthrough)
+                .map_err(|err| TermError::MediaEncode(err.to_string()))?;
+            let est = proto.data.len();
+            Ok(RenderedMedia::Ratatui {
+                protocol: Protocol::Sixel(proto),
+                tier: GraphicsTier::Sixel,
+                kitty_id: None,
+                estimated_bytes: est,
+            })
+        }
+        GraphicsTier::ITerm2 => {
+            let proto = Iterm2::new(resized, cell_box, tmux_passthrough)
+                .map_err(|err| TermError::MediaEncode(err.to_string()))?;
+            let est = proto.data.len();
+            Ok(RenderedMedia::Ratatui {
+                protocol: Protocol::ITerm2(proto),
+                tier: GraphicsTier::ITerm2,
+                kitty_id: None,
+                estimated_bytes: est,
+            })
+        }
+        GraphicsTier::HalfBlock => {
+            let proto = Halfblocks::new(resized, cell_box)
+                .map_err(|err| TermError::MediaEncode(err.to_string()))?;
+            // ~24 bytes SGR + UTF-8 '▀' per cell worst case.
+            let est = usize::from(cell_box.width) * usize::from(cell_box.height) * 24;
+            Ok(RenderedMedia::Ratatui {
+                protocol: Protocol::Halfblocks(proto),
+                tier: GraphicsTier::HalfBlock,
+                kitty_id: None,
+                estimated_bytes: est,
+            })
+        }
+        GraphicsTier::TextTagOnly => Ok(RenderedMedia::TextTag(TextTagFrame::from_parts(
+            title,
+            is_animated,
+            source_dims.0,
+            source_dims.1,
+            charset,
+            max_cols,
+        ))),
+    }
+}
 
-        let image = rgba_frame_to_dynamic_image(frame)?;
-        let target_px_w = (u32::from(cell_box.width) * u32::from(self.cell_pixels.0)).max(1);
-        let target_px_h = (u32::from(cell_box.height) * u32::from(self.cell_pixels.1)).max(1);
-        let resized = if image.width() == target_px_w && image.height() == target_px_h {
-            image
-        } else {
-            image.resize_exact(target_px_w, target_px_h, FilterType::Triangle)
-        };
+/// Request submitted to [`MediaEncoderPool`] for non-blocking off-main-thread graphics encoding.
+#[derive(Debug, Clone)]
+pub struct MediaEncodeRequest {
+    /// Caller correlation/cache key (e.g. canonical URL or composite slot key).
+    pub key: String,
+    /// Shared decoded RGBA8 frame pixels.
+    pub frame: Arc<RgbaFrame>,
+    /// Target bounding box width in terminal character cells.
+    pub width_cells: u16,
+    /// Target bounding box height in terminal character cells.
+    pub height_cells: u16,
+    /// Graphics protocol tier used to encode this frame.
+    pub tier: GraphicsTier,
+    /// Terminal character cell dimensions `(width_px, height_px)`.
+    pub cell_px: (u16, u16),
+    /// Aspect-ratio fit mode (default [`MediaFitMode::Contain`]).
+    pub fit: MediaFitMode,
+    /// Active character set used when falling back to `TextTagOnly`.
+    pub charset: ResolvedCharset,
+    /// Wrap Kitty/Sixel/iTerm2 sequences in `tmux` DCS passthrough.
+    pub tmux_passthrough: bool,
+    /// Optional label/title for `TextTagOnly` fallback rendering.
+    pub title: Option<String>,
+    /// Whether this frame belongs to an animated sequence (for bandwidth prioritization).
+    pub is_animated: bool,
+}
 
-        match tier {
-            GraphicsTier::KittyPlaceholder => {
-                let id = self.alloc_kitty_id();
-                let est = (target_px_w as usize * target_px_h as usize * 4) * 4 / 3;
-                let proto = Kitty::new(resized, cell_box, id, self.tmux_passthrough, false)
-                    .map_err(|err| TermError::MediaEncode(err.to_string()))?;
-                Ok(RenderedMedia::Ratatui {
-                    protocol: Protocol::Kitty(proto),
-                    tier: GraphicsTier::KittyPlaceholder,
-                    kitty_id: Some(id),
-                    estimated_bytes: est,
-                })
-            }
-            GraphicsTier::KittyDirect => {
-                let id = self.alloc_kitty_id();
-                Ok(RenderedMedia::KittyDirect(KittyDirectFrame::encode(
-                    &resized,
-                    cell_box,
-                    id,
-                    self.tmux_passthrough,
-                )))
-            }
-            GraphicsTier::Sixel => {
-                let proto = Sixel::new(resized, cell_box, self.tmux_passthrough)
-                    .map_err(|err| TermError::MediaEncode(err.to_string()))?;
-                let est = proto.data.len();
-                Ok(RenderedMedia::Ratatui {
-                    protocol: Protocol::Sixel(proto),
-                    tier: GraphicsTier::Sixel,
-                    kitty_id: None,
-                    estimated_bytes: est,
-                })
-            }
-            GraphicsTier::ITerm2 => {
-                let proto = Iterm2::new(resized, cell_box, self.tmux_passthrough)
-                    .map_err(|err| TermError::MediaEncode(err.to_string()))?;
-                let est = proto.data.len();
-                Ok(RenderedMedia::Ratatui {
-                    protocol: Protocol::ITerm2(proto),
-                    tier: GraphicsTier::ITerm2,
-                    kitty_id: None,
-                    estimated_bytes: est,
-                })
-            }
-            GraphicsTier::HalfBlock => {
-                let proto = Halfblocks::new(resized, cell_box)
-                    .map_err(|err| TermError::MediaEncode(err.to_string()))?;
-                // ~24 bytes SGR + UTF-8 '▀' per cell worst case.
-                let est = usize::from(cell_box.width) * usize::from(cell_box.height) * 24;
-                Ok(RenderedMedia::Ratatui {
-                    protocol: Protocol::Halfblocks(proto),
-                    tier: GraphicsTier::HalfBlock,
-                    kitty_id: None,
-                    estimated_bytes: est,
-                })
-            }
-            GraphicsTier::TextTagOnly => Ok(self.render_text_tag(media, max_cols)),
+impl MediaEncodeRequest {
+    /// Construct an encode request with standard defaults (`Contain`, `Utf8`, no tmux passthrough).
+    #[must_use]
+    pub fn new(
+        key: impl Into<String>,
+        frame: Arc<RgbaFrame>,
+        width_cells: u16,
+        height_cells: u16,
+        tier: GraphicsTier,
+        cell_px: (u16, u16),
+    ) -> Self {
+        Self {
+            key: key.into(),
+            frame,
+            width_cells,
+            height_cells,
+            tier,
+            cell_px,
+            fit: MediaFitMode::Contain,
+            charset: ResolvedCharset::Utf8,
+            tmux_passthrough: false,
+            title: None,
+            is_animated: false,
         }
     }
 }
 
+/// Ready-to-draw encoded terminal graphics frame returned asynchronously by [`MediaEncoderPool`].
+#[derive(Clone)]
+pub struct RenderedMediaFrame {
+    /// Caller correlation/cache key echoed from the request.
+    pub key: String,
+    /// Requested bounding box width in terminal character cells.
+    pub width_cells: u16,
+    /// Requested bounding box height in terminal character cells.
+    pub height_cells: u16,
+    /// Graphics tier that produced [`Self::media`].
+    pub tier: GraphicsTier,
+    /// Whether this frame belongs to an animated sequence.
+    pub is_animated: bool,
+    /// Encoded terminal graphics payload ready to render immediately into a `ratatui` buffer.
+    pub media: RenderedMedia,
+}
+
+impl RenderedMediaFrame {
+    /// Render this frame into `buf` clipped to `area`.
+    pub fn render(&self, area: Rect, buf: &mut Buffer) {
+        self.media.render(area, buf);
+    }
+
+    /// Estimated PTY byte footprint emitted when rendering this frame.
+    #[must_use]
+    pub fn estimated_pty_bytes(&self) -> usize {
+        self.media.estimated_pty_bytes()
+    }
+
+    /// Assigned Kitty image ID, if applicable.
+    #[must_use]
+    pub const fn kitty_id(&self) -> Option<u32> {
+        self.media.kitty_id()
+    }
+
+    /// Consume this wrapper and return the inner [`RenderedMedia`].
+    #[must_use]
+    pub fn into_media(self) -> RenderedMedia {
+        self.media
+    }
+}
+
+type EncodeJobKey = (String, u16, u16, GraphicsTier);
+
+struct InFlightEncodeGuard {
+    in_flight: Arc<Mutex<HashSet<EncodeJobKey>>>,
+    job_key: EncodeJobKey,
+}
+
+impl Drop for InFlightEncodeGuard {
+    fn drop(&mut self) {
+        let mut guard = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.remove(&self.job_key);
+    }
+}
+
+/// Bounded asynchronous off-main-thread pixel encoder (`spawn_blocking` + `mpsc` result stream).
+///
+/// Keeps `terminal.draw(...)` completely free of RGBA cloning, resizing, zlib deflation, Sixel
+/// quantization, and PNG encoding stalls by dispatching encoding onto Tokio's blocking pool and
+/// delivering ready-to-draw [`RenderedMediaFrame`]s over an `mpsc` channel suitable for
+/// `tokio::select!`.
+#[derive(Clone)]
+pub struct MediaEncoderPool {
+    semaphore: Arc<Semaphore>,
+    tx: mpsc::UnboundedSender<RenderedMediaFrame>,
+    in_flight: Arc<Mutex<HashSet<EncodeJobKey>>>,
+    next_kitty_id: Arc<AtomicU32>,
+    charset: ResolvedCharset,
+    tmux_passthrough: bool,
+}
+
+impl MediaEncoderPool {
+    /// Create a bounded encoder pool with explicit concurrency cap, charset, and tmux mode,
+    /// returning `(pool, result_rx)` for direct `tokio::select!` integration.
+    #[must_use]
+    pub fn with_options(
+        max_concurrent_encodes: usize,
+        charset: ResolvedCharset,
+        tmux_passthrough: bool,
+    ) -> (Self, mpsc::UnboundedReceiver<RenderedMediaFrame>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let pool = Self {
+            semaphore: Arc::new(Semaphore::new(max_concurrent_encodes.max(1))),
+            tx,
+            in_flight: Arc::new(Mutex::new(HashSet::new())),
+            // Start above Kitty probe ID 31 and well separated from MediaRenderer's 100.. range.
+            next_kitty_id: Arc::new(AtomicU32::new(10_000)),
+            charset,
+            tmux_passthrough,
+        };
+        (pool, rx)
+    }
+
+    /// Create an encoder pool with explicit concurrency cap and default UTF-8 / non-tmux settings.
+    #[must_use]
+    pub fn new(
+        max_concurrent_encodes: usize,
+    ) -> (Self, mpsc::UnboundedReceiver<RenderedMediaFrame>) {
+        Self::with_options(max_concurrent_encodes, ResolvedCharset::Utf8, false)
+    }
+
+    /// Create an encoder pool configured with default concurrency (`4` workers).
+    #[must_use]
+    pub fn with_defaults() -> (Self, mpsc::UnboundedReceiver<RenderedMediaFrame>) {
+        Self::new(DEFAULT_ENCODE_CONCURRENCY)
+    }
+
+    /// Create an encoder pool inheriting `resolved_charset` and `tmux_passthrough_active` from a [`ProbeReport`].
+    #[must_use]
+    pub fn from_probe(
+        report: &ProbeReport,
+    ) -> (Self, mpsc::UnboundedReceiver<RenderedMediaFrame>) {
+        Self::with_options(
+            DEFAULT_ENCODE_CONCURRENCY,
+            report.resolved_charset,
+            report.tmux_passthrough_active,
+        )
+    }
+
+    fn alloc_kitty_id(counter: &AtomicU32) -> u32 {
+        let id = counter.fetch_add(1, Ordering::Relaxed);
+        if id < 10_000 {
+            counter.store(10_001, Ordering::Relaxed);
+            10_000
+        } else {
+            id
+        }
+    }
+
+    /// Enqueue a non-blocking background encode job from positional parameters.
+    ///
+    /// Returns `true` if a new background task was spawned, or `false` if an identical
+    /// `(key, width_cells, height_cells, tier)` job is already in flight.
+    pub fn enqueue(
+        &self,
+        key: impl Into<String>,
+        frame: Arc<RgbaFrame>,
+        width_cells: u16,
+        height_cells: u16,
+        tier: GraphicsTier,
+        cell_px: (u16, u16),
+    ) -> bool {
+        let mut req = MediaEncodeRequest::new(key, frame, width_cells, height_cells, tier, cell_px);
+        req.charset = self.charset;
+        req.tmux_passthrough = self.tmux_passthrough;
+        self.enqueue_request(req)
+    }
+
+    /// Enqueue a full [`MediaEncodeRequest`] onto the bounded background blocking pool.
+    ///
+    /// Deduplicates concurrent jobs with the same `(key, width_cells, height_cells, tier)` and
+    /// delivers completed [`RenderedMediaFrame`]s on the paired `mpsc` receiver.
+    pub fn enqueue_request(&self, req: MediaEncodeRequest) -> bool {
+        let job_key: EncodeJobKey = (req.key.clone(), req.width_cells, req.height_cells, req.tier);
+        {
+            let mut guard = self
+                .in_flight
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !guard.insert(job_key.clone()) {
+                return false;
+            }
+        }
+
+        let semaphore = Arc::clone(&self.semaphore);
+        let tx = self.tx.clone();
+        let in_flight = Arc::clone(&self.in_flight);
+        let kitty_ids = Arc::clone(&self.next_kitty_id);
+
+        tokio::spawn(async move {
+            let _guard = InFlightEncodeGuard { in_flight, job_key };
+            let Ok(_permit) = semaphore.acquire_owned().await else {
+                return;
+            };
+            let result = tokio::task::spawn_blocking(move || encode_request_sync(req, &kitty_ids))
+                .await;
+            match result {
+                Ok(Ok(rendered_frame)) => {
+                    let _ = tx.send(rendered_frame);
+                }
+                Ok(Err(err)) => {
+                    tracing::warn!(error = %err, "background media encode failed");
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "background media encode task join failed");
+                }
+            }
+        });
+        true
+    }
+
+    /// Encode a single [`MediaEncodeRequest`] asynchronously on the bounded blocking pool and
+    /// return the ready-to-draw [`RenderedMediaFrame`] directly.
+    pub async fn encode_once(&self, req: MediaEncodeRequest) -> TermResult<RenderedMediaFrame> {
+        let _permit = self
+            .semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| TermError::MediaEncode("encoder pool closed".to_owned()))?;
+        let kitty_ids = Arc::clone(&self.next_kitty_id);
+        tokio::task::spawn_blocking(move || encode_request_sync(req, &kitty_ids))
+            .await
+            .map_err(|err| TermError::TaskJoin(err.to_string()))?
+    }
+
+    /// Returns `true` if an encode job for `(key, width_cells, height_cells, tier)` is currently in flight.
+    #[must_use]
+    pub fn is_in_flight(
+        &self,
+        key: &str,
+        width_cells: u16,
+        height_cells: u16,
+        tier: GraphicsTier,
+    ) -> bool {
+        let guard = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.contains(&(key.to_owned(), width_cells, height_cells, tier))
+    }
+
+    /// Clear in-flight deduplication entries (e.g. after a terminal resize or redraw reset).
+    pub fn clear_in_flight(&self) {
+        let mut guard = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.clear();
+    }
+}
+
+fn encode_request_sync(
+    req: MediaEncodeRequest,
+    kitty_ids: &AtomicU32,
+) -> TermResult<RenderedMediaFrame> {
+    let source_dims = (req.frame.width, req.frame.height);
+    let media = encode_rgba_frame(
+        &req.frame,
+        req.title.as_deref(),
+        req.is_animated,
+        source_dims,
+        req.width_cells,
+        req.height_cells,
+        req.fit,
+        req.tier,
+        req.charset,
+        req.cell_px,
+        req.tmux_passthrough,
+        &|| MediaEncoderPool::alloc_kitty_id(kitty_ids),
+    )?;
+    Ok(RenderedMediaFrame {
+        key: req.key,
+        width_cells: req.width_cells,
+        height_cells: req.height_cells,
+        tier: req.tier,
+        is_animated: req.is_animated,
+        media,
+    })
+}
+
 /// Sliding-window PTY byte-rate governor preventing animated media from saturating slow PTYs or
-/// stalling keyboard input over SSH/tmux.
+/// stalling keyboard input over SSH/tmux while guaranteeing static images are never permanently
+/// starved via single-frame token-bucket debt.
 #[derive(Debug, Clone)]
 pub struct PtyBandwidthGovernor {
     budget_bytes_per_sec: usize,
@@ -1277,7 +1735,7 @@ impl PtyBandwidthGovernor {
         }
     }
 
-    /// Construct a governor tuned for local (`256 KiB/s`) or SSH (`48 KiB/s`) sessions.
+    /// Construct a governor tuned for local (`2 MiB/s`) or SSH (`128 KiB/s`) sessions.
     #[must_use]
     pub fn for_session(over_ssh: bool) -> Self {
         Self::new(if over_ssh {
@@ -1298,10 +1756,41 @@ impl PtyBandwidthGovernor {
         }
     }
 
-    /// Returns `true` if emitting `bytes` at `now` stays within the 1-second byte budget.
-    pub fn can_emit(&mut self, bytes: usize, now: Instant) -> bool {
+    /// Returns `true` if emitting a static image of `bytes` at `now` is allowed.
+    ///
+    /// Uses token-bucket debt: when `window_bytes == 0`, a single static image is ALWAYS permitted
+    /// even if `bytes > budget_bytes_per_sec`, so large static images can never be permanently
+    /// starved. Subsequent frames wait until the rolling 1-second window drains.
+    pub fn can_emit_static(&mut self, bytes: usize, now: Instant) -> bool {
         self.prune(now);
-        self.window_bytes.saturating_add(bytes) <= self.budget_bytes_per_sec
+        self.window_bytes == 0
+            || self.window_bytes.saturating_add(bytes) <= self.budget_bytes_per_sec
+    }
+
+    /// Returns `true` if emitting an animated GIF or inline video frame of `bytes` at `now` stays
+    /// within the animation sub-budget (`75%` of `budget_bytes_per_sec`).
+    ///
+    /// Animations never incur token-bucket debt and throttle before static images so large static
+    /// attachments always render promptly.
+    pub fn can_emit_animation(&mut self, bytes: usize, now: Instant) -> bool {
+        self.prune(now);
+        let animation_budget = (self.budget_bytes_per_sec / 4).saturating_mul(3);
+        self.window_bytes.saturating_add(bytes) <= animation_budget
+    }
+
+    /// Dispatch bandwidth check based on whether the frame is animated (`true`) or static (`false`).
+    pub fn can_emit_for(&mut self, bytes: usize, is_animated: bool, now: Instant) -> bool {
+        if is_animated {
+            self.can_emit_animation(bytes, now)
+        } else {
+            self.can_emit_static(bytes, now)
+        }
+    }
+
+    /// Returns `true` if emitting a static frame of `bytes` at `now` is permitted (alias for
+    /// [`Self::can_emit_static`], preserving single-frame debt so static images never starve).
+    pub fn can_emit(&mut self, bytes: usize, now: Instant) -> bool {
+        self.can_emit_static(bytes, now)
     }
 
     /// Record that `bytes` of media data were emitted at `now`.
@@ -1600,13 +2089,45 @@ mod tests {
     #[test]
     fn pty_bandwidth_governor_enforces_local_and_ssh_budgets() {
         let t0 = Instant::now();
+        let local_gov = PtyBandwidthGovernor::for_session(false);
+        assert_eq!(local_gov.budget_bytes_per_sec(), 2 * 1024 * 1024);
+
         let mut ssh_gov = PtyBandwidthGovernor::for_session(true);
-        assert_eq!(ssh_gov.budget_bytes_per_sec(), SSH_PTY_BYTE_BUDGET_PER_SEC);
-        assert!(ssh_gov.can_emit(30_000, t0));
-        ssh_gov.record_emitted(30_000, t0);
-        assert!(!ssh_gov.can_emit(30_000, t0 + Duration::from_millis(200)));
+        assert_eq!(ssh_gov.budget_bytes_per_sec(), 128 * 1024);
+        assert!(ssh_gov.can_emit(80_000, t0));
+        ssh_gov.record_emitted(80_000, t0);
+        assert!(!ssh_gov.can_emit(80_000, t0 + Duration::from_millis(200)));
         // After the 1-second window expires, budget resets cleanly.
-        assert!(ssh_gov.can_emit(30_000, t0 + Duration::from_millis(1050)));
+        assert!(ssh_gov.can_emit(80_000, t0 + Duration::from_millis(1050)));
+    }
+
+    #[test]
+    fn pty_bandwidth_governor_allows_oversized_static_when_idle_and_throttles_animations() {
+        let t0 = Instant::now();
+        let mut ssh_gov = PtyBandwidthGovernor::for_session(true);
+        let oversized = SSH_PTY_BYTE_BUDGET_PER_SEC * 2 + 4096;
+
+        // When window_bytes == 0, an oversized single static image MUST be allowed (token-bucket debt).
+        assert!(ssh_gov.can_emit_static(oversized, t0));
+        assert!(ssh_gov.can_emit_for(oversized, false, t0));
+        // Animations NEVER incur token-bucket debt above their sub-budget.
+        assert!(!ssh_gov.can_emit_animation(oversized, t0));
+        assert!(!ssh_gov.can_emit_for(oversized, true, t0));
+
+        // Record the oversized static emission -> subsequent animations and static frames throttle.
+        ssh_gov.record_emitted(oversized, t0);
+        let t_mid = t0 + Duration::from_millis(250);
+        assert!(!ssh_gov.can_emit_animation(1024, t_mid));
+        assert!(!ssh_gov.can_emit_static(1024, t_mid));
+
+        // After the 1-second window clears, static images can occupy up to 100% while animations
+        // throttle first at 75% load.
+        let t_next = t0 + Duration::from_millis(1050);
+        let eighty_pct = (SSH_PTY_BYTE_BUDGET_PER_SEC * 4) / 5;
+        assert!(ssh_gov.can_emit_static(eighty_pct, t_next));
+        ssh_gov.record_emitted(eighty_pct, t_next);
+        assert!(!ssh_gov.can_emit_animation(512, t_next + Duration::from_millis(50)));
+        assert!(ssh_gov.can_emit_static(8 * 1024, t_next + Duration::from_millis(50)));
     }
 
     #[test]
@@ -1689,30 +2210,334 @@ mod tests {
         }
     }
 
+    fn make_test_animated_webp(
+        frame_count: usize,
+        width: u32,
+        height: u32,
+        delay_ms: u32,
+    ) -> Vec<u8> {
+        let mut body = Vec::new();
+
+        // VP8X extended header chunk (10 bytes): bit 1 = Animation (0x02), bit 4 = Alpha (0x10).
+        let mut vp8x = [0u8; 10];
+        vp8x[0] = 0x12;
+        let w_m1 = width - 1;
+        let h_m1 = height - 1;
+        vp8x[4] = (w_m1 & 0xFF) as u8;
+        vp8x[5] = ((w_m1 >> 8) & 0xFF) as u8;
+        vp8x[6] = ((w_m1 >> 16) & 0xFF) as u8;
+        vp8x[7] = (h_m1 & 0xFF) as u8;
+        vp8x[8] = ((h_m1 >> 8) & 0xFF) as u8;
+        vp8x[9] = ((h_m1 >> 16) & 0xFF) as u8;
+        body.extend_from_slice(b"VP8X");
+        body.extend_from_slice(&10u32.to_le_bytes());
+        body.extend_from_slice(&vp8x);
+
+        // ANIM chunk (6 bytes): BGRA background = transparent black, loop count = 0 (infinite).
+        body.extend_from_slice(b"ANIM");
+        body.extend_from_slice(&6u32.to_le_bytes());
+        body.extend_from_slice(&[0u8; 6]);
+
+        for idx in 0..frame_count {
+            let color = Rgba([
+                ((idx * 60 + 20) % 255) as u8,
+                ((idx * 80 + 40) % 255) as u8,
+                ((idx * 100 + 60) % 255) as u8,
+                255,
+            ]);
+            let img = RgbaImage::from_pixel(width, height, color);
+            let mut single = Vec::new();
+            assert!(
+                DynamicImage::ImageRgba8(img)
+                    .write_to(&mut Cursor::new(&mut single), ImageFormat::WebP)
+                    .is_ok()
+            );
+            // Strip the 12-byte `RIFF <size> WEBP` container header to extract the VP8L chunk.
+            let frame_chunk = &single[12..];
+
+            let mut anmf = Vec::with_capacity(16 + frame_chunk.len());
+            // Frame X/Y offsets (0, 0) in 24-bit LE.
+            anmf.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+            // Frame width-1 & height-1 in 24-bit LE.
+            anmf.extend_from_slice(&[
+                (w_m1 & 0xFF) as u8,
+                ((w_m1 >> 8) & 0xFF) as u8,
+                ((w_m1 >> 16) & 0xFF) as u8,
+                (h_m1 & 0xFF) as u8,
+                ((h_m1 >> 8) & 0xFF) as u8,
+                ((h_m1 >> 16) & 0xFF) as u8,
+            ]);
+            // Frame duration in ms (24-bit LE) + flags (0x02 = do not blend).
+            anmf.extend_from_slice(&[
+                (delay_ms & 0xFF) as u8,
+                ((delay_ms >> 8) & 0xFF) as u8,
+                ((delay_ms >> 16) & 0xFF) as u8,
+                0x02,
+            ]);
+            anmf.extend_from_slice(frame_chunk);
+
+            body.extend_from_slice(b"ANMF");
+            body.extend_from_slice(&(anmf.len() as u32).to_le_bytes());
+            body.extend_from_slice(&anmf);
+            if anmf.len() % 2 == 1 {
+                body.push(0);
+            }
+        }
+
+        let mut riff = Vec::with_capacity(12 + body.len());
+        riff.extend_from_slice(b"RIFF");
+        riff.extend_from_slice(&((4 + body.len()) as u32).to_le_bytes());
+        riff.extend_from_slice(b"WEBP");
+        riff.extend_from_slice(&body);
+        riff
+    }
+
+    #[test]
+    fn animated_webp_multi_frame_decode_and_limits() {
+        assert_eq!(DEFAULT_MAX_STATIC_DIM, 1024);
+        assert_eq!(DEFAULT_DECODE_CONCURRENCY, 8);
+
+        let webp_bytes = make_test_animated_webp(4, 24, 16, 75);
+        let decoded = decode_image_bytes(
+            "webp://klipy-meme",
+            &webp_bytes,
+            Some("meme.webp".to_owned()),
+            &DecodeLimits::default(),
+        );
+        let media = match decoded {
+            Ok(m) => m,
+            Err(err) => panic!("expected animated WebP multi-frame decode, got {err}"),
+        };
+
+        assert!(media.is_animated);
+        assert_eq!(media.frame_count(), 4);
+        assert_eq!(media.source_width, 24);
+        assert_eq!(media.source_height, 16);
+        for (idx, frame) in media.frames.iter().enumerate() {
+            assert_eq!(frame.width, 24);
+            assert_eq!(frame.height, 16);
+            assert_eq!(frame.delay_ms, 75);
+            assert_eq!(frame.pixels.len(), 24 * 16 * 4);
+            assert_eq!(frame.pixels[0], ((idx * 60 + 20) % 255) as u8);
+            assert_eq!(frame.pixels[1], ((idx * 80 + 40) % 255) as u8);
+            assert_eq!(frame.pixels[2], ((idx * 100 + 60) % 255) as u8);
+        }
+
+        // Respects max_animated_frames ceiling.
+        let tight_frames = DecodeLimits {
+            max_animated_frames: 2,
+            ..DecodeLimits::default()
+        };
+        let limited = decode_image_bytes("webp://capped", &webp_bytes, None, &tight_frames);
+        assert_eq!(limited.map(|m| m.frame_count()).ok(), Some(2));
+
+        // Respects max_animated_dimension downscaling while preserving intrinsic source dimensions.
+        let large_webp = make_test_animated_webp(2, 400, 200, 90);
+        let scaled = match decode_image_bytes(
+            "webp://large",
+            &large_webp,
+            None,
+            &DecodeLimits::default(),
+        ) {
+            Ok(m) => m,
+            Err(err) => panic!("expected downscaled animated WebP decode, got {err}"),
+        };
+        assert!(scaled.is_animated);
+        assert_eq!((scaled.source_width, scaled.source_height), (400, 200));
+        assert_eq!((scaled.frames[0].width, scaled.frames[0].height), (320, 160));
+    }
+
     #[test]
     fn kitty_direct_chunks_large_images_and_doubles_escapes_in_tmux_passthrough() {
-        // 64x64 RGBA = 16_384 raw bytes -> ~21_848 base64 bytes -> multiple 4096-byte chunks!
-        let img = DynamicImage::ImageRgba8(RgbaImage::from_pixel(64, 64, Rgba([10, 20, 30, 255])));
-        let direct = KittyDirectFrame::encode(&img, Size::new(8, 4), 123, false);
+        use std::io::Read as _;
+
+        // Pseudo-noise 96x96 image ensures compressed zlib stream spans multiple 4096-byte chunks.
+        let mut noisy = RgbaImage::new(96, 96);
+        let mut state: u32 = 0x1234_5678;
+        for px in noisy.pixels_mut() {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let r = (state >> 24) as u8;
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let g = (state >> 24) as u8;
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let b = (state >> 24) as u8;
+            *px = Rgba([r, g, b, 255]);
+        }
+        let img = DynamicImage::ImageRgba8(noisy.clone());
+        let direct = KittyDirectFrame::encode(&img, Size::new(12, 6), 123, false);
         assert!(
             direct
                 .payload
-                .starts_with("\x1b_Ga=T,f=32,s=64,v=64,c=8,r=4,i=123,C=1,q=2,m=1;")
+                .starts_with("\x1b_Ga=T,f=32,o=z,s=96,v=96,c=12,r=6,i=123,C=1,q=2,m=1;")
         );
         assert!(direct.payload.contains("\x1b_Gm=1;"));
         assert!(direct.payload.contains("\x1b_Gm=0;"));
         assert!(direct.payload.ends_with("\x1b\\"));
 
+        // Reassemble base64 chunks and verify zlib inflate restores exact raw RGBA bytes.
+        let mut reassembled_b64 = String::new();
+        for part in direct.payload.split("\x1b_G").skip(1) {
+            let trimmed = part.strip_suffix("\x1b\\").unwrap_or_default();
+            let (_, data) = trimmed.split_once(';').unwrap_or_default();
+            reassembled_b64.push_str(data);
+        }
+        let compressed = base64::engine::general_purpose::STANDARD
+            .decode(reassembled_b64.as_bytes())
+            .unwrap_or_default();
+        let mut inflated = Vec::new();
+        let mut decoder = flate2::read::ZlibDecoder::new(compressed.as_slice());
+        assert!(decoder.read_to_end(&mut inflated).is_ok());
+        assert_eq!(inflated, *noisy.as_raw());
+
         // Tmux DCS passthrough MUST wrap each chunk with `\x1bPtmux;\x1b\x1b_G...\x1b\x1b\\\x1b\\`
-        // and include `C=1` on chunk 0 so terminal cursor tracking stays synced.
+        // and include `o=z` and `C=1` on chunk 0 so terminal cursor tracking stays synced.
         let small = DynamicImage::ImageRgba8(RgbaImage::from_pixel(2, 2, Rgba([255, 0, 0, 255])));
         let tmux_direct = KittyDirectFrame::encode(&small, Size::new(1, 1), 77, true);
         assert!(
             tmux_direct
                 .payload
-                .starts_with("\x1bPtmux;\x1b\x1b_Ga=T,f=32,s=2,v=2,c=1,r=1,i=77,C=1,q=2,m=0;")
+                .starts_with("\x1bPtmux;\x1b\x1b_Ga=T,f=32,o=z,s=2,v=2,c=1,r=1,i=77,C=1,q=2,m=0;")
         );
         assert!(tmux_direct.payload.ends_with("\x1b\x1b\\\x1b\\"));
+    }
+
+    #[test]
+    fn kitty_placeholder_and_direct_emit_oz_compressed_payloads() {
+        // Flat banded 128x64 graphic compresses dramatically under fast zlib (`o=z`).
+        let mut img = RgbaImage::new(128, 64);
+        for (x, _y, px) in img.enumerate_pixels_mut() {
+            *px = Rgba([((x / 16) * 32) as u8, 96, 180, 255]);
+        }
+        let raw_b64_len = (128 * 64 * 4) * 4 / 3;
+        let frame = RgbaFrame {
+            width: 128,
+            height: 64,
+            delay_ms: 0,
+            pixels: img.clone().into_raw(),
+        };
+        let media = DecodedMedia::from_rgba_frames("img://bands", None, 128, 64, vec![frame]);
+
+        // KittyDirect: verify `o=z` header and >= 10x shrink on banded graphic.
+        let direct = KittyDirectFrame::encode(&DynamicImage::ImageRgba8(img), Size::new(16, 4), 200, false);
+        assert!(direct.payload.contains("f=32,o=z,"));
+        assert!(
+            direct.payload.len() < raw_b64_len / 4,
+            "expected compressed KittyDirect payload ({}) << uncompressed ({})",
+            direct.payload.len(),
+            raw_b64_len
+        );
+
+        // KittyPlaceholder: render first frame into a buffer and verify `o=z` in emitted sequence.
+        let renderer = MediaRenderer::new(GraphicsTier::KittyPlaceholder, ResolvedCharset::Utf8, (8, 16), false);
+        let rendered = match renderer.render_frame(&media, 0, 16, 4, MediaFitMode::Contain) {
+            Ok(r) => r,
+            Err(err) => panic!("KittyPlaceholder render failed: {err}"),
+        };
+        let mut buf = Buffer::empty(Rect::new(0, 0, 16, 4));
+        rendered.render(Rect::new(0, 0, 16, 4), &mut buf);
+        let first_cell = buf[(0, 0)].symbol();
+        assert!(
+            first_cell.contains("f=32,o=z,"),
+            "expected KittyPlaceholder transmission to carry o=z compression"
+        );
+        assert!(
+            first_cell.len() < raw_b64_len / 4,
+            "expected compressed KittyPlaceholder payload ({}) << uncompressed ({})",
+            first_cell.len(),
+            raw_b64_len
+        );
+    }
+
+    #[tokio::test]
+    async fn media_encoder_pool_encodes_off_thread_and_deduplicates_in_flight() {
+        let frame = Arc::new(RgbaFrame {
+            width: 32,
+            height: 32,
+            delay_ms: 0,
+            pixels: vec![128u8; 32 * 32 * 4],
+        });
+
+        let (pool, mut rx) = MediaEncoderPool::new(2);
+        assert!(pool.enqueue(
+            "img://kitty",
+            Arc::clone(&frame),
+            8,
+            4,
+            GraphicsTier::KittyPlaceholder,
+            (8, 16),
+        ));
+        // Duplicate `(key, w, h, tier)` submitted while still queued/in-flight is deduplicated.
+        assert!(!pool.enqueue(
+            "img://kitty",
+            Arc::clone(&frame),
+            8,
+            4,
+            GraphicsTier::KittyPlaceholder,
+            (8, 16),
+        ));
+        assert!(pool.is_in_flight("img://kitty", 8, 4, GraphicsTier::KittyPlaceholder));
+        assert!(pool.enqueue(
+            "img://direct",
+            Arc::clone(&frame),
+            8,
+            4,
+            GraphicsTier::KittyDirect,
+            (8, 16),
+        ));
+        assert!(pool.enqueue(
+            "img://sixel",
+            Arc::clone(&frame),
+            8,
+            4,
+            GraphicsTier::Sixel,
+            (8, 16),
+        ));
+        assert!(pool.enqueue(
+            "img://halfblock",
+            Arc::clone(&frame),
+            8,
+            4,
+            GraphicsTier::HalfBlock,
+            (8, 16),
+        ));
+
+        let mut received = std::collections::HashMap::new();
+        for _ in 0..4 {
+            let item = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("encoder pool timed out")
+                .expect("encoder pool channel closed prematurely");
+            let mut buf = Buffer::empty(Rect::new(0, 0, 8, 4));
+            item.render(Rect::new(0, 0, 8, 4), &mut buf);
+            if item.tier == GraphicsTier::KittyPlaceholder {
+                assert!(buf[(0, 0)].symbol().contains("o=z"));
+            }
+            if let RenderedMedia::KittyDirect(ref kd) = item.media {
+                assert!(kd.payload.contains("o=z"));
+            }
+            received.insert(item.key.clone(), item.tier);
+        }
+
+        assert_eq!(received.get("img://kitty"), Some(&GraphicsTier::KittyPlaceholder));
+        assert_eq!(received.get("img://direct"), Some(&GraphicsTier::KittyDirect));
+        assert_eq!(received.get("img://sixel"), Some(&GraphicsTier::Sixel));
+        assert_eq!(received.get("img://halfblock"), Some(&GraphicsTier::HalfBlock));
+
+        // After completion, in-flight entries are cleaned up via RAII guard.
+        assert!(!pool.is_in_flight("img://kitty", 8, 4, GraphicsTier::KittyPlaceholder));
+
+        // Direct async `encode_once` also returns a ready-to-draw frame cleanly.
+        let req = MediaEncodeRequest::new(
+            "img://once",
+            frame,
+            6,
+            3,
+            GraphicsTier::KittyDirect,
+            (8, 16),
+        );
+        let once = pool.encode_once(req).await;
+        assert!(once.is_ok());
+        assert_eq!(once.map(|f| f.tier).ok(), Some(GraphicsTier::KittyDirect));
     }
 
     #[test]
