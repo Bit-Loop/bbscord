@@ -11,5 +11,21 @@ description = "Go Live stream viewing, Wayland PipeWire screen capture, and GStr
 bbs-core.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+zeroize.workspace = true
+tokio-tungstenite.workspace = true
+davey.workspace = true
+ashpd = { workspace = true, features = ["screencast"] }
+gstreamer.workspace = true
+gstreamer-webrtc.workspace = true
+gstreamer-app.workspace = true
+gstreamer-video = "0.25"
+
+[dev-dependencies]
+openmls = { version = "0.8.1", features = ["js"] }
+openmls_basic_credential = "0.5.0"
+openmls_rust_crypto = "0.5.1"
