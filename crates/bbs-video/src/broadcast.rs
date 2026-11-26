@@ -830,7 +830,6 @@ impl BroadcastPipeline {
 
         if let Some(portal) = self.portal_session.take() {
             portal.close().await;
-            drop(portal);
         }
     }
 }
