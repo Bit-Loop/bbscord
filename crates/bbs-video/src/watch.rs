@@ -60,7 +60,7 @@ pub struct WatchConfig {
     pub popout_height: u32,
     /// Target FPS hint passed to `mpv --demuxer-rawvideo-fps`.
     pub popout_fps: u8,
-    /// When `true`, apply wall-clock throttling in `InlineTerminal` mode in addition to `videorate`.
+    /// When `true`, enforce wall-clock FPS throttling in `InlineTerminal` mode inside the `AppSink` callback.
     pub enforce_wall_clock_throttle: bool,
     /// Prefer software decoder over hardware decoder (useful in deterministic headless tests).
     pub prefer_software_decoder: bool,
@@ -789,13 +789,6 @@ fn build_sink_branch(
             }
         }
         VideoSinkKind::InlineTerminal => {
-            let videorate = gst::ElementFactory::make("videorate")
-                .name("watch_inline_videorate")
-                .property("drop-only", true)
-                .property("skip-to-first", true)
-                .build()
-                .map_err(|err| CoreError::Video(format!("failed to create videorate: {err}")))?;
-
             let target_fps = config.inline_target_fps.clamp(1, 60);
             let caps = gst_video::VideoCapsBuilder::new()
                 .format(gst_video::VideoFormat::Rgba)
@@ -862,9 +855,9 @@ fn build_sink_branch(
 
             let appsink_elem = appsink.upcast_ref::<gst::Element>();
             pipeline
-                .add_many([&videoconvert, &videoscale, &videorate, appsink_elem])
+                .add_many([&videoconvert, &videoscale, appsink_elem])
                 .map_err(|err| CoreError::Video(format!("failed to add inline sink branch: {err}")))?;
-            gst::Element::link_many([&videoconvert, &videoscale, &videorate, appsink_elem]).map_err(
+            gst::Element::link_many([&videoconvert, &videoscale, appsink_elem]).map_err(
                 |err| CoreError::Video(format!("failed to link inline sink branch: {err}")),
             )?;
 

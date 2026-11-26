@@ -376,6 +376,7 @@ impl BroadcastPipeline {
         let height = config.quality.height.max(16) as i32;
         let fps = i32::from(config.quality.fps.clamp(1, 60));
         let raw_caps = gst::Caps::builder("video/x-raw")
+            .field("format", "I420")
             .field("width", width)
             .field("height", height)
             .field("framerate", gst::Fraction::new(fps, 1))
